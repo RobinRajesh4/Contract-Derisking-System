@@ -1,0 +1,141 @@
+{
+  "policy_id": "POLICY-001",
+  "name": "General Business Contract Compliance Policy",
+  "group": "Corporate Standard",
+  "version": "1.0",
+  "risk_threshold": 70,
+  "domains": [
+    {
+      "domain_name": "Legal",
+      "color": "#E74C3C",
+      "micro_policies": [
+        {
+          "id": "L-001",
+          "name": "Governing Law Clause",
+          "description": "Ensure contract specifies governing law and jurisdiction clearly.",
+          "risk_weight": 10,
+          "check": "Must include governing law, e.g., 'This agreement is governed by the laws of...'"
+        },
+        {
+          "id": "L-002",
+          "name": "Termination Notice",
+          "description": "Minimum 30 days notice required for termination without cause.",
+          "risk_weight": 15,
+          "check": "If notice < 30 days → Non-compliant"
+        },
+        {
+          "id": "L-003",
+          "name": "Indemnification",
+          "description": "Vendor must indemnify the company against legal claims from third parties.",
+          "risk_weight": 20,
+          "check": "Missing or vague indemnity → High risk"
+        }
+      ]
+    },
+    {
+      "domain_name": "Financial",
+      "color": "#3498DB",
+      "micro_policies": [
+        {
+          "id": "F-001",
+          "name": "Payment Terms",
+          "description": "Payment period must not exceed 60 days from invoice date.",
+          "risk_weight": 15,
+          "check": "If payment > 60 days → Medium risk"
+        },
+        {
+          "id": "F-002",
+          "name": "Late Fee Clause",
+          "description": "Late payment fee clause must be defined.",
+          "risk_weight": 10,
+          "check": "Missing → Low compliance"
+        },
+        {
+          "id": "F-003",
+          "name": "Contract Value Threshold",
+          "description": "Contracts above $500,000 must require CFO approval.",
+          "risk_weight": 25,
+          "check": "If > $500K without approval → Critical risk"
+        }
+      ]
+    },
+    {
+      "domain_name": "Data Security",
+      "color": "#16A085",
+      "micro_policies": [
+        {
+          "id": "DS-001",
+          "name": "Data Protection",
+          "description": "Must comply with GDPR or equivalent data laws.",
+          "risk_weight": 20,
+          "check": "Missing GDPR clause → Critical risk"
+        },
+        {
+          "id": "DS-002",
+          "name": "Data Retention",
+          "description": "Contract must define data retention and deletion timelines.",
+          "risk_weight": 10,
+          "check": "Missing retention → Medium risk"
+        },
+        {
+          "id": "DS-003",
+          "name": "Confidentiality",
+          "description": "NDA or confidentiality clause must be included.",
+          "risk_weight": 15,
+          "check": "Absent NDA → High risk"
+        }
+      ]
+    },
+    {
+      "domain_name": "Operational",
+      "color": "#F39C12",
+      "micro_policies": [
+        {
+          "id": "OP-001",
+          "name": "Performance SLAs",
+          "description": "Include clear service levels and uptime commitments.",
+          "risk_weight": 15,
+          "check": "Missing SLA → Medium risk"
+        },
+        {
+          "id": "OP-002",
+          "name": "Renewal Clause",
+          "description": "Auto-renewal should not exceed 1 year without mutual consent.",
+          "risk_weight": 10,
+          "check": "Auto-renewal > 1 year → Medium risk"
+        }
+      ]
+    },
+    {
+      "domain_name": "Compliance",
+      "color": "#9B59B6",
+      "micro_policies": [
+        {
+          "id": "C-001",
+          "name": "Anti-Bribery",
+          "description": "Include anti-bribery and corruption clause.",
+          "risk_weight": 20,
+          "check": "Missing clause → Critical risk"
+        },
+        {
+          "id": "C-002",
+          "name": "Audit Rights",
+          "description": "Organization must have audit rights for vendor compliance.",
+          "risk_weight": 15,
+          "check": "No audit clause → High risk"
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "total_policies": 15,
+    "domains_covered": 5,
+    "max_risk": 100,
+    "critical_risk_items": [
+      "Indemnification",
+      "GDPR",
+      "CFO Approval",
+      "Anti-Bribery"
+    ]
+  }
+}

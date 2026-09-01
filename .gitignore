@@ -1,0 +1,46 @@
+﻿# Python virtual environments
+backend/venv/
+venv/
+.venv/
+
+# Python generated files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Local Qdrant data
+backend/qdrant_data/
+qdrant_data/
+
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+
+# Local backups
+*.backup
+*.bak
+
+# Node dependencies and build output
+node_modules/
+dist/
+.vite/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor files
+.vscode/
+.idea/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Runtime-generated application data
+2
+backend/data/analyses.json
