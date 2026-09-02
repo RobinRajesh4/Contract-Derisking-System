@@ -31,6 +31,13 @@ EMBEDDING_MODEL_NAME = os.getenv(
     "nomic-embed-text",
 )
 
+MIN_RELEVANCE_SCORE = float(
+    os.getenv(
+        "RAG_MIN_RELEVANCE_SCORE",
+        "0.50",
+    )
+)
+
 
 class RAGStore:
     def __init__(

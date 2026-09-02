@@ -1,4 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { useQuery } from "@tanstack/react-query";
+import { Link } from "react-router-dom";
 import {
   Bot,
   FileText,
@@ -7,7 +13,14 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { listAnalyses } from "@/services/analysis";
 
 interface Source {
   source_number?: number;
@@ -17,27 +30,79 @@ interface Source {
   score?: number;
 }
 
-
 interface Message {
   role: "user" | "assistant";
   content: string;
   sources?: Source[];
 }
 
-
 export default function Chat() {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      role: "assistant",
-      content:
-        "Hello! I can answer questions about contracts " +
-        "that have been uploaded and indexed. What would " +
-        "you like to know?",
-    },
-  ]);
+  const [messages, setMessages] = useState<Message[]>(() => {
+    const savedMessages = sessionStorage.getItem(
+      "contract-chat-messages"
+    );
+
+    if (savedMessages) {
+      try {
+        return JSON.parse(savedMessages) as Message[];
+      } catch {
+        sessionStorage.removeItem(
+          "contract-chat-messages"
+        );
+      }
+    }
+
+    return [
+      {
+        role: "assistant",
+        content:
+          "Hello! I can answer questions about contracts " +
+          "that have been uploaded and indexed. What would " +
+          "you like to know?",
+      },
+    ];
+  });
 
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+
+  const [
+    selectedAnalysisId,
+    setSelectedAnalysisId,
+  ] = useState(
+    () =>
+      sessionStorage.getItem(
+        "contract-chat-selected-analysis"
+      ) || "all"
+  );
+
+  useEffect(() => {
+    sessionStorage.setItem(
+      "contract-chat-selected-analysis",
+      selectedAnalysisId
+    );
+  }, [selectedAnalysisId]);
+
+  const {
+    data: analysesData,
+    isLoading: isLoadingAnalyses,
+    isError: isAnalysesError,
+  } = useQuery({
+    queryKey: ["analyses"],
+    queryFn: () => listAnalyses(),
+  });
+
+  const analyses =
+    (analysesData as any[] | undefined) || [];
+
+  const selectedAnalysis =
+    selectedAnalysisId === "all"
+      ? null
+      : analyses.find(
+          (analysis: any) =>
+            analysis.analysis_id ===
+            selectedAnalysisId
+        );
 
   const messagesEndRef =
     useRef<HTMLDivElement | null>(null);
@@ -46,6 +111,13 @@ export default function Chat() {
     messagesEndRef.current?.scrollIntoView({
       behavior: "smooth",
     });
+  }, [messages]);
+
+  useEffect(() => {
+    sessionStorage.setItem(
+      "contract-chat-messages",
+      JSON.stringify(messages)
+    );
   }, [messages]);
 
   const sendMessage = async () => {
@@ -68,17 +140,29 @@ export default function Chat() {
     setIsLoading(true);
 
     try {
+      const requestBody: {
+        message: string;
+        top_k: number;
+        analysis_id?: string;
+      } = {
+        message: question,
+        top_k: 5,
+      };
+
+      if (selectedAnalysisId !== "all") {
+        requestBody.analysis_id =
+          selectedAnalysisId;
+      }
+
       const response = await fetch(
         "http://127.0.0.1:8001/chat",
         {
           method: "POST",
           headers: {
-            "Content-Type": "application/json",
+            "Content-Type":
+              "application/json",
           },
-          body: JSON.stringify({
-            message: question,
-            top_k: 5,
-          }),
+          body: JSON.stringify(requestBody),
         }
       );
 
@@ -86,7 +170,8 @@ export default function Chat() {
 
       if (!response.ok) {
         throw new Error(
-          data.detail || "Failed to get a response"
+          data.detail ||
+            "Failed to get a response"
         );
       }
 
@@ -131,79 +216,225 @@ export default function Chat() {
         <p className="text-sm text-muted-foreground">
           Search across uploaded and indexed contracts
         </p>
+
+        <div className="mt-3 max-w-sm">
+          <Select
+            value={selectedAnalysisId}
+            onValueChange={
+              setSelectedAnalysisId
+            }
+            disabled={isLoadingAnalyses}
+          >
+            <SelectTrigger>
+              <SelectValue placeholder="Select contract" />
+            </SelectTrigger>
+
+            <SelectContent>
+              <SelectItem value="all">
+                All Contracts
+              </SelectItem>
+
+              {analyses.map(
+                (analysis: any) => (
+                  <SelectItem
+                    key={
+                      analysis.analysis_id
+                    }
+                    value={
+                      analysis.analysis_id
+                    }
+                  >
+                    {analysis.filename ||
+                      `Analysis ${analysis.analysis_id?.slice(
+                        0,
+                        8
+                      )}`}
+                  </SelectItem>
+                )
+              )}
+            </SelectContent>
+          </Select>
+
+          {isLoadingAnalyses && (
+            <p className="mt-2 text-xs text-muted-foreground">
+              Loading contracts...
+            </p>
+          )}
+
+          {isAnalysesError && (
+            <p className="mt-2 text-xs text-destructive">
+              Failed to load contracts.
+            </p>
+          )}
+
+          {!isLoadingAnalyses &&
+            !isAnalysesError &&
+            analyses.length === 0 && (
+              <p className="mt-2 text-xs text-muted-foreground">
+                No uploaded contracts are
+                available.
+              </p>
+            )}
+
+          {!isLoadingAnalyses &&
+            analyses.length > 0 && (
+              <p className="mt-2 text-xs text-muted-foreground">
+                {selectedAnalysisId ===
+                "all"
+                  ? `Searching across all ${analyses.length} contracts`
+                  : `Searching only: ${
+                      selectedAnalysis?.filename ||
+                      `Analysis ${selectedAnalysisId.slice(
+                        0,
+                        8
+                      )}`
+                    }`}
+              </p>
+            )}
+        </div>
       </div>
 
       <div className="flex-1 space-y-6 overflow-y-auto p-6">
-        {messages.map((message, index) => (
-          <div
-            key={index}
-            className={`flex gap-4 ${
-              message.role === "user"
-                ? "justify-end"
-                : ""
-            }`}
-          >
-            {message.role === "assistant" && (
-              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary/10">
-                <Bot className="h-5 w-5 text-primary" />
-              </div>
-            )}
-
+        {messages.map(
+          (message, index) => (
             <div
-              className={`max-w-[80%] rounded-lg p-4 ${
+              key={index}
+              className={`flex gap-4 ${
                 message.role === "user"
-                  ? "bg-primary text-primary-foreground"
-                  : "bg-muted"
+                  ? "justify-end"
+                  : ""
               }`}
             >
-              <p className="whitespace-pre-wrap">
-                {message.content}
-              </p>
+              {message.role ===
+                "assistant" && (
+                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary/10">
+                  <Bot className="h-5 w-5 text-primary" />
+                </div>
+              )}
 
-              {message.sources &&
-                message.sources.length > 0 && (
-                  <div className="mt-4 border-t border-border/50 pt-4">
-                    <p className="mb-2 text-xs font-semibold opacity-80">
-                      Sources used
-                    </p>
+              <div
+                className={`max-w-[80%] rounded-lg p-4 ${
+                  message.role === "user"
+                    ? "bg-primary text-primary-foreground"
+                    : "bg-muted"
+                }`}
+              >
+                <p className="whitespace-pre-wrap">
+                  {message.content}
+                </p>
 
-                    <div className="space-y-2">
-                      {message.sources.map(
-                        (source, sourceIndex) => (
-                          <div
-                            key={sourceIndex}
-                            className="flex items-start gap-2 rounded border border-border/50 bg-background/50 p-2 text-xs"
-                          >
-                            <FileText className="mt-0.5 h-3 w-3 shrink-0" />
+                {message.sources &&
+                  message.sources.length >
+                    0 && (
+                    <div className="mt-4 border-t border-border/50 pt-4">
+                      <p className="mb-2 text-xs font-semibold opacity-80">
+                        Sources used
+                      </p>
 
-                            <div>
-                              <p className="line-clamp-3 opacity-80">
-                                {source.text}
-                              </p>
+                      <div className="space-y-2">
+                        {message.sources.map(
+                          (
+                            source,
+                            sourceIndex
+                          ) =>
+                            source.analysis_id ? (
+                              <Link
+                                key={
+                                  sourceIndex
+                                }
+                                to={`/analyses/${source.analysis_id}`}
+                                className="flex items-start gap-2 rounded border border-border/50 bg-background/50 p-2 text-xs transition-colors hover:border-primary/50 hover:bg-background"
+                              >
+                                <FileText className="mt-0.5 h-3 w-3 shrink-0" />
 
-                              {typeof source.score ===
-                                "number" && (
-                                <p className="mt-1 text-muted-foreground">
-                                  Relevance:{" "}
-                                  {source.score.toFixed(3)}
-                                </p>
-                              )}
-                            </div>
-                          </div>
-                        )
-                      )}
+                                <div className="min-w-0">
+                                  <p className="line-clamp-3 opacity-80">
+                                    {
+                                      source.text
+                                    }
+                                  </p>
+
+                                  <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-muted-foreground">
+                                    {source.clause_id !==
+                                      undefined && (
+                                      <span>
+                                        Clause:{" "}
+                                        {
+                                          source.clause_id
+                                        }
+                                      </span>
+                                    )}
+
+                                    {typeof source.score ===
+                                      "number" && (
+                                      <span>
+                                        Relevance:{" "}
+                                        {source.score.toFixed(
+                                          3
+                                        )}
+                                      </span>
+                                    )}
+
+                                    <span className="font-medium text-primary">
+                                      Open contract
+                                    </span>
+                                  </div>
+                                </div>
+                              </Link>
+                            ) : (
+                              <div
+                                key={
+                                  sourceIndex
+                                }
+                                className="flex items-start gap-2 rounded border border-border/50 bg-background/50 p-2 text-xs"
+                              >
+                                <FileText className="mt-0.5 h-3 w-3 shrink-0" />
+
+                                <div className="min-w-0">
+                                  <p className="line-clamp-3 opacity-80">
+                                    {
+                                      source.text
+                                    }
+                                  </p>
+
+                                  <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-muted-foreground">
+                                    {source.clause_id !==
+                                      undefined && (
+                                      <span>
+                                        Clause:{" "}
+                                        {
+                                          source.clause_id
+                                        }
+                                      </span>
+                                    )}
+
+                                    {typeof source.score ===
+                                      "number" && (
+                                      <span>
+                                        Relevance:{" "}
+                                        {source.score.toFixed(
+                                          3
+                                        )}
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+                            )
+                        )}
+                      </div>
                     </div>
-                  </div>
-                )}
-            </div>
-
-            {message.role === "user" && (
-              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary">
-                <User className="h-5 w-5 text-primary-foreground" />
+                  )}
               </div>
-            )}
-          </div>
-        ))}
+
+              {message.role === "user" && (
+                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary">
+                  <User className="h-5 w-5 text-primary-foreground" />
+                </div>
+              )}
+            </div>
+          )
+        )}
 
         {isLoading && (
           <div className="flex gap-4">
@@ -213,7 +444,9 @@ export default function Chat() {
 
             <div className="flex items-center gap-1 rounded-lg bg-muted p-4">
               <div className="h-2 w-2 animate-bounce rounded-full bg-primary/50" />
+
               <div className="h-2 w-2 animate-bounce rounded-full bg-primary/50 [animation-delay:-.3s]" />
+
               <div className="h-2 w-2 animate-bounce rounded-full bg-primary/50 [animation-delay:-.5s]" />
             </div>
           </div>

@@ -1,8 +1,10 @@
 import {
   FileText,
+  GitCompare,
   Home,
   MessageSquare,
   Shield,
+  TrendingUp,
   Upload,
 } from "lucide-react";
 
@@ -44,6 +46,16 @@ const navItems = [
     icon: FileText,
   },
   {
+    title: "Insights",
+    url: "/insights",
+    icon: TrendingUp,
+  },
+  {
+    title: "Compare",
+    url: "/compare",
+    icon: GitCompare,
+  },
+  {
     title: "Ask AI",
     url: "/chat",
     icon: MessageSquare,
@@ -56,7 +68,8 @@ export function AppSidebar() {
     <Sidebar collapsible="icon">
       <SidebarContent>
         <div className="border-b border-sidebar-border p-4">
-          < img src={worldlineLogo} alt="Worldline" className="h-8 w-auto" / >        </div>
+          < img src={worldlineLogo} alt="Worldline" className="h-8 w-auto" / >
+        </div>
 
         <SidebarGroup>
           <SidebarGroupLabel className="text-sidebar-foreground/60">
