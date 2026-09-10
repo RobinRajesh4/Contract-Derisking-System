@@ -143,10 +143,86 @@ export async function getSummary(
   );
 }
 
+export interface DomainRiskStats {
+  total: number;
+  high: number;
+  medium: number;
+  low: number;
+  unclassified: number;
+  normalized_risk_score: number;
+  high_risk_percentage: number;
+}
+
+export interface ContractRiskStats {
+  analysis_id?: string;
+  filename?: string;
+  created_at?: string;
+  updated_at?: string;
+  total_clauses: number;
+  classified_clauses: number;
+  unclassified_clauses: number;
+  high_risk: number;
+  medium_risk: number;
+  low_risk: number;
+  high_risk_percentage: number;
+  medium_risk_percentage: number;
+  low_risk_percentage: number;
+  normalized_risk_score: number;
+  weighted_risk_points: number;
+  domains: Record<string, DomainRiskStats>;
+}
+
+export interface DomainComparison {
+  domain: string;
+  contract_1: DomainRiskStats;
+  contract_2: DomainRiskStats;
+  score_difference: number;
+}
+
+export interface ExtractedTermMatch {
+  value: string;
+  clause_id?: string | number;
+  clause_text: string;
+}
+
+export interface ExtractedTerm {
+  label: string;
+  value: string;
+  clause_id?: string | number;
+  clause_text: string;
+  all_matches: ExtractedTermMatch[];
+  has_conflict: boolean;
+}
+
+export interface TermComparison {
+  key: string;
+  label: string;
+  contract_1: ExtractedTerm | null;
+  contract_2: ExtractedTerm | null;
+  status:
+    | "same"
+    | "different"
+    | "only_contract_1"
+    | "only_contract_2"
+    | "missing_both";
+}
+
+
 export interface CompareResult {
-  contract_1: Record<string, any>;
-  contract_2: Record<string, any>;
-  comparison: Record<string, any>;
+  contract_1: ContractRiskStats;
+  contract_2: ContractRiskStats;
+  comparison: {
+    clause_difference: number;
+    high_risk_difference: number;
+    normalized_score_difference: number;
+    high_risk_rate_difference: number;
+    safer_contract: string | null;
+    is_tie: boolean;
+    verdict: string;
+    verdict_reasons: string[];
+    domain_comparison: DomainComparison[];
+    term_comparison: TermComparison[];
+  };
 }
 
 export async function compareAnalyses(

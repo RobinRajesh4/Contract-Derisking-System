@@ -78,7 +78,7 @@ export default function Chat() {
 
   useEffect(() => {
     sessionStorage.setItem(
-      "contract-chat-selected-analysis",
+      "contract-chat-selected-analysis",  
       selectedAnalysisId
     );
   }, [selectedAnalysisId]);
@@ -210,7 +210,7 @@ export default function Chat() {
       <div className="border-b bg-muted px-6 py-4">
         <h2 className="flex items-center gap-2 text-lg font-semibold">
           <Bot className="h-5 w-5" />
-          Ask AI
+          Chatbot
         </h2>
 
         <p className="text-sm text-muted-foreground">

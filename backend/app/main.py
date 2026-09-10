@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 import orjson
 from dotenv import load_dotenv
+import re
 
 # Load env from .env (GROQ_API_KEY, QDRANT_URL, etc.)
 load_dotenv()
@@ -448,11 +449,6 @@ class ChatRequest(BaseModel):
     top_k: int = 5
 
 
-class ChatRequest(BaseModel):
-    message: str
-    analysis_id: Optional[str] = None
-    top_k: int = 5
-
 
 @app.post("/chat")
 async def chat_endpoint(
@@ -615,45 +611,661 @@ Explain that the response is not legal advice when appropriate.
         "sources": sources,
     }
 
+term_labels = {
+    "effective_date": "Effective Date",
+    "contract_duration": "Contract Duration",
+    "renewal_period": "Renewal Period",
+    "payment_period": "Payment Period",
+    "termination_notice": "Termination Notice",
+    "liability_cap": "Liability Cap",
+    "governing_law": "Governing Law",
+    "jurisdiction": "Jurisdiction",
+    "sla_uptime": "SLA Uptime",
+    "breach_notification": (
+        "Data Breach Notification"
+    ),
+}
+
+term_patterns = {
+    "effective_date": [
+        (
+            r"(?:effective\s+date|commences?\s+on|"
+            r"effective\s+from)\s*(?:is|of|on|:)?\s*"
+            r"([A-Za-z]+\s+\d{1,2},?\s+\d{4}|"
+            r"\d{1,2}\s+[A-Za-z]+\s+\d{4}|"
+            r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
+        ),
+    ],
+    "contract_duration": [
+        (
+            r"(?:term|duration|period)\s*(?:of|is|:)?\s*"
+            r"(\d+\s*\([^)]+\)\s*(?:year|month|day)s?|"
+            r"\d+\s*(?:year|month|day)s?)"
+        ),
+        (
+            r"(?:remain(?:s)?\s+in\s+force|continue)"
+            r"\s+for\s+"
+            r"(\d+\s*\([^)]+\)\s*(?:year|month|day)s?|"
+            r"\d+\s*(?:year|month|day)s?)"
+        ),
+    ],
+    "renewal_period": [
+        (
+            r"(?:renew(?:ed|al)?|automatic(?:ally)?\s+"
+            r"renew(?:ed|al)?)"
+            r".{0,80}?"
+            r"(\d+\s*\([^)]+\)\s*(?:year|month|day)s?|"
+            r"\d+\s*(?:year|month|day)s?)"
+        ),
+    ],
+    "payment_period": [
+        (
+            r"(?:paid|payable|payment\s+shall\s+be\s+made)"
+            r".{0,80}?"
+            r"(?:within|net)\s+"
+            r"(\d+\s*\([^)]+\)\s*(?:business\s+)?days?|"
+            r"\d+\s*(?:business\s+)?days?)"
+        ),
+        (
+            r"\bnet\s+(\d+)\b"
+        ),
+    ],
+    "termination_notice": [
+        (
+            r"(?:terminate|termination)"
+            r".{0,120}?"
+            r"(?:notice\s+of|upon|with)\s+"
+            r"(\d+\s*\([^)]+\)\s*(?:business\s+)?days?"
+            r"(?:\s+written\s+notice)?|"
+            r"\d+\s*(?:business\s+)?days?"
+            r"(?:\s+written\s+notice)?)"
+        ),
+        (
+            r"(\d+\s*(?:business\s+)?days?)"
+            r"\s+(?:prior\s+)?written\s+notice"
+        ),
+    ],
+    "liability_cap": [
+        (
+            r"(?:liability|aggregate\s+liability)"
+            r".{0,120}?"
+            r"(?:shall\s+not\s+exceed|limited\s+to|"
+            r"capped\s+at|cap(?:ped)?\s+at)\s+"
+            r"([^.;\n]+)"
+        ),
+        (
+            r"(unlimited\s+liability)"
+        ),
+    ],
+    "governing_law": [
+        (
+            r"(?:governed\s+by|governing\s+law)"
+            r"(?:\s+the\s+laws?)?(?:\s+of)?\s*"
+            r"([A-Za-z][A-Za-z\s,&-]{2,60})"
+        ),
+    ],
+    "jurisdiction": [
+        (
+            r"(?:exclusive\s+jurisdiction|jurisdiction)"
+            r"(?:\s+of|\s+in|\s+shall\s+be)?\s*"
+            r"([A-Za-z][A-Za-z\s,&-]{2,60})"
+        ),
+    ],
+    "sla_uptime": [
+        (
+            r"(\d{2,3}(?:\.\d+)?\s*%)"
+            r".{0,40}?"
+            r"(?:uptime|availability)"
+        ),
+        (
+            r"(?:uptime|availability)"
+            r".{0,40}?"
+            r"(\d{2,3}(?:\.\d+)?\s*%)"
+        ),
+    ],
+    "breach_notification": [
+        (
+            r"(?:security|data)\s+breach"
+            r".{0,120}?"
+            r"(?:within|no\s+later\s+than)\s+"
+            r"(\d+\s*(?:hours?|days?))"
+        ),
+        (
+            r"(?:notify|notification)"
+            r".{0,80}?"
+            r"(?:breach|security\s+incident)"
+            r".{0,80}?"
+            r"(\d+\s*(?:hours?|days?))"
+        ),
+    ],
+}
+
+
+def extract_structured_terms(
+    analysis: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    results = analysis.get(
+        "results",
+        analysis.get("clauses", []),
+    )
+
+    extracted: Dict[
+        str,
+        Dict[str, Any],
+    ] = {}
+
+    for term_key, patterns in term_patterns.items():
+        matches = []
+
+        for clause in results:
+            clause_text = str(
+                clause.get("text", "")
+            ).strip()
+
+            if not clause_text:
+                continue
+
+            for pattern in patterns:
+                match = re.search(
+                    pattern,
+                    clause_text,
+                    flags=(
+                        re.IGNORECASE
+                        | re.DOTALL
+                    ),
+                )
+
+                if not match:
+                    continue
+
+                value = re.sub(
+                    r"\s+",
+                    " ",
+                    match.group(1).strip(),
+                )
+
+                existing_values = {
+                    item["value"].lower()
+                    for item in matches
+                }
+
+                if value.lower() in existing_values:
+                    continue
+
+                matches.append(
+                    {
+                        "value": value,
+                        "clause_id": clause.get(
+                            "id"
+                        ),
+                        "clause_text": (
+                            clause_text
+                        ),
+                    }
+                )
+
+        if matches:
+            extracted[term_key] = {
+                "label": term_labels[
+                    term_key
+                ],
+                "value": matches[0][
+                    "value"
+                ],
+                "clause_id": matches[0][
+                    "clause_id"
+                ],
+                "clause_text": matches[0][
+                    "clause_text"
+                ],
+                "all_matches": matches,
+                "has_conflict": (
+                    len(
+                        {
+                            item[
+                                "value"
+                            ].lower()
+                            for item in matches
+                        }
+                    )
+                    > 1
+                ),
+            }
+
+    return extracted
+
+
 @app.post("/compare")
-async def compare_contracts(payload: Dict[str, Any] = Body(...)):
-    """Compare two contract analyses side by side."""
+async def compare_contracts(
+    payload: Dict[str, Any] = Body(...),
+):
+    """Compare two previously analyzed contracts."""
+
     analysis_id_1 = payload.get("analysis_id_1")
     analysis_id_2 = payload.get("analysis_id_2")
-    
+
     if not analysis_id_1 or not analysis_id_2:
-        raise HTTPException(status_code=400, detail="Both analysis IDs required")
+        raise HTTPException(
+            status_code=400,
+            detail="Both analysis IDs are required",
+        )
+
+    if analysis_id_1 == analysis_id_2:
+        raise HTTPException(
+            status_code=400,
+            detail="Select two different contracts to compare",
+        )
+
+    analysis_1 = store.get_analysis(analysis_id_1)
+    analysis_2 = store.get_analysis(analysis_id_2)
+
+    if not analysis_1 or not analysis_2:
+        raise HTTPException(
+            status_code=404,
+            detail="One or both analyses were not found",
+        )
+
+    risk_weights = {
+        "high": 5,
+        "medium": 3,
+        "low": 1,
+    }
     
-    analysis1 = store.get_analysis(analysis_id_1)
-    analysis2 = store.get_analysis(analysis_id_2)
-    
-    if not analysis1 or not analysis2:
-        raise HTTPException(status_code=404, detail="One or both analyses not found")
-    
-    def get_stats(analysis):
-        results = analysis.get("results", analysis.get("clauses", []))
-        high = sum(1 for r in results if (r.get('classification', {}).get('risk_level', '')).lower() == 'high')
-        medium = sum(1 for r in results if (r.get('classification', {}).get('risk_level', '')).lower() == 'medium')
-        low = sum(1 for r in results if (r.get('classification', {}).get('risk_level', '')).lower() == 'low')
+
+
+    def get_stats(
+        analysis: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        results = analysis.get(
+            "results",
+            analysis.get("clauses", []),
+        )
+
+        high = 0
+        medium = 0
+        low = 0
+        unclassified = 0
+
+        domain_stats: Dict[
+            str,
+            Dict[str, Any],
+        ] = {}
+
+        for result in results:
+            classification = (
+                result.get("classification") or {}
+            )
+
+            risk_level = str(
+                classification.get(
+                    "risk_level",
+                    "",
+                )
+            ).strip().lower()
+
+            domain = str(
+                classification.get(
+                    "domain",
+                    "Other",
+                )
+                or "Other"
+            ).strip()
+
+            if domain not in domain_stats:
+                domain_stats[domain] = {
+                    "total": 0,
+                    "high": 0,
+                    "medium": 0,
+                    "low": 0,
+                    "unclassified": 0,
+                }
+
+            domain_stats[domain]["total"] += 1
+
+            if risk_level == "high":
+                high += 1
+                domain_stats[domain]["high"] += 1
+
+            elif risk_level == "medium":
+                medium += 1
+                domain_stats[domain]["medium"] += 1
+
+            elif risk_level == "low":
+                low += 1
+                domain_stats[domain]["low"] += 1
+
+            else:
+                unclassified += 1
+                domain_stats[domain]["unclassified"] += 1
+
+        total_clauses = len(results)
+        classified_clauses = high + medium + low
+
+        weighted_points = (
+            high * risk_weights["high"]
+            + medium * risk_weights["medium"]
+            + low * risk_weights["low"]
+        )
+
+        normalized_risk_score = (
+            weighted_points / classified_clauses
+            if classified_clauses > 0
+            else 0
+        )
+
+        high_risk_percentage = (
+            high / classified_clauses * 100
+            if classified_clauses > 0
+            else 0
+        )
+
+        medium_risk_percentage = (
+            medium / classified_clauses * 100
+            if classified_clauses > 0
+            else 0
+        )
+
+        low_risk_percentage = (
+            low / classified_clauses * 100
+            if classified_clauses > 0
+            else 0
+        )
+
+        for domain_data in domain_stats.values():
+            domain_classified = (
+                domain_data["high"]
+                + domain_data["medium"]
+                + domain_data["low"]
+            )
+
+            domain_weighted_points = (
+                domain_data["high"]
+                * risk_weights["high"]
+                + domain_data["medium"]
+                * risk_weights["medium"]
+                + domain_data["low"]
+                * risk_weights["low"]
+            )
+
+            domain_data["normalized_risk_score"] = round(
+                (
+                    domain_weighted_points
+                    / domain_classified
+                )
+                if domain_classified > 0
+                else 0,
+                2,
+            )
+
+            domain_data["high_risk_percentage"] = round(
+                (
+                    domain_data["high"]
+                    / domain_classified
+                    * 100
+                )
+                if domain_classified > 0
+                else 0,
+                2,
+            )
+
         return {
-            "total_clauses": len(results),
+            "analysis_id": analysis.get("analysis_id"),
+            "filename": analysis.get("filename"),
+            "created_at": analysis.get("created_at"),
+            "updated_at": analysis.get("updated_at"),
+            "total_clauses": total_clauses,
+            "classified_clauses": classified_clauses,
+            "unclassified_clauses": unclassified,
             "high_risk": high,
             "medium_risk": medium,
             "low_risk": low,
-            "filename": analysis.get("filename"),
-            "created_at": analysis.get("created_at")
+            "high_risk_percentage": round(
+                high_risk_percentage,
+                2,
+            ),
+            "medium_risk_percentage": round(
+                medium_risk_percentage,
+                2,
+            ),
+            "low_risk_percentage": round(
+                low_risk_percentage,
+                2,
+            ),
+            "normalized_risk_score": round(
+                normalized_risk_score,
+                2,
+            ),
+            "weighted_risk_points": weighted_points,
+            "domains": domain_stats,
         }
-    
-    return {
-        "contract_1": get_stats(analysis1),
-        "contract_2": get_stats(analysis2),
-        "comparison": {
-            "clause_difference": get_stats(analysis1)["total_clauses"] - get_stats(analysis2)["total_clauses"],
-            "risk_difference": get_stats(analysis1)["high_risk"] - get_stats(analysis2)["high_risk"],
-            "safer_contract": analysis_id_1 if get_stats(analysis1)["high_risk"] < get_stats(analysis2)["high_risk"] else analysis_id_2
-        }
-    }
 
+    contract_1 = get_stats(analysis_1)
+    contract_2 = get_stats(analysis_2)
+    
+    terms_1 = extract_structured_terms(
+    analysis_1
+    )
+
+    terms_2 = extract_structured_terms(
+        analysis_2
+    )
+
+    contract_1["structured_terms"] = terms_1
+    contract_2["structured_terms"] = terms_2
+
+    score_1 = contract_1["normalized_risk_score"]
+    score_2 = contract_2["normalized_risk_score"]
+
+    high_rate_1 = contract_1[
+        "high_risk_percentage"
+    ]
+    high_rate_2 = contract_2[
+        "high_risk_percentage"
+    ]
+
+    safer_contract = None
+    verdict = ""
+    verdict_reasons: List[str] = []
+
+    contract_1_name = (
+        contract_1["filename"] or "Contract 1"
+    )
+    contract_2_name = (
+        contract_2["filename"] or "Contract 2"
+    )
+
+    if score_1 < score_2:
+        safer_contract = analysis_id_1
+        verdict = (
+            f"{contract_1_name} has the lower "
+            "normalized risk score."
+        )
+
+    elif score_2 < score_1:
+        safer_contract = analysis_id_2
+        verdict = (
+            f"{contract_2_name} has the lower "
+            "normalized risk score."
+        )
+
+    elif high_rate_1 < high_rate_2:
+        safer_contract = analysis_id_1
+        verdict = (
+            f"{contract_1_name} has the lower "
+            "high-risk clause rate."
+        )
+
+    elif high_rate_2 < high_rate_1:
+        safer_contract = analysis_id_2
+        verdict = (
+            f"{contract_2_name} has the lower "
+            "high-risk clause rate."
+        )
+
+    else:
+        verdict = (
+            "The contracts have equal normalized "
+            "risk scores and high-risk rates."
+        )
+
+    score_difference = round(
+        score_1 - score_2,
+        2,
+    )
+
+    high_risk_rate_difference = round(
+        high_rate_1 - high_rate_2,
+        2,
+    )
+
+    if score_1 != score_2:
+        verdict_reasons.append(
+            "Normalized risk scores are "
+            f"{score_1} and {score_2}."
+        )
+
+    if high_rate_1 != high_rate_2:
+        verdict_reasons.append(
+            "High-risk clause rates are "
+            f"{high_rate_1}% and {high_rate_2}%."
+        )
+
+    if (
+        contract_1["unclassified_clauses"] > 0
+        or contract_2["unclassified_clauses"] > 0
+    ):
+        verdict_reasons.append(
+            "One or both contracts contain "
+            "unclassified clauses."
+        )
+
+    if not verdict_reasons:
+        verdict_reasons.append(
+            "Both contracts have the same normalized "
+            "risk score and high-risk clause rate."
+        )
+
+    all_domains = sorted(
+        set(contract_1["domains"].keys())
+        | set(contract_2["domains"].keys())
+    )
+
+    all_term_keys = list(term_labels.keys())
+
+    term_comparison = []
+
+    for term_key in all_term_keys:
+        term_1 = terms_1.get(term_key)
+        term_2 = terms_2.get(term_key)
+
+        value_1 = (
+            term_1.get("value")
+            if term_1
+            else None
+        )
+
+        value_2 = (
+            term_2.get("value")
+            if term_2
+            else None
+        )
+
+        if value_1 and value_2:
+            status = (
+                "same"
+                if value_1.strip().lower()
+                == value_2.strip().lower()
+                else "different"
+            )
+
+        elif value_1 and not value_2:
+            status = "only_contract_1"
+
+        elif value_2 and not value_1:
+            status = "only_contract_2"
+
+        else:
+            status = "missing_both"
+
+        term_comparison.append(
+            {
+                "key": term_key,
+                "label": term_labels[
+                    term_key
+                ],
+                "contract_1": term_1,
+                "contract_2": term_2,
+                "status": status,
+            }
+        )
+
+    domain_comparison = []
+
+    def empty_domain_stats() -> Dict[str, Any]:
+        return {
+            "total": 0,
+            "high": 0,
+            "medium": 0,
+            "low": 0,
+            "unclassified": 0,
+            "normalized_risk_score": 0,
+            "high_risk_percentage": 0,
+        }
+
+    for domain in all_domains:
+        domain_1 = contract_1["domains"].get(
+            domain,
+            empty_domain_stats(),
+        )
+
+        domain_2 = contract_2["domains"].get(
+            domain,
+            empty_domain_stats(),
+        )
+
+        domain_comparison.append(
+            {
+                "domain": domain,
+                "contract_1": domain_1,
+                "contract_2": domain_2,
+                "score_difference": round(
+                    domain_1[
+                        "normalized_risk_score"
+                    ]
+                    - domain_2[
+                        "normalized_risk_score"
+                    ],
+                    2,
+                ),
+            }
+        )
+
+    return {
+        "contract_1": contract_1,
+        "contract_2": contract_2,
+        "comparison": {
+            "clause_difference": (
+                contract_1["total_clauses"]
+                - contract_2["total_clauses"]
+            ),
+            "high_risk_difference": (
+                contract_1["high_risk"]
+                - contract_2["high_risk"]
+            ),
+            "normalized_score_difference": (
+                score_difference
+            ),
+            "high_risk_rate_difference": (
+                high_risk_rate_difference
+            ),
+            "safer_contract": safer_contract,
+            "is_tie": safer_contract is None,
+            "verdict": verdict,
+            "verdict_reasons": verdict_reasons,
+            "domain_comparison": domain_comparison,
+            "term_comparison": term_comparison,
+        },
+    }
 
 # --- LLM Settings endpoints ---
 

@@ -87,7 +87,7 @@ export default function AnalysisDetail() {
       toast({
         title: "Summary generated",
         description:
-          "AI executive summary is ready.",
+          "Executive summary is ready.",
       });
     },
 
@@ -969,7 +969,7 @@ export default function AnalysisDetail() {
           <div className="flex items-center justify-between">
             <CardTitle className="flex items-center gap-2">
               <Sparkles className="h-5 w-5" />
-              AI Executive Summary
+              Executive Summary
             </CardTitle>
 
             <Button
@@ -999,7 +999,7 @@ export default function AnalysisDetail() {
           </div>
 
           <CardDescription>
-            AI-generated overview of
+            Overview of
             obligations, major risks, and
             recommendations for this
             contract
