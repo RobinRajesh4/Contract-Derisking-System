@@ -38,12 +38,12 @@ const App = () => (
           <div className="flex min-h-screen w-full">
             <AppSidebar />
 
-            <main className="flex-1 overflow-auto">
-              <header className="sticky top-0 z-10 flex h-14 items-center gap-4 border-b bg-background px-6">
+            <main className="flex flex-1 flex-col overflow-hidden">
+              <header className="sticky top-0 z-10 flex h-14 shrink-0 items-center gap-4 border-b bg-background px-6">
                 <SidebarTrigger />
 
                 <div>
-                  < img src={worldlineLogo} alt="Worldline" className="h-6 w-auto" / >
+                  <img src={worldlineLogo} alt="Worldline" className="h-6 w-auto" />
                 </div>
 
                 <h2 className="text-lg font-semibold">
@@ -51,55 +51,69 @@ const App = () => (
                 </h2>
               </header>
 
-              <div className="p-6">
-                <Routes>
-                  <Route
-                    path="/chat"
-                    element={<Chat />}
-                  />
+              <Routes>
+                {/* Chat gets full height, no padding wrapper */}
+                <Route
+                  path="/chat"
+                  element={
+                    <div className="flex flex-1 flex-col overflow-hidden p-4">
+                      <Chat />
+                    </div>
+                  }
+                />
 
-                  <Route
-                    path="/"
-                    element={<Dashboard />}
-                  />
+                {/* All other pages use the standard padded container */}
+                <Route
+                  path="/*"
+                  element={
+                    <div className="p-6">
+                      <Routes>
+                        <Route
+                          path="/"
+                          element={<Dashboard />}
+                        />
 
-                  <Route
-                    path="/upload"
-                    element={<Upload />}
-                  />
+                        <Route
+                          path="/upload"
+                          element={<Upload />}
+                        />
 
-                  <Route
-                    path="/policies"
-                    element={<Policies />}
-                  />
+                        <Route
+                          path="/policies"
+                          element={<Policies />}
+                        />
 
-                  <Route
-                    path="/analyses"
-                    element={<Analyses />}
-                  />
+                        <Route
+                          path="/analyses"
+                          element={<Analyses />}
+                        />
 
-                  <Route
-                    path="/analyses/:id"
-                    element={<AnalysisDetail />}
-                  />
+                        <Route
+                          path="/analyses/:id"
+                          element={<AnalysisDetail />}
+                        />
 
-                  <Route
-                    path="/insights"
-                    element={<Insights />}
-                  />
+                        <Route
+                          path="/insights"
+                          element={<Insights />}
+                        />
 
-                  <Route
-                    path="/compare"
-                    element={<Compare />}
-                  />
+                        <Route
+                          path="/compare"
+                          element={<Compare />}
+                        />
 
-                  <Route
-                    path="*"
-                    element={<NotFound />}
-                  />
-                </Routes>
-              </div>
+                        <Route
+                          path="*"
+                          element={<NotFound />}
+                        />
+                      </Routes>
+                    </div>
+                  }
+                />
+              </Routes>
             </main>
+
           </div>
         </SidebarProvider>
       </BrowserRouter>

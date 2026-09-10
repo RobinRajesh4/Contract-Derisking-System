@@ -40,3 +40,40 @@
 .read-the-docs {
   color: #888;
 }
+
+/* ─── Contract Document Viewer ─────────────────────────────── */
+
+@keyframes clause-highlight {
+  0% {
+    background: hsl(48 96% 70% / 0.85);
+    box-shadow: 0 0 0 3px hsl(48 96% 55% / 0.7);
+  }
+  60% {
+    background: hsl(48 96% 70% / 0.4);
+    box-shadow: 0 0 0 2px hsl(48 96% 55% / 0.3);
+  }
+  100% {
+    background: transparent;
+    box-shadow: none;
+  }
+}
+
+.clause-highlighted {
+  animation: clause-highlight 3s ease-out forwards;
+  border-radius: 6px;
+  transition: background 0.15s;
+}
+
+/* Drag-to-resize handle between chat and document panes */
+.pane-divider {
+  width: 5px;
+  cursor: col-resize;
+  background: transparent;
+  flex-shrink: 0;
+  transition: background 0.2s;
+}
+.pane-divider:hover,
+.pane-divider.dragging {
+  background: hsl(var(--primary) / 0.35);
+}
+
