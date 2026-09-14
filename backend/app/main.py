@@ -508,6 +508,7 @@ async def chat_endpoint(
 
     context_parts = []
     sources = []
+    filename_cache: Dict[str, str] = {}
 
     for index, result in enumerate(
         results,
@@ -520,16 +521,25 @@ async def chat_endpoint(
         if not clause_text:
             continue
 
+        result_analysis_id = result.get("analysis_id")
+
+        if result_analysis_id not in filename_cache:
+            source_analysis = store.get_analysis(result_analysis_id) or {}
+            filename_cache[result_analysis_id] = (
+                source_analysis.get("filename") or f"Contract {result_analysis_id}"
+            )
+
+        contract_label = filename_cache[result_analysis_id]
+
         context_parts.append(
-            f"[Source {index}]\n{clause_text}"
+            f"[Contract: {contract_label} | Source {index}]\n{clause_text}"
         )
 
         sources.append(
             {
                 "source_number": index,
-                "analysis_id": result.get(
-                    "analysis_id"
-                ),
+                "analysis_id": result_analysis_id,
+                "filename": contract_label,
                 "clause_id": result.get(
                     "clause_id"
                 ),
@@ -553,13 +563,43 @@ async def chat_endpoint(
 
     prompt = f"""
 Use only the contract excerpts below to answer the question.
+Each excerpt is labeled with the contract it came from.
 
-If the answer is not supported by the excerpts, say:
-"I do not know based on the provided contract documents."
+If the question asks you to compare, rank, or pick the "best" contract:
+- Group the excerpts by contract.
+- Weigh them against each other on the risk indicators, obligations,
+  and terms present in the excerpts (e.g. termination rights, liability,
+  payment terms, one-sided clauses, ambiguity/contradictions).
+- State which contract you'd recommend and why, referencing contract
+  names and source numbers.
+- If two or more contracts are genuinely tied or the excerpts don't cover
+  enough ground to compare them, say so explicitly and explain what's
+  missing, rather than refusing outright.
 
-Do not invent contract terms.
-Refer to source numbers when appropriate.
+Only fall back to "I do not know based on the provided contract documents."
+if the excerpts contain no information at all relevant to the question.
+
+Do not invent contract terms that aren't in the excerpts.
 Keep the answer concise and clear.
+
+Whenever you reference a specific excerpt, you MUST cite it using the
+exact literal format [Source N] (square brackets, capital S, the
+number shown next to that excerpt) - for example [Source 1] or
+[Source 3]. Never write "Source N" without the brackets, and never
+invent a source number that wasn't provided.
+
+This citation is required on EVERY sentence or bullet point that makes
+a claim, not just once at the top or in a heading. If you write a list
+of reasons, each individual reason needs its own [Source N] citation,
+even if multiple reasons cite the same source. You can still name the
+contract in prose, but that never replaces the bracketed citation -
+both appear together.
+
+Example of the required style:
+"Contract A has unilateral termination rights for the Service Provider
+[Source 3]. It also imposes a disproportionate penalty on the Client
+for merely discussing termination [Source 3]. In contrast, Contract B's
+term dates are internally consistent [Source 2]."
 
 Contract excerpts:
 
@@ -571,12 +611,22 @@ Question:
 """.strip()
 
     system_prompt = """
-You are a contract question-answering assistant.
+You are a contract analysis assistant that can both answer factual
+questions and make comparative risk judgments across multiple contracts,
+based only on the supplied excerpts.
 
-Answer only using the supplied contract excerpts.
-Do not invent information.
-Do not provide unsupported conclusions.
-Explain that the response is not legal advice when appropriate.
+When asked to compare or recommend, reason about which contract is
+lower-risk or more favorable using the excerpts provided, and give a
+clear recommendation with your reasoning - don't just decline because
+the judgment isn't spelled out verbatim in the text.
+
+Do not invent facts, clauses, or numbers that aren't in the excerpts.
+Always note that this is not legal advice.
+
+Respond in plain text only. Do not use Markdown formatting -
+no asterisks for bold/italic, no #/## headers, no markdown bullet
+or numbered list syntax. Use plain sentences and paragraphs, and
+line breaks or simple dashes if you need a list.
 """.strip()
 
     provider = llm._get_provider()

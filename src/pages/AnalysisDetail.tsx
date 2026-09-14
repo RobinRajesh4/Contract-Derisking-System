@@ -6,7 +6,7 @@ import {
   ContractSummary,
 } from "@/services/analysis";
 import { apiFetch } from "@/services/api";
-import { useState } from "react";
+import { useState,useEffect } from "react";
 import {
   Card,
   CardContent,
@@ -76,6 +76,15 @@ export default function AnalysisDetail() {
 
   const [summary, setSummary] =
     useState<ContractSummary | null>(null);
+
+  // If a summary was already generated in a previous session, it's
+  // persisted on the analysis record - use it instead of forcing
+  // the user to regenerate on every visit.
+  useEffect(() => {
+    if (!summary && data?.summary) {
+      setSummary(data.summary as ContractSummary);
+    }
+  }, [data, summary]);
 
   const summaryMutation = useMutation({
     mutationFn: () =>

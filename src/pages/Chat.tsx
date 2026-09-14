@@ -41,6 +41,23 @@ interface Message {
   sources?: Source[];
 }
 
+
+/**
+ * Strip common Markdown syntax so it doesn't render as literal
+ * asterisks/hashes in the plain-text chat bubble.
+ */
+function stripMarkdown(text: string): string {
+  return text
+    .replace(/^#{1,6}\s+/gm, "") // headers
+    .replace(/\*\*\*(.+?)\*\*\*/g, "$1") // bold+italic
+    .replace(/\*\*(.+?)\*\*/g, "$1") // bold
+    .replace(/\*(.+?)\*/g, "$1") // italic
+    .replace(/__(.+?)__/g, "$1") // bold (underscore)
+    .replace(/_(.+?)_/g, "$1") // italic (underscore)
+    .replace(/^\s*[-*+]\s+/gm, "\u2022 ") // bullet lists -> •
+    .replace(/`{1,3}([^`]+)`{1,3}/g, "$1"); // inline/code fences
+}
+
 /* ─── Helpers ────────────────────────────────────────────── */
 
 /**
@@ -458,7 +475,7 @@ export default function Chat() {
                     {/* Message text with inline [Source N] refs linkified */}
                     <p className="whitespace-pre-wrap leading-relaxed">
                       {isBot
-                        ? linkifySourceRefs(message.content, (n) => {
+                        ? linkifySourceRefs(stripMarkdown(message.content), (n) => {
                             const src = lastSourceMap[n];
                             if (src) handleSourceClick(src);
                           })
