@@ -557,76 +557,45 @@ async def chat_endpoint(
             "sources": [],
         }
 
+    global_context = ""
+    if not request.analysis_id or request.analysis_id == "all":
+        all_analyses = store.list_analyses()
+        if all_analyses:
+            dir_lines = ["\nAvailable Contracts Directory (Use this to answer listing/filtering questions):"]
+            for a in all_analyses:
+                file_name = a.get("filename") or f"Contract {a.get('analysis_id')}"
+                dir_lines.append(f"- ID: {a.get('analysis_id')} | Name: {file_name}")
+            global_context = "\n".join(dir_lines) + "\n\n"
+
     context = "\n\n".join(
         context_parts
     )
 
     prompt = f"""
-Use only the contract excerpts below to answer the question.
-Each excerpt is labeled with the contract it came from.
+Use the context provided below to answer the question.
+If the question asks to list contracts based on specific criteria (e.g. by customer, end date, value), use the Available Contracts Directory in combination with the excerpts to form your answer.
+When listing contracts, you MUST format your response as a Markdown table with exactly these columns:
+| # | customer name | date of contract ending | contract about | link |
+For the 'link' column, use a markdown link with the exact format: [View](#source-<ID>) where <ID> is the actual contract ID.
 
-If the question asks you to compare, rank, or pick the "best" contract:
-- Group the excerpts by contract.
-- Weigh them against each other on the risk indicators, obligations,
-  and terms present in the excerpts (e.g. termination rights, liability,
-  payment terms, one-sided clauses, ambiguity/contradictions).
-- State which contract you'd recommend and why, referencing contract
-  names and source numbers.
-- If two or more contracts are genuinely tied or the excerpts don't cover
-  enough ground to compare them, say so explicitly and explain what's
-  missing, rather than refusing outright.
-
-Only fall back to "I do not know based on the provided contract documents."
-if the excerpts contain no information at all relevant to the question.
-
-Do not invent contract terms that aren't in the excerpts.
-Keep the answer concise and clear.
-
-Whenever you reference a specific excerpt, you MUST cite it using the
-exact literal format [Source N] (square brackets, capital S, the
-number shown next to that excerpt) - for example [Source 1] or
-[Source 3]. Never write "Source N" without the brackets, and never
-invent a source number that wasn't provided.
-
-This citation is required on EVERY sentence or bullet point that makes
-a claim, not just once at the top or in a heading. If you write a list
-of reasons, each individual reason needs its own [Source N] citation,
-even if multiple reasons cite the same source. You can still name the
-contract in prose, but that never replaces the bracketed citation -
-both appear together.
-
-Example of the required style:
-"Contract A has unilateral termination rights for the Service Provider
-[Source 3]. It also imposes a disproportionate penalty on the Client
-for merely discussing termination [Source 3]. In contrast, Contract B's
-term dates are internally consistent [Source 2]."
-
+{global_context}
 Contract excerpts:
-
 {context}
 
 Question:
-
 {query}
 """.strip()
 
     system_prompt = """
-You are a contract analysis assistant that can both answer factual
-questions and make comparative risk judgments across multiple contracts,
-based only on the supplied excerpts.
+You are a highly capable contract analysis assistant. You answer factual questions, make comparative risk judgments, draft new clauses, and filter contracts.
 
-When asked to compare or recommend, reason about which contract is
-lower-risk or more favorable using the excerpts provided, and give a
-clear recommendation with your reasoning - don't just decline because
-the judgment isn't spelled out verbatim in the text.
-
-Do not invent facts, clauses, or numbers that aren't in the excerpts.
-Always note that this is not legal advice.
-
-Respond in plain text only. Do not use Markdown formatting -
-no asterisks for bold/italic, no #/## headers, no markdown bullet
-or numbered list syntax. Use plain sentences and paragraphs, and
-line breaks or simple dashes if you need a list.
+Guidelines:
+1. Be always specific, precise and correct. Always check responses for correctness.
+2. If asked to list contracts, ALWAYS use a Markdown table formatted with exactly these columns: # | customer name | date of contract ending | contract about | link. Sort them logically (e.g., ending sooner on top, or active on top). Use [View](#source-<ID>) for links.
+3. Be proactive: Ask relevant follow-up questions at the end of your response (e.g., "do you want me to list expired contracts too?" or "would you like me to draft an amended clause?").
+4. When you reference a specific excerpt, you MUST cite it using a Markdown link in the exact format: [Source N](#source-N). For example: [Source 1](#source-1) or [Source 3](#source-3). This citation is required on every claim you make based on an excerpt.
+5. If drafting a new contract or clause (e.g. "prepare new contract with new indemnification clause"), provide the drafted text clearly in Markdown blockquotes or code blocks.
+6. Use standard Markdown formatting (bold, italic, lists, tables) freely to make your response highly readable.
 """.strip()
 
     provider = llm._get_provider()

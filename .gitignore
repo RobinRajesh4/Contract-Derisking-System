@@ -1,4 +1,4 @@
-﻿# Python virtual environments
+# Python virtual environments
 backend/venv/
 venv/
 .venv/
@@ -44,3 +44,4 @@ Thumbs.db
 # Runtime-generated application data
 2
 backend/data/analyses.json
+.ipynb_checkpoints/

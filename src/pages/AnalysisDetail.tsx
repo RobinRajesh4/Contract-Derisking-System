@@ -6,7 +6,7 @@ import {
   ContractSummary,
 } from "@/services/analysis";
 import { apiFetch } from "@/services/api";
-import { useState,useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   Card,
   CardContent,
@@ -48,6 +48,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/hooks/use-toast";
+import DocumentViewer from "@/components/DocumentViewer";
 
 export default function AnalysisDetail() {
   const { id } = useParams<{ id: string }>();
@@ -76,6 +77,32 @@ export default function AnalysisDetail() {
 
   const [summary, setSummary] =
     useState<ContractSummary | null>(null);
+
+  /* ── Split-pane state ── */
+  const [highlightedClauseId, setHighlightedClauseId] = useState<
+    string | number | null
+  >(null);
+  const [leftWidth, setLeftWidth] = useState(55); // percent
+  const isDragging = useRef(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const dividerRef = useRef<HTMLDivElement>(null);
+
+  /* Drag-to-resize logic */
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      if (!isDragging.current || !containerRef.current) return;
+      const rect = containerRef.current.getBoundingClientRect();
+      const pct = ((e.clientX - rect.left) / rect.width) * 100;
+      setLeftWidth(Math.min(Math.max(pct, 25), 75));
+    };
+    const onUp = () => { isDragging.current = false; document.body.style.cursor = ""; };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, []);
 
   // If a summary was already generated in a previous session, it's
   // persisted on the analysis record - use it instead of forcing
@@ -731,7 +758,16 @@ export default function AnalysisDetail() {
   };
 
   return (
-    <div className="space-y-6 max-w-7xl mx-auto">
+    <div
+      ref={containerRef}
+      className="flex h-[calc(100vh-4rem)] overflow-hidden"
+    >
+      {/* ── LEFT: Analysis content ── */}
+      <div
+        className="flex flex-col overflow-y-auto"
+        style={{ width: `${leftWidth}%` }}
+      >
+      <div className="space-y-6 max-w-4xl mx-auto p-6 w-full">
       {/* Header */}
       <div className="space-y-2">
         <div className="flex items-start justify-between gap-4">
@@ -1151,7 +1187,12 @@ export default function AnalysisDetail() {
               return (
                 <Card
                   key={c.id}
-                  className={`transition-all hover:shadow-md ${
+                  onClick={() => setHighlightedClauseId(c.id)}
+                  className={`transition-all hover:shadow-md cursor-pointer ${
+                    highlightedClauseId === c.id
+                      ? "ring-2 ring-primary ring-offset-1"
+                      : ""
+                  } ${
                     riskLower === "high"
                       ? "border-l-4 border-l-red-500"
                       : riskLower ===
@@ -1423,6 +1464,43 @@ export default function AnalysisDetail() {
               );
             }
           )}
+        </div>
+      </div>
+    </div> {/* end left content */}
+      </div> {/* end left pane */}
+
+      {/* ── Drag divider ── */}
+      <div
+        ref={dividerRef}
+        onMouseDown={() => {
+          isDragging.current = true;
+          document.body.style.cursor = "col-resize";
+        }}
+        className="w-1.5 shrink-0 cursor-col-resize bg-border hover:bg-primary/40 transition-colors active:bg-primary/60"
+        title="Drag to resize"
+      />
+
+      {/* ── RIGHT: Document viewer ── */}
+      <div
+        className="flex flex-col overflow-hidden border-l bg-muted/20"
+        style={{ width: `${100 - leftWidth}%` }}
+      >
+        <div className="shrink-0 px-4 py-2 border-b bg-background/80 flex items-center gap-2">
+          <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+            Original Document
+          </span>
+          {highlightedClauseId !== null && (
+            <span className="text-xs text-primary">
+              — §{highlightedClauseId} highlighted
+            </span>
+          )}
+        </div>
+        <div className="flex-1 overflow-hidden">
+          <DocumentViewer
+            analysisId={id ?? null}
+            highlightedClauseId={highlightedClauseId}
+            emptyLabel="Click any clause on the left to jump to it here."
+          />
         </div>
       </div>
     </div>

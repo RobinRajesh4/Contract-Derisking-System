@@ -168,7 +168,7 @@ class OllamaProvider(BaseLLMProvider):
         if REQUESTS_AVAILABLE and _requests_module is not None:
             try:
                 url = f"{self.base_url}/api/generate"
-                payload = {"model": self.model, "prompt": full_prompt, "temperature": float(temperature),"stream":False}
+                payload = {"model": self.model, "prompt": full_prompt, "temperature": float(temperature), "stream": False}
 
                 def _call_http():
                     r = _requests_module.post(url, json=payload, timeout=TIMEOUT_SEC)

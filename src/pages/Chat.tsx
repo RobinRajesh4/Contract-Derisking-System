@@ -8,12 +8,12 @@ import {
 import { useQuery } from "@tanstack/react-query";
 import {
   Bot,
-  FileText,
   Send,
   User,
-  BookOpen,
   ChevronRight,
 } from "lucide-react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -23,7 +23,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { listAnalyses, getAnalysis } from "@/services/analysis";
+import { listAnalyses } from "@/services/analysis";
+import DocumentViewer from "@/components/DocumentViewer";
 
 /* ─── Types ──────────────────────────────────────────────── */
 
@@ -46,163 +47,7 @@ interface Message {
  * Strip common Markdown syntax so it doesn't render as literal
  * asterisks/hashes in the plain-text chat bubble.
  */
-function stripMarkdown(text: string): string {
-  return text
-    .replace(/^#{1,6}\s+/gm, "") // headers
-    .replace(/\*\*\*(.+?)\*\*\*/g, "$1") // bold+italic
-    .replace(/\*\*(.+?)\*\*/g, "$1") // bold
-    .replace(/\*(.+?)\*/g, "$1") // italic
-    .replace(/__(.+?)__/g, "$1") // bold (underscore)
-    .replace(/_(.+?)_/g, "$1") // italic (underscore)
-    .replace(/^\s*[-*+]\s+/gm, "\u2022 ") // bullet lists -> •
-    .replace(/`{1,3}([^`]+)`{1,3}/g, "$1"); // inline/code fences
-}
-
 /* ─── Helpers ────────────────────────────────────────────── */
-
-/**
- * Replace "[Source N]" markers inside reply text with styled
- * inline superscript spans so they visually match the source chips.
- */
-function linkifySourceRefs(
-  text: string,
-  onClickRef: (n: number) => void
-): React.ReactNode[] {
-  const parts = text.split(/(\[Source \d+\])/g);
-  return parts.map((part, i) => {
-    const m = part.match(/\[Source (\d+)\]/);
-    if (m) {
-      const num = parseInt(m[1], 10);
-      return (
-        <button
-          key={i}
-          onClick={() => onClickRef(num)}
-          className="mx-0.5 inline-flex h-4 w-4 items-center justify-center rounded-full bg-primary/20 text-[10px] font-bold text-primary ring-1 ring-primary/40 hover:bg-primary/40 transition-colors cursor-pointer align-super"
-          title={`Jump to Source ${num}`}
-        >
-          {num}
-        </button>
-      );
-    }
-    return <span key={i}>{part}</span>;
-  });
-}
-
-/* ─── Document Viewer ────────────────────────────────────── */
-
-interface DocumentViewerProps {
-  analysisId: string | null;
-  highlightedClauseId: string | number | null;
-}
-
-function DocumentViewer({
-  analysisId,
-  highlightedClauseId,
-}: DocumentViewerProps) {
-  const { data, isLoading, isError } = useQuery({
-    queryKey: ["analysis-clauses", analysisId],
-    queryFn: () => getAnalysis(analysisId as string),
-    enabled: !!analysisId,
-  });
-
-  const clauseRefs = useRef<Record<string | number, HTMLDivElement | null>>({});
-
-  // Scroll to + flash the highlighted clause whenever it changes
-  useEffect(() => {
-    if (highlightedClauseId == null) return;
-
-    const el = clauseRefs.current[highlightedClauseId];
-    if (!el) return;
-
-    // Remove old animation class so it can re-trigger
-    el.classList.remove("clause-highlighted");
-    // Force reflow to restart animation
-    void el.offsetWidth;
-    el.classList.add("clause-highlighted");
-
-    el.scrollIntoView({ behavior: "smooth", block: "center" });
-
-    const timer = setTimeout(() => {
-      el.classList.remove("clause-highlighted");
-    }, 3200);
-
-    return () => clearTimeout(timer);
-  }, [highlightedClauseId]);
-
-  if (!analysisId) {
-    return (
-      <div className="flex h-full flex-col items-center justify-center gap-4 text-muted-foreground">
-        <BookOpen className="h-12 w-12 opacity-30" />
-        <div className="text-center">
-          <p className="text-sm font-medium">No contract selected</p>
-          <p className="mt-1 text-xs opacity-70">
-            Select a specific contract from the dropdown to view the document
-            and jump to referenced clauses.
-          </p>
-        </div>
-      </div>
-    );
-  }
-
-  if (isLoading) {
-    return (
-      <div className="flex h-full items-center justify-center text-muted-foreground">
-        <div className="flex flex-col items-center gap-3">
-          <div className="h-6 w-6 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-          <p className="text-xs">Loading document…</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (isError || !data) {
-    return (
-      <div className="flex h-full items-center justify-center text-destructive">
-        <p className="text-sm">Failed to load document.</p>
-      </div>
-    );
-  }
-
-  const clauses: Array<{ id: string | number; text: string }> =
-    data.clauses ?? data.results ?? [];
-
-  const filename: string = data.filename ?? "Contract";
-
-  return (
-    <div className="flex h-full flex-col overflow-hidden">
-      {/* Document header */}
-      <div className="shrink-0 border-b bg-muted/50 px-5 py-3">
-        <div className="flex items-center gap-2">
-          <FileText className="h-4 w-4 text-primary" />
-          <span className="truncate text-sm font-semibold">{filename}</span>
-        </div>
-        <p className="mt-0.5 text-xs text-muted-foreground">
-          {clauses.length} clause{clauses.length !== 1 ? "s" : ""}
-        </p>
-      </div>
-
-      {/* Clause list */}
-      <div className="flex-1 overflow-y-auto p-5 space-y-4">
-        {clauses.map((clause) => (
-          <div
-            key={clause.id}
-            ref={(el) => {
-              clauseRefs.current[clause.id] = el;
-            }}
-            data-clause-id={clause.id}
-            className="group relative rounded-md border border-border/40 bg-background p-4 text-sm leading-relaxed transition-colors hover:border-border"
-          >
-            {/* Clause number badge */}
-            <span className="mb-2 inline-block rounded bg-muted px-1.5 py-0.5 text-[10px] font-bold text-muted-foreground">
-              §{clause.id}
-            </span>
-            <p className="whitespace-pre-wrap text-foreground/90">{clause.text}</p>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
 
 /* ─── Main Chat Component ────────────────────────────────── */
 
@@ -472,15 +317,45 @@ export default function Chat() {
                         : "bg-primary text-primary-foreground"
                     }`}
                   >
-                    {/* Message text with inline [Source N] refs linkified */}
-                    <p className="whitespace-pre-wrap leading-relaxed">
-                      {isBot
-                        ? linkifySourceRefs(stripMarkdown(message.content), (n) => {
-                            const src = lastSourceMap[n];
-                            if (src) handleSourceClick(src);
-                          })
-                        : message.content}
-                    </p>
+                    <div className="whitespace-pre-wrap leading-relaxed prose prose-sm max-w-none dark:prose-invert">
+                      {isBot ? (
+                        <ReactMarkdown
+                          remarkPlugins={[remarkGfm]}
+                          components={{
+                            a: ({ node, ...props }) => {
+                              if (props.href?.startsWith("#source-")) {
+                                const num = parseInt(props.href.replace("#source-", ""), 10);
+                                return (
+                                  <button
+                                    onClick={(e) => {
+                                      e.preventDefault();
+                                      const src = lastSourceMap[num];
+                                      if (src) handleSourceClick(src);
+                                    }}
+                                    className="mx-0.5 inline-flex h-4 w-4 items-center justify-center rounded-full bg-primary/20 text-[10px] font-bold text-primary ring-1 ring-primary/40 hover:bg-primary/40 transition-colors cursor-pointer align-super"
+                                    title={`Jump to Source ${num}`}
+                                  >
+                                    {num}
+                                 </button>
+                                );
+                              }
+                              return (
+                                <a
+                                  {...props}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="text-primary underline hover:text-primary/80"
+                                />
+                              );
+                            },
+                          }}
+                        >
+                          {message.content}
+                        </ReactMarkdown>
+                      ) : (
+                        <p>{message.content}</p>
+                      )}
+                    </div>
 
                     {/* Source chips */}
                     {isBot &&
