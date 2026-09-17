@@ -39,6 +39,7 @@ def list_policies() -> List[Dict[str, Any]]:
 
 # --- simple evaluators -------------------------------------------------------
 
+
 def _extract_keywords(check_text: str) -> List[str]:
     # crude keyword extraction from check directive
     words = re.findall(r"[A-Za-z]{4,}", check_text or "")
@@ -59,10 +60,12 @@ def _policy_match(clause_text: str, check_text: str) -> bool:
     if not kws:
         return False
     hits = sum(1 for k in kws if k in t)
-    return hits >= max(2, len(kws)//3)
+    return hits >= max(2, len(kws) // 3)
 
 
-def apply_policy(clauses: List[Dict[str, Any]], policy: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def apply_policy(
+    clauses: List[Dict[str, Any]], policy: Dict[str, Any]
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     domain_map = {}
     for d in policy.get("domains", []):
         domain_map[d.get("domain_name", "")] = d
@@ -74,7 +77,11 @@ def apply_policy(clauses: List[Dict[str, Any]], policy: Dict[str, Any]) -> Tuple
 
     for c in clauses:
         text = c.get("text", "")
-        domain = (c.get("classification", {}).get("domain") or c.get("metadata", {}).get("domain") or "Other")
+        domain = (
+            c.get("classification", {}).get("domain")
+            or c.get("metadata", {}).get("domain")
+            or "Other"
+        )
         dspec = domain_map.get(domain) or {}
         mps = dspec.get("micro_policies", [])
 
@@ -91,28 +98,34 @@ def apply_policy(clauses: List[Dict[str, Any]], policy: Dict[str, Any]) -> Tuple
                 matched.append(pid)
             else:
                 # treat as violation and accumulate risk score
-                violations.append({"id": pid, "name": mp.get("name"), "risk_weight": weight})
+                violations.append(
+                    {"id": pid, "name": mp.get("name"), "risk_weight": weight}
+                )
                 score += weight
 
         total_score += score
         if violations:
             non_compliant_items.extend(v.get("id") for v in violations)
 
-        enriched.append({
-            **c,
-            "policy": {
-                "domain": domain,
-                "matched_policies": matched,
-                "violations": violations,
-                "policy_score": score,
+        enriched.append(
+            {
+                **c,
+                "policy": {
+                    "domain": domain,
+                    "matched_policies": matched,
+                    "violations": violations,
+                    "policy_score": score,
+                },
             }
-        })
+        )
 
     risk_threshold = int(policy.get("risk_threshold", 0))
     summary = {
         "policy_id": policy.get("policy_id"),
         "total_policy_score": total_score,
-        "is_above_threshold": total_score >= risk_threshold if risk_threshold else False,
+        "is_above_threshold": (
+            total_score >= risk_threshold if risk_threshold else False
+        ),
         "non_compliant_items": non_compliant_items,
         "domains_covered": len(policy.get("domains", [])),
     }

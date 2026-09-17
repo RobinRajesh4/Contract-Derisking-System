@@ -1,17 +1,19 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Body
+from fastapi.responses import FileResponse
 from typing import List as TypingList
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import orjson
+import os
 from dotenv import load_dotenv
 import re
 
 # Load env from .env (GROQ_API_KEY, QDRANT_URL, etc.)
 load_dotenv()
 
-from .parser import extract_text_from_file, split_into_clauses, extract_metadata
+from .parser import extract_text_from_file, split_into_clauses, extract_metadata, assign_clause_pages
 from .store import Store
 from .mcp.llm_agent import LLMClient
 from .policy import save_policy, get_policy, list_policies, apply_policy
@@ -66,6 +68,35 @@ app.add_middleware(
 )
 
 store = Store()
+
+
+def _persist_original_file(
+    analysis_id: str,
+    filename: str,
+    content: bytes,
+    content_type: Optional[str],
+) -> None:
+    """Save the raw uploaded file to disk and record its path, so the
+    frontend can later render the real document instead of only our
+    parsed text."""
+    try:
+        uploads_dir = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "uploaded_files"
+        )
+        os.makedirs(uploads_dir, exist_ok=True)
+
+        _, ext = os.path.splitext(filename or "")
+        stored_path = os.path.join(uploads_dir, f"{analysis_id}{ext}")
+
+        with open(stored_path, "wb") as f:
+            f.write(content)
+
+        store.update_analysis(
+            analysis_id,
+            {"file_path": stored_path, "content_type": content_type},
+        )
+    except Exception as error:
+        print(f"Failed to persist original file for {analysis_id}: {error}")
 llm = LLMClient()
 rag = None
 
@@ -93,10 +124,11 @@ else:
 async def upload(file: UploadFile = File(...)):
     try:
         content = await file.read()
-        text, ocr_info = extract_text_from_file(file.filename, content)
+        text, ocr_info, pages = extract_text_from_file(file.filename, content)
         if not text or not text.strip():
             raise HTTPException(status_code=400, detail="No text could be extracted from the file")
         clauses = split_into_clauses(text)
+        clause_pages = assign_clause_pages(clauses, pages)
         items = []
         for idx, clause_text in enumerate(clauses, start=1):
             meta = extract_metadata(clause_text)
@@ -104,6 +136,7 @@ async def upload(file: UploadFile = File(...)):
                 "id": idx,
                 "text": clause_text,
                 "metadata": meta,
+                "page": clause_pages[idx - 1],
             })
         analysis_id = store.save_analysis({
             "filename": file.filename,
@@ -113,6 +146,10 @@ async def upload(file: UploadFile = File(...)):
             "file_size": len(content),
             "ocr_info": ocr_info,
         })
+
+        _persist_original_file(
+            analysis_id, file.filename, content, file.content_type
+        )
         # Upsert clauses into Qdrant for later retrieval (best-effort)
         if rag is not None:
             try:
@@ -151,12 +188,13 @@ async def batch_upload(files: TypingList[UploadFile] = File(...)):
     for file in files:
         try:
             content = await file.read()
-            text, ocr_info = extract_text_from_file(file.filename, content)
+            text, ocr_info, pages = extract_text_from_file(file.filename, content)
             if not text or not text.strip():
                 errors.append({"filename": file.filename, "error": "No text could be extracted"})
                 continue
                 
             clauses = split_into_clauses(text)
+            clause_pages = assign_clause_pages(clauses, pages)
             items = []
             for idx, clause_text in enumerate(clauses, start=1):
                 meta = extract_metadata(clause_text)
@@ -164,6 +202,7 @@ async def batch_upload(files: TypingList[UploadFile] = File(...)):
                     "id": idx,
                     "text": clause_text,
                     "metadata": meta,
+                    "page": clause_pages[idx - 1],
                 })
             
             analysis_id = store.save_analysis({
@@ -174,6 +213,10 @@ async def batch_upload(files: TypingList[UploadFile] = File(...)):
                 "file_size": len(content),
                 "ocr_info": ocr_info,
             })
+
+            _persist_original_file(
+                analysis_id, file.filename, content, file.content_type
+            )
             
             if rag is not None:
                 try:
@@ -375,6 +418,24 @@ async def get_analysis(analysis_id: str):
         raise HTTPException(status_code=404, detail="Not found")
     return data
 
+@app.get("/clauses/{analysis_id}/file")
+async def get_analysis_file(analysis_id: str):
+    data = store.get_analysis(analysis_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    file_path = data.get("file_path")
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(
+            status_code=404,
+            detail="Original file not available for this analysis",
+        )
+
+    return FileResponse(
+        path=file_path,
+        media_type=data.get("content_type") or "application/pdf",
+        filename=data.get("filename") or os.path.basename(file_path),
+    )
 
 @app.get("/")
 async def root():
@@ -573,10 +634,38 @@ async def chat_endpoint(
 
     prompt = f"""
 Use the context provided below to answer the question.
-If the question asks to list contracts based on specific criteria (e.g. by customer, end date, value), use the Available Contracts Directory in combination with the excerpts to form your answer.
-When listing contracts, you MUST format your response as a Markdown table with exactly these columns:
-| # | customer name | date of contract ending | contract about | link |
-For the 'link' column, use a markdown link with the exact format: [View](#source-<ID>) where <ID> is the actual contract ID.
+If the question asks to list contracts based on specific criteria (e.g. by customer, end date, value, a clause type, IP terms), use the Available Contracts Directory in combination with the excerpts to form your answer.
+
+When listing contracts, respond as a Markdown table. Choose ONLY the columns that are relevant to what was asked - don't always use the same fixed columns:
+- Listing by end date / expiry -> # | customer name | date of contract ending | contract about | link, sorted soonest-ending first
+- Listing by customer name -> # | customer name | date of contract ending | contract about | link, sorted active contracts first
+- Listing by a clause topic (e.g. "which contracts share IP with customer") -> # | customer name | contract about | link (omit date/value columns that weren't asked for)
+- Listing by contract value -> # | contract date | contract value | link
+Always include a 'link' column using the exact format: [View](#contract-<ID>) where <ID> is the contract's ID from the Available Contracts Directory.
+Pick the sort order and columns that best fit the specific question asked, rather than a single fixed template.
+
+If the question is a yes/no clause-quality check (e.g. "is the indemnification clause weaker in these contracts", "does X contract have Y protection"), lead with a short, direct answer: Yes / No / Partially / It depends, followed by one or two sentences of the specific reasoning. Don't write a long essay for a yes/no question.
+
+If the question asks to compare, rank, or pick the "best"/"worst"/"safest" contract:
+- Group the excerpts by contract.
+- Weigh them against each other on the risk indicators, obligations,
+  and terms present in the excerpts (e.g. termination rights, liability,
+  payment terms, one-sided clauses, ambiguity/contradictions).
+- State which contract you'd recommend and why, referencing contract
+  names and source numbers.
+- If two or more contracts are genuinely tied or the excerpts don't cover
+  enough ground to compare them, say so explicitly and explain what's
+  missing, rather than refusing outright.
+- If every retrieved excerpt is from the same single contract, say so
+  plainly (name that contract) instead of implying there's nothing to compare.
+
+Only fall back to "I do not know based on the provided contract documents."
+if the excerpts contain no information at all relevant to the question.
+
+Do not invent contract terms that aren't in the excerpts.
+Be specific, precise, and correct - double check names, dates, and numbers
+against the excerpts before answering.
+Keep answers concise; don't pad with repeated caveats.
 
 {global_context}
 Contract excerpts:
@@ -587,15 +676,16 @@ Question:
 """.strip()
 
     system_prompt = """
-You are a highly capable contract analysis assistant. You answer factual questions, make comparative risk judgments, draft new clauses, and filter contracts.
+You are a highly capable contract analysis assistant. You answer factual questions, make comparative risk judgments, draft new clauses, and filter/list contracts.
 
 Guidelines:
-1. Be always specific, precise and correct. Always check responses for correctness.
-2. If asked to list contracts, ALWAYS use a Markdown table formatted with exactly these columns: # | customer name | date of contract ending | contract about | link. Sort them logically (e.g., ending sooner on top, or active on top). Use [View](#source-<ID>) for links.
-3. Be proactive: Ask relevant follow-up questions at the end of your response (e.g., "do you want me to list expired contracts too?" or "would you like me to draft an amended clause?").
-4. When you reference a specific excerpt, you MUST cite it using a Markdown link in the exact format: [Source N](#source-N). For example: [Source 1](#source-1) or [Source 3](#source-3). This citation is required on every claim you make based on an excerpt.
-5. If drafting a new contract or clause (e.g. "prepare new contract with new indemnification clause"), provide the drafted text clearly in Markdown blockquotes or code blocks.
-6. Use standard Markdown formatting (bold, italic, lists, tables) freely to make your response highly readable.
+1. Always be specific, precise, and correct. Double-check every fact, name, date, and number against the excerpts before answering.
+2. If asked to list contracts, ALWAYS respond as a Markdown table, but pick columns and sort order to match what was actually asked (see examples in the prompt) rather than one fixed template for every listing question. Use [View](#contract-<ID>) for links, where <ID> is the contract's ID from the Available Contracts Directory.
+3. If asked a yes/no clause-quality question, answer with Yes / No / Partially / It depends up front, then briefly justify it. Don't over-explain a simple question.
+4. Be proactive: end with a relevant, specific follow-up question tied to what was just asked (e.g. "do you want me to list expired contracts too?", "would you like me to draft an amended clause for this?") - not a generic closing line every time.
+5. When you reference a specific excerpt, you MUST cite it using a Markdown link in the exact format: [Source N](#source-N). This citation is required on every claim you make based on an excerpt.
+6. If drafting a new contract or clause, provide the drafted text clearly in a Markdown blockquote or code block, clearly separated from your explanation.
+7. Use standard Markdown formatting (bold, italic, lists, tables) freely to make your response readable.
 """.strip()
 
     provider = llm._get_provider()

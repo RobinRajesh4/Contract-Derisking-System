@@ -299,7 +299,7 @@ export default function Insights() {
             {filtered.length !== 1
               ? "s"
               : ""}{" "}
-            match your filters — jump to
+            match your filters - jump to
             detail, generate a summary, or
             compare
           </CardDescription>

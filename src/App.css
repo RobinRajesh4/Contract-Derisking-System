@@ -21,6 +21,11 @@
   transition: background 0.15s;
 }
 
+.pdf-clause-highlight {
+  background: hsl(48 96% 65% / 0.55);
+  border-radius: 2px;
+}
+
 /* Drag-to-resize handle between chat and document panes */
 .pane-divider {
   width: 5px;

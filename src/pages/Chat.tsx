@@ -6,6 +6,8 @@ import {
   useState,
 } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useNavigate } from "react-router-dom";
+
 import {
   Bot,
   Send,
@@ -31,6 +33,7 @@ import DocumentViewer from "@/components/DocumentViewer";
 interface Source {
   source_number?: number;
   analysis_id?: string;
+  filename?: string;
   clause_id?: string | number;
   text: string;
   score?: number;
@@ -52,6 +55,8 @@ interface Message {
 /* ─── Main Chat Component ────────────────────────────────── */
 
 export default function Chat() {
+  const navigate = useNavigate();
+
   /* ── State: messages ─── */
   const [messages, setMessages] = useState<Message[]>(() => {
     const saved = sessionStorage.getItem("contract-chat-messages");
@@ -302,7 +307,7 @@ export default function Chat() {
               return (
                 <div
                   key={index}
-                  className={`flex gap-3 ${isBot ? "" : "justify-end"}`}
+                  className={`flex gap-3 min-w-0 ${isBot ? "" : "justify-end"}`}
                 >
                   {isBot && (
                     <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-primary/10">
@@ -311,18 +316,37 @@ export default function Chat() {
                   )}
 
                   <div
-                    className={`max-w-[85%] rounded-xl px-4 py-3 text-sm ${
+                    className={`max-w-[85%] min-w-0 rounded-xl px-4 py-3 text-sm ${
                       isBot
                         ? "bg-muted text-foreground"
                         : "bg-primary text-primary-foreground"
                     }`}
                   >
-                    <div className="whitespace-pre-wrap leading-relaxed prose prose-sm max-w-none dark:prose-invert">
+                    <div className="whitespace-pre-wrap break-words leading-relaxed prose prose-sm max-w-none dark:prose-invert prose-table:block prose-table:overflow-x-auto prose-table:w-max prose-table:max-w-full">
                       {isBot ? (
                         <ReactMarkdown
                           remarkPlugins={[remarkGfm]}
                           components={{
+                            table: ({ node, ...props }) => (
+                              <div className="max-w-full overflow-x-auto">
+                                <table {...props} />
+                              </div>
+                            ),
                             a: ({ node, ...props }) => {
+                              if (props.href?.startsWith("#contract-")) {
+                                const contractId = props.href.replace("#contract-", "");
+                                return (
+                                  <button
+                                    onClick={(e) => {
+                                      e.preventDefault();
+                                      navigate(`/analyses/${contractId}`);
+                                    }}
+                                    className="text-primary underline hover:text-primary/80"
+                                  >
+                                    View
+                                  </button>
+                                );
+                              }
                               if (props.href?.startsWith("#source-")) {
                                 const num = parseInt(props.href.replace("#source-", ""), 10);
                                 return (
@@ -379,6 +403,11 @@ export default function Chat() {
                                 </span>
 
                                 <div className="min-w-0 flex-1">
+                                  {source.filename && (
+                                    <p className="mb-0.5 truncate text-[10px] font-semibold text-foreground/70">
+                                      {source.filename}
+                                    </p>
+                                  )}
                                   <p className="line-clamp-2 leading-snug text-foreground/80">
                                     {source.text}
                                   </p>

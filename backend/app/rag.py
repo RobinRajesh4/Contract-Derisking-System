@@ -61,7 +61,7 @@ class RAGStore:
         self.collection = collection
         self.embedding_model = embedding_model
         self.ollama_url = OLLAMA_URL
-
+        
         # Generate one test embedding to confirm that Ollama and
         # the embedding model are available and determine dimension.
         test_vectors = self.embed(
@@ -199,8 +199,7 @@ class RAGStore:
         """
         Add or update contract clauses in local Qdrant storage.
         """
-
-        if not clauses:
+        if not clauses: 
             return
 
         searchable_clauses = [

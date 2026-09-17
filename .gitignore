@@ -42,6 +42,6 @@ npm-debug.log*
 Thumbs.db
 
 # Runtime-generated application data
-2
 backend/data/analyses.json
+backend/uploaded_files/
 .ipynb_checkpoints/

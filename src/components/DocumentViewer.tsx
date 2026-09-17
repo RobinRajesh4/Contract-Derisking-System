@@ -2,11 +2,12 @@ import { useEffect, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { FileText, BookOpen } from "lucide-react";
 import { getAnalysis } from "@/services/analysis";
+import { getBaseUrl } from "@/services/api";
+import PdfDocumentViewer from "./PdfDocumentViewer";
 
 export interface DocumentViewerProps {
   analysisId: string | null;
   highlightedClauseId: string | number | null;
-  /** Optional label shown when no contract is selected */
   emptyLabel?: string;
 }
 
@@ -23,7 +24,6 @@ export default function DocumentViewer({
 
   const clauseRefs = useRef<Record<string | number, HTMLDivElement | null>>({});
 
-  /* Scroll to + flash the highlighted clause whenever it changes */
   useEffect(() => {
     if (highlightedClauseId == null) return;
 
@@ -31,7 +31,7 @@ export default function DocumentViewer({
     if (!el) return;
 
     el.classList.remove("clause-highlighted");
-    void el.offsetWidth; // force reflow so animation re-fires
+    void el.offsetWidth;
     el.classList.add("clause-highlighted");
 
     el.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -43,7 +43,6 @@ export default function DocumentViewer({
     return () => clearTimeout(timer);
   }, [highlightedClauseId]);
 
-  /* ── Empty state ── */
   if (!analysisId) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-4 text-muted-foreground">
@@ -56,7 +55,6 @@ export default function DocumentViewer({
     );
   }
 
-  /* ── Loading ── */
   if (isLoading) {
     return (
       <div className="flex h-full items-center justify-center text-muted-foreground">
@@ -68,7 +66,6 @@ export default function DocumentViewer({
     );
   }
 
-  /* ── Error ── */
   if (isError || !data) {
     return (
       <div className="flex h-full items-center justify-center text-destructive">
@@ -77,25 +74,56 @@ export default function DocumentViewer({
     );
   }
 
-  const clauses: Array<{ id: string | number; text: string }> =
-    data.clauses ?? data.results ?? [];
+  const clauses: Array<{ id: string | number; text: string; page?: number }> =
+    data.results ?? data.clauses ?? [];
 
   const filename: string = data.filename ?? "Contract";
 
+    const isPdf: boolean =
+    !!data.file_path &&
+    (data.content_type === "application/pdf" ||
+      filename.toLowerCase().endsWith(".pdf"));
+
+  if (isPdf) {
+    const fileUrl = `${getBaseUrl()}/clauses/${analysisId}/file`;
+    const activeClause = clauses.find((c) => c.id === highlightedClauseId);
+
+    return (
+      <div className="flex h-full flex-col overflow-hidden">
+        <div className="shrink-0 border-b bg-muted/50 px-5 py-3">
+          <div className="flex items-center gap-2">
+            <FileText className="h-4 w-4 text-primary" />
+            <span className="truncate text-sm font-semibold">{filename}</span>
+          </div>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            Original document
+          </p>
+        </div>
+
+        <div className="flex-1 overflow-hidden">
+          <PdfDocumentViewer
+            fileUrl={fileUrl}
+            highlightText={activeClause?.text ?? null}
+            highlightKey={highlightedClauseId}
+            targetPage={activeClause?.page ?? null}
+          />
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-full flex-col overflow-hidden">
-      {/* Document header */}
       <div className="shrink-0 border-b bg-muted/50 px-5 py-3">
         <div className="flex items-center gap-2">
           <FileText className="h-4 w-4 text-primary" />
           <span className="truncate text-sm font-semibold">{filename}</span>
         </div>
         <p className="mt-0.5 text-xs text-muted-foreground">
-          {clauses.length} clause{clauses.length !== 1 ? "s" : ""}
+          {clauses.length} clause{clauses.length !== 1 ? "s" : ""} · original file unavailable
         </p>
       </div>
 
-      {/* Clause list */}
       <div className="flex-1 overflow-y-auto p-5 space-y-4">
         {clauses.map((clause) => (
           <div
