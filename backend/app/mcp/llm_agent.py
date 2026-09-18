@@ -39,6 +39,20 @@ SUMMARY_KEYS = {
 }
 
 
+CONTRACT_METADATA_KEYS = {
+    "customer_name",
+    "contract_about",
+    "start_date",
+    "end_date",
+    "contract_value",
+    "currency",
+    "ip_shared_with_customer",
+    "indemnification_clause_present",
+    "indemnification_strength",
+    "governing_law",
+}
+
+
 def remove_markdown_fences(content: str) -> str:
     """
     Remove Markdown code fences surrounding an LLM response.
@@ -518,6 +532,89 @@ def normalize_classification(
     }
 
 
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _clean_optional_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"null", "none", "n/a", "unknown", "not stated", "not specified"}:
+        return None
+    return text
+
+
+def _clean_optional_date(value: Any) -> Optional[str]:
+    text = _clean_optional_str(value)
+    if text is None:
+        return None
+    return text if _DATE_RE.match(text) else text  # keep raw text if not ISO; UI/prompt can still use it
+
+
+def _clean_optional_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"true", "yes", "y"}:
+        return True
+    if text in {"false", "no", "n"}:
+        return False
+    return None
+
+
+def normalize_contract_metadata(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Validate and normalize the contract-level metadata extraction
+    response so downstream code (the chat directory, listing
+    endpoints) can rely on consistent types.
+    """
+
+    if not isinstance(result, dict):
+        raise ValueError("Contract metadata must be a JSON object")
+
+    contract_value_raw = result.get("contract_value")
+    contract_value: Optional[float] = None
+    if contract_value_raw not in (None, "", "null"):
+        try:
+            contract_value = float(
+                str(contract_value_raw).replace(",", "").replace("₹", "").strip()
+            )
+        except (ValueError, TypeError):
+            contract_value = None
+
+    indemnification_strength = _clean_optional_str(
+        result.get("indemnification_strength")
+    )
+    if indemnification_strength and indemnification_strength.capitalize() in {
+        "Weak",
+        "Standard",
+        "Strong",
+    }:
+        indemnification_strength = indemnification_strength.capitalize()
+    elif indemnification_strength:
+        indemnification_strength = None
+
+    return {
+        "customer_name": _clean_optional_str(result.get("customer_name")),
+        "contract_about": _clean_optional_str(result.get("contract_about")),
+        "start_date": _clean_optional_date(result.get("start_date")),
+        "end_date": _clean_optional_date(result.get("end_date")),
+        "contract_value": contract_value,
+        "currency": _clean_optional_str(result.get("currency")),
+        "ip_shared_with_customer": _clean_optional_bool(
+            result.get("ip_shared_with_customer")
+        ),
+        "indemnification_clause_present": _clean_optional_bool(
+            result.get("indemnification_clause_present")
+        ),
+        "indemnification_strength": indemnification_strength,
+        "governing_law": _clean_optional_str(result.get("governing_law")),
+        "extraction_method": "llm",
+    }
+
+
 class LLMClient:
     def __init__(self) -> None:
         self.cfg = MCPConfig()
@@ -682,6 +779,255 @@ Return no text outside the JSON object.
                 f"Summary generation error: {error}"
             )
             return None
+
+    def extract_contract_metadata(
+        self,
+        contract_text: str,
+        filename: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Extract document-level contract metadata (customer, dates,
+        value, IP terms, indemnification strength) so the chat
+        assistant can answer listing/filtering questions accurately
+        without having to re-read every clause every time.
+
+        Falls back to a conservative local heuristic extraction if
+        no LLM provider is available or the LLM call fails, so the
+        directory always has a best-effort entry for every contract.
+        """
+
+        provider = self._get_provider()
+
+        if provider.is_available():
+            try:
+                contract_preview = contract_text[:12000]
+
+                prompt = f"""
+Extract key metadata from the following contract.
+
+Filename (may hint at the customer/contract type, but the contract
+text is authoritative if they disagree):
+{filename or "unknown"}
+
+Contract text:
+{contract_preview}
+
+Return exactly one compact JSON object with these keys:
+
+customer_name
+contract_about
+start_date
+end_date
+contract_value
+currency
+ip_shared_with_customer
+indemnification_clause_present
+indemnification_strength
+governing_law
+
+Requirements:
+
+1. customer_name: the counterparty / client / customer name as a string.
+   Use null if it truly cannot be determined.
+2. contract_about: a short (3-8 word) description of what the contract
+   is for, e.g. "IT services agreement" or "Data processing agreement".
+3. start_date and end_date: ISO format YYYY-MM-DD if a specific date is
+   stated or can be computed (e.g. "3 years from execution"). Use null
+   if not determinable. Do not guess a date that is not supported by
+   the text.
+4. contract_value: the total contract value as a plain number (no
+   currency symbols, no commas). Use null if not stated.
+5. currency: the ISO currency code (e.g. INR, USD) if determinable,
+   else null.
+6. ip_shared_with_customer: true if the contract assigns, licenses, or
+   otherwise shares intellectual property ownership/rights with the
+   customer; false if IP is retained solely by the provider; null if
+   the contract has no IP clause at all.
+7. indemnification_clause_present: true or false.
+8. indemnification_strength: one of "Weak", "Standard", "Strong", or
+   null if there is no indemnification clause. "Weak" means the
+   clause is one-sided against the drafting party, has low/no caps
+   protecting the drafting party, or has narrow/limited coverage.
+9. governing_law: the governing law / jurisdiction if stated, else null.
+10. Do not invent facts. Use null wherever the text does not support
+    a confident answer.
+11. Do not return Markdown.
+12. Do not return text before or after the JSON.
+""".strip()
+
+                system = """
+You are a contract metadata-extraction assistant.
+
+Return exactly one valid JSON object.
+Return no reasoning.
+Return no Markdown.
+Return no text outside the JSON object.
+Only report facts you can support from the given text.
+""".strip()
+
+                content = provider.invoke(
+                    prompt,
+                    system=system,
+                    temperature=0,
+                )
+
+                result = parse_llm_json(
+                    content,
+                    required_keys=CONTRACT_METADATA_KEYS,
+                )
+
+                return normalize_contract_metadata(result)
+
+            except Exception as error:
+                print(
+                    "Contract metadata extraction failed. "
+                    f"Using local fallback. Reason: {error}"
+                )
+
+        return self._local_metadata_fallback(
+            contract_text,
+            filename,
+        )
+
+    def _local_metadata_fallback(
+        self,
+        contract_text: str,
+        filename: Optional[str],
+    ) -> Dict[str, Any]:
+        """
+        Best-effort regex extraction used only when no LLM provider
+        is available. Deliberately conservative: leaves fields null
+        rather than guessing, since this data drives contract
+        listings and must stay accurate.
+        """
+
+        text = contract_text or ""
+
+        customer_name = None
+        customer_match = re.search(
+            r"(?:Customer|Client)\s*[:\-]\s*([A-Za-z0-9 .,&()'\-]{2,80})",
+            text,
+        )
+        if customer_match:
+            customer_name = customer_match.group(1).strip().rstrip(".,")
+
+        date_pattern = (
+            r"\b(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}"
+            r"|\d{4}-\d{2}-\d{2}"
+            r"|(?:January|February|March|April|May|June|July|"
+            r"August|September|October|November|December)\s+"
+            r"\d{1,2},?\s+\d{4})\b"
+        )
+
+        end_date = None
+        end_date_match = re.search(
+            r"(?:end date|expiry|expiration|valid until|terminates on)"
+            rf"\D{{0,20}}({date_pattern})",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if end_date_match:
+            end_date = end_date_match.group(1)
+
+        start_date = None
+        start_date_match = re.search(
+            r"(?:effective date|commencement date|start date|"
+            rf"dated as of)\D{{0,20}}({date_pattern})",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if start_date_match:
+            start_date = start_date_match.group(1)
+
+        contract_value = None
+        currency = None
+        value_match = re.search(
+            r"(INR|USD|EUR|GBP|Rs\.?|\$|₹)\s?"
+            r"([\d,]+(?:\.\d+)?)",
+            text,
+        )
+        if value_match:
+            currency_raw = value_match.group(1)
+            currency_map = {
+                "rs.": "INR",
+                "rs": "INR",
+                "₹": "INR",
+                "$": "USD",
+            }
+            currency = currency_map.get(
+                currency_raw.lower(),
+                currency_raw.upper(),
+            )
+            contract_value = value_match.group(2).replace(",", "")
+
+        lowered = text.lower()
+
+        ip_shared_with_customer = None
+        if re.search(r"intellectual property|\bIP\b", text, flags=re.IGNORECASE):
+            if any(
+                phrase in lowered
+                for phrase in [
+                    "assigns all right",
+                    "assign all intellectual property",
+                    "license to customer",
+                    "grants customer a license",
+                    "shall belong to customer",
+                    "vest in the customer",
+                ]
+            ):
+                ip_shared_with_customer = True
+            elif any(
+                phrase in lowered
+                for phrase in [
+                    "retains all right",
+                    "sole and exclusive property",
+                    "shall remain the property of",
+                ]
+            ):
+                ip_shared_with_customer = False
+
+        indemnification_present = bool(
+            re.search(r"indemnif", text, flags=re.IGNORECASE)
+        )
+
+        indemnification_strength = None
+        if indemnification_present:
+            if any(
+                phrase in lowered
+                for phrase in [
+                    "sole discretion",
+                    "no liability",
+                    "shall not be liable",
+                    "waives all claims",
+                    "as-is",
+                ]
+            ):
+                indemnification_strength = "Weak"
+            else:
+                indemnification_strength = "Standard"
+
+        governing_law = None
+        law_match = re.search(
+            r"governed by (?:the )?laws? of ([A-Za-z ,]{2,40})",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if law_match:
+            governing_law = law_match.group(1).strip().rstrip(".,")
+
+        return {
+            "customer_name": customer_name,
+            "contract_about": None,
+            "start_date": start_date,
+            "end_date": end_date,
+            "contract_value": contract_value,
+            "currency": currency,
+            "ip_shared_with_customer": ip_shared_with_customer,
+            "indemnification_clause_present": indemnification_present,
+            "indemnification_strength": indemnification_strength,
+            "governing_law": governing_law,
+            "extraction_method": "local_fallback",
+        }
 
     def generate_recommendation(
         self,

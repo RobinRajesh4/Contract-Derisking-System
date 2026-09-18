@@ -42,6 +42,9 @@ class AnalyzeResponse(BaseModel):
 def orjson_dumps(v, *, default):
     return orjson.dumps(v, default=default).decode()
 
+
+_DATE_RE_MAIN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 # Temporarily use default response class to debug startup issue
 # app = FastAPI(default_response_class=ORJSONResponse)
 app = FastAPI()
@@ -138,6 +141,13 @@ async def upload(file: UploadFile = File(...)):
                 "metadata": meta,
                 "page": clause_pages[idx - 1],
             })
+
+        try:
+            contract_metadata = llm.extract_contract_metadata(text, file.filename)
+        except Exception as error:
+            print(f"Contract metadata extraction failed for {file.filename}: {error}")
+            contract_metadata = None
+
         analysis_id = store.save_analysis({
             "filename": file.filename,
             "clauses": items,
@@ -145,6 +155,7 @@ async def upload(file: UploadFile = File(...)):
             "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
             "file_size": len(content),
             "ocr_info": ocr_info,
+            "contract_metadata": contract_metadata,
         })
 
         _persist_original_file(
@@ -204,7 +215,13 @@ async def batch_upload(files: TypingList[UploadFile] = File(...)):
                     "metadata": meta,
                     "page": clause_pages[idx - 1],
                 })
-            
+
+            try:
+                contract_metadata = llm.extract_contract_metadata(text, file.filename)
+            except Exception as meta_error:
+                print(f"Contract metadata extraction failed for {file.filename}: {meta_error}")
+                contract_metadata = None
+
             analysis_id = store.save_analysis({
                 "filename": file.filename,
                 "clauses": items,
@@ -212,6 +229,7 @@ async def batch_upload(files: TypingList[UploadFile] = File(...)):
                 "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                 "file_size": len(content),
                 "ocr_info": ocr_info,
+                "contract_metadata": contract_metadata,
             })
 
             _persist_original_file(
@@ -380,6 +398,22 @@ async def analyze(payload: AnalyzeRequest):
     }
     if policy_summary:
         update_payload["policy_summary"] = policy_summary
+
+    # Automatically generate the executive summary now, since this is
+    # the first point where clauses have risk classifications attached
+    # (generate_contract_summary counts high/medium/low risk clauses -
+    # doing this at /upload instead would always report 0 high-risk
+    # clauses, since classification hasn't run yet at that point).
+    contract_text = " ".join(c.get("text", "") for c in results)
+    try:
+        executive_summary = llm.generate_contract_summary(contract_text, results)
+    except Exception as error:
+        print(f"Automatic summary generation failed for {payload.analysis_id}: {error}")
+        executive_summary = None
+
+    if executive_summary:
+        update_payload["summary"] = executive_summary
+
     store.update_analysis(payload.analysis_id, update_payload)
 
     return AnalyzeResponse(
@@ -504,6 +538,89 @@ async def generate_summary(analysis_id: str):
         raise HTTPException(status_code=500, detail="Could not generate summary")
 
 
+@app.get("/contracts")
+async def list_contracts(include_expired: bool = True):
+    """
+    Return the contract directory (filename + extracted metadata) for
+    every stored analysis. Powers listing/filtering UI and is the same
+    data the /chat endpoint feeds to the assistant.
+    """
+    from datetime import date as _date
+
+    analyses = store.list_analyses()
+    contracts = []
+    today = _date.today().isoformat()
+
+    for a in analyses:
+        cm = a.get("contract_metadata") or {}
+        end_date = cm.get("end_date")
+        is_expired = bool(end_date and _DATE_RE_MAIN.match(end_date or "") and end_date < today)
+
+        if not include_expired and is_expired:
+            continue
+
+        contracts.append({
+            "analysis_id": a.get("analysis_id"),
+            "filename": a.get("filename"),
+            "customer_name": cm.get("customer_name"),
+            "contract_about": cm.get("contract_about"),
+            "start_date": cm.get("start_date"),
+            "end_date": cm.get("end_date"),
+            "contract_value": cm.get("contract_value"),
+            "currency": cm.get("currency"),
+            "ip_shared_with_customer": cm.get("ip_shared_with_customer"),
+            "indemnification_clause_present": cm.get("indemnification_clause_present"),
+            "indemnification_strength": cm.get("indemnification_strength"),
+            "governing_law": cm.get("governing_law"),
+            "is_expired": is_expired,
+            "has_metadata": bool(cm),
+        })
+
+    return {"contracts": contracts}
+
+
+@app.post("/contracts/backfill-metadata")
+async def backfill_contract_metadata(force: bool = False):
+    """
+    Extract contract_metadata for analyses that were uploaded before
+    this feature existed (or, with force=true, re-extract for all
+    analyses). Needed because existing entries in the store only have
+    an analysis_id and filename, which isn't enough to answer
+    listing/filtering questions correctly.
+    """
+    analyses = store.list_analyses()
+    updated = []
+    skipped = []
+    failed = []
+
+    for a in analyses:
+        analysis_id = a.get("analysis_id")
+
+        if not force and a.get("contract_metadata"):
+            skipped.append(analysis_id)
+            continue
+
+        clauses = a.get("results") or a.get("clauses") or []
+        contract_text = " ".join(c.get("text", "") for c in clauses).strip()
+
+        if not contract_text:
+            failed.append({"analysis_id": analysis_id, "error": "No clause text stored for this analysis"})
+            continue
+
+        try:
+            contract_metadata = llm.extract_contract_metadata(contract_text, a.get("filename"))
+            store.update_analysis(analysis_id, {"contract_metadata": contract_metadata})
+            updated.append(analysis_id)
+        except Exception as error:
+            failed.append({"analysis_id": analysis_id, "error": str(error)})
+
+    return {
+        "updated": updated,
+        "skipped_already_had_metadata": skipped,
+        "failed": failed,
+    }
+
+
 class ChatRequest(BaseModel):
     message: str
     analysis_id: Optional[str] = None
@@ -622,10 +739,45 @@ async def chat_endpoint(
     if not request.analysis_id or request.analysis_id == "all":
         all_analyses = store.list_analyses()
         if all_analyses:
-            dir_lines = ["\nAvailable Contracts Directory (Use this to answer listing/filtering questions):"]
+            dir_lines = [
+                "\nAvailable Contracts Directory (authoritative structured data - "
+                "use this, not guesswork from excerpts, to answer listing/filtering/"
+                "date/value/customer/IP questions; a field being 'unknown' means it "
+                "genuinely could not be determined from the contract, don't invent one):"
+            ]
             for a in all_analyses:
                 file_name = a.get("filename") or f"Contract {a.get('analysis_id')}"
-                dir_lines.append(f"- ID: {a.get('analysis_id')} | Name: {file_name}")
+                cm = a.get("contract_metadata") or {}
+
+                def _fmt(value):
+                    return value if value not in (None, "") else "unknown"
+
+                raw_value = cm.get("contract_value")
+                if isinstance(raw_value, (int, float)):
+                    value_str = (
+                        str(int(raw_value))
+                        if float(raw_value).is_integer()
+                        else str(raw_value)
+                    )
+                    currency_str = _fmt(cm.get("currency"))
+                    value_display = f"{value_str} {currency_str}".strip()
+                else:
+                    value_display = "unknown"
+
+                fields = [
+                    f"ID: {a.get('analysis_id')}",
+                    f"Name: {file_name}",
+                    f"Customer: {_fmt(cm.get('customer_name'))}",
+                    f"About: {_fmt(cm.get('contract_about'))}",
+                    f"Start: {_fmt(cm.get('start_date'))}",
+                    f"End: {_fmt(cm.get('end_date'))}",
+                    f"Value: {value_display}",
+                    f"IP shared with customer: {_fmt(cm.get('ip_shared_with_customer'))}",
+                    f"Indemnification present: {_fmt(cm.get('indemnification_clause_present'))}",
+                    f"Indemnification strength: {_fmt(cm.get('indemnification_strength'))}",
+                    f"Governing law: {_fmt(cm.get('governing_law'))}",
+                ]
+                dir_lines.append("- " + " | ".join(fields))
             global_context = "\n".join(dir_lines) + "\n\n"
 
     context = "\n\n".join(
