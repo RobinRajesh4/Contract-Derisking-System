@@ -1002,6 +1002,35 @@ export default function AnalysisDetail() {
                     </Badge>
                   </div>
                 </div>
+
+                {/* Missing Requirements - contract-level violations.
+                    A check only lands here if NO clause anywhere in
+                    the contract satisfied it; per-clause badges below
+                    only show what each clause DOES satisfy, since a
+                    clause not addressing a check that wasn't its job
+                    was never a real violation. */}
+                {a.policy_summary.missing_requirements &&
+                  a.policy_summary.missing_requirements.length > 0 && (
+                    <div className="space-y-2 pt-1">
+                      <h4 className="text-sm font-semibold flex items-center gap-2">
+                        <AlertTriangle className="h-4 w-4" />
+                        Missing Requirements ({a.policy_summary.missing_requirements.length})
+                      </h4>
+                      <div className="flex flex-wrap gap-2">
+                        {a.policy_summary.missing_requirements.map((m: any) => (
+                          <Badge
+                            key={m.id}
+                            variant="destructive"
+                            className="gap-1"
+                            title={m.reason || undefined}
+                          >
+                            <AlertTriangle className="h-3 w-3" />
+                            {m.name || m.id} ({m.risk_weight})
+                          </Badge>
+                        ))}
+                      </div>
+                    </div>
+                  )}
               </div>
             </>
           )}

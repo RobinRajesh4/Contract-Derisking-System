@@ -68,88 +68,190 @@ def apply_policy(
     policy: Dict[str, Any],
     llm: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    domain_map = {}
+    """
+    Evaluate policy compliance at the CONTRACT level, per check - not
+    per clause.
+
+    A check (e.g. "Governing Law Preference") belongs to a domain, and
+    every clause classified into that domain is a *candidate* to
+    satisfy it - but it is only ever a genuine violation if NO clause
+    anywhere in the contract satisfies it. The previous approach
+    treated every clause that didn't individually satisfy every check
+    in its domain as a separate violation, which produced false
+    positives whenever a different clause already covered it (e.g. a
+    Term clause getting flagged for not specifying governing law, when
+    a separate Jurisdiction clause already does - both are Legal
+    clauses, but only one of them was ever going to address that
+    check). Aggregating per check across the whole domain instead means
+    a violation now means what it should: "this requirement is
+    genuinely missing from the contract," not "this particular clause
+    wasn't about that requirement."
+
+    This still uses the same one-bundled-LLM-call-per-clause evaluation
+    as before (no added cost) - it's the aggregation afterward that
+    changes.
+    """
+    domain_map: Dict[str, Dict[str, Any]] = {}
     for d in policy.get("domains", []):
         domain_map[d.get("domain_name", "")] = d
 
-    total_score = 0
-    non_compliant_items: List[str] = []
-
-    enriched: List[Dict[str, Any]] = []
-
-    for c in clauses:
-        text = c.get("text", "")
+    # Group clause indices by domain.
+    clauses_by_domain: Dict[str, List[int]] = {}
+    for idx, c in enumerate(clauses):
         domain = (
             c.get("classification", {}).get("domain")
             or c.get("metadata", {}).get("domain")
             or "Other"
         )
+        clauses_by_domain.setdefault(domain, []).append(idx)
+
+    # Step 1: evaluate every clause against its own domain's checks -
+    # same per-clause bundled LLM call as before. Store every result
+    # keyed by (clause index, check id) so it can be aggregated
+    # per-check afterward instead of per-clause.
+    clause_check_results: Dict[int, Dict[str, Dict[str, Any]]] = {}
+
+    for domain, idxs in clauses_by_domain.items():
         dspec = domain_map.get(domain) or {}
         mps = dspec.get("micro_policies", [])
+        if not mps:
+            continue
 
-        matched: List[str] = []
-        violations: List[Dict[str, Any]] = []
-        score = 0
+        for idx in idxs:
+            text = clauses[idx].get("text", "")
 
-        # Prefer a real LLM judgment of whether the clause satisfies
-        # each check's intent. Fall back to keyword matching only when
-        # no LLM is available, the call fails outright (llm_results is
-        # None), or - per individual check - the model's response
-        # omitted that particular check id (that one entry is None).
-        llm_results: Optional[List[Optional[Dict[str, Any]]]] = None
-        if llm is not None and mps:
-            try:
-                llm_results = llm.evaluate_policy_compliance(text, mps)
-            except Exception as error:
-                print(f"Policy compliance LLM call raised: {error}")
-                llm_results = None
+            llm_results: Optional[List[Optional[Dict[str, Any]]]] = None
+            if llm is not None:
+                try:
+                    llm_results = llm.evaluate_policy_compliance(text, mps)
+                except Exception as error:
+                    print(f"Policy compliance LLM call raised: {error}")
+                    llm_results = None
 
-        evaluation_method = "llm" if llm_results is not None else "keyword"
+            per_check: Dict[str, Dict[str, Any]] = {}
+            for mp_idx, mp in enumerate(mps):
+                pid = mp.get("id")
+                check = mp.get("check", "")
+                llm_entry = llm_results[mp_idx] if llm_results is not None else None
 
-        for idx, mp in enumerate(mps):
+                if llm_entry is not None:
+                    per_check[pid] = {
+                        "matched": bool(llm_entry.get("matched")),
+                        "reason": llm_entry.get("reason", ""),
+                        "method": "llm",
+                    }
+                else:
+                    ok = _policy_match(text, check)
+                    per_check[pid] = {
+                        "matched": ok,
+                        "reason": (
+                            "Evaluated by keyword fallback (LLM omitted this check)."
+                            if llm_results is not None
+                            else "Evaluated by keyword fallback (no LLM available)."
+                        ),
+                        "method": "keyword",
+                    }
+
+            clause_check_results[idx] = per_check
+
+    # Step 2: aggregate per check, across every clause in its domain -
+    # satisfied if ANY clause in that domain satisfies it.
+    missing_requirements: List[Dict[str, Any]] = []
+    non_compliant_items: List[str] = []
+    total_score = 0
+
+    for domain, dspec in domain_map.items():
+        mps = dspec.get("micro_policies", [])
+        idxs = clauses_by_domain.get(domain, [])
+
+        # A domain the contract has NO clauses in at all is only a
+        # genuine gap if the policy explicitly says this domain is
+        # required for every contract it's applied to (opt-in,
+        # defaults to False). Otherwise, a domain with zero clauses
+        # just means this contract was never going to touch it - e.g.
+        # a personal financing agreement has no reason to contain a
+        # PCI-DSS or ESG-reporting clause, so treating that domain's
+        # checks as "missing requirements" would be flagging the
+        # contract for not being a type of contract it never claimed
+        # to be. Domains where the contract DOES have clauses are
+        # unaffected by this - those checks are still evaluated
+        # normally below, regardless of the required flag.
+        domain_is_required = bool(dspec.get("required", False))
+        if not idxs and not domain_is_required:
+            continue
+
+        for mp in mps:
             pid = mp.get("id")
-            check = mp.get("check", "")
+            name = mp.get("name")
             weight = int(mp.get("risk_weight", 0))
 
-            llm_entry = llm_results[idx] if llm_results is not None else None
+            satisfied = False
+            satisfied_by: List[Dict[str, Any]] = []
+            fallback_reason = ""
 
-            if llm_entry is not None:
-                ok = bool(llm_entry.get("matched"))
-                reason = llm_entry.get("reason", "")
-            else:
-                ok = _policy_match(text, check)
-                reason = (
-                    "Evaluated by keyword fallback (LLM omitted this check)."
-                    if llm_results is not None
-                    else "Evaluated by keyword fallback (no LLM available)."
+            if not idxs:
+                fallback_reason = (
+                    f"No clause in this contract was classified under "
+                    f"the '{domain}' domain."
                 )
-
-            if ok:
-                matched.append(pid)
             else:
-                violations.append(
-                    {
-                        "id": pid,
-                        "name": mp.get("name"),
-                        "risk_weight": weight,
-                        "reason": reason,
-                    }
-                )
-                score += weight
+                for idx in idxs:
+                    result = clause_check_results.get(idx, {}).get(pid)
+                    if result and result.get("matched"):
+                        satisfied = True
+                        satisfied_by.append(
+                            {
+                                "clause_id": clauses[idx].get("id"),
+                                "reason": result.get("reason", ""),
+                            }
+                        )
+                if not satisfied:
+                    for idx in idxs:
+                        result = clause_check_results.get(idx, {}).get(pid)
+                        if result and result.get("reason"):
+                            fallback_reason = result["reason"]
+                            break
 
-        total_score += score
-        if violations:
-            non_compliant_items.extend(v.get("id") for v in violations)
+            if satisfied:
+                continue
+
+            total_score += weight
+            non_compliant_items.append(pid)
+            missing_requirements.append(
+                {
+                    "id": pid,
+                    "name": name,
+                    "domain": domain,
+                    "risk_weight": weight,
+                    "reason": fallback_reason,
+                }
+            )
+
+    # Step 3: build per-clause info. A clause still usefully shows
+    # which checks IT satisfies (that's real, clause-specific
+    # information worth surfacing) - but it no longer carries
+    # "violations," since failing to address a check that was never
+    # its job wasn't a real violation. Genuine violations (nothing in
+    # the whole contract satisfies a required check) live in
+    # policy_summary.missing_requirements instead, since they're a
+    # contract-level fact, not a clause-level one.
+    enriched: List[Dict[str, Any]] = []
+    for idx, c in enumerate(clauses):
+        domain = (
+            c.get("classification", {}).get("domain")
+            or c.get("metadata", {}).get("domain")
+            or "Other"
+        )
+        per_check = clause_check_results.get(idx, {})
+        matched_here = [pid for pid, r in per_check.items() if r.get("matched")]
 
         enriched.append(
             {
                 **c,
                 "policy": {
                     "domain": domain,
-                    "matched_policies": matched,
-                    "violations": violations,
-                    "policy_score": score,
-                    "evaluation_method": evaluation_method,
+                    "matched_policies": matched_here,
+                    "violations": [],
                 },
             }
         )
@@ -162,7 +264,7 @@ def apply_policy(
             total_score >= risk_threshold if risk_threshold else False
         ),
         "non_compliant_items": non_compliant_items,
+        "missing_requirements": missing_requirements,
         "domains_covered": len(policy.get("domains", [])),
     }
     return enriched, summary
-    
