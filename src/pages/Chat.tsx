@@ -246,7 +246,7 @@ export default function Chat() {
         <div className="flex flex-wrap items-center gap-4">
           <div className="flex items-center gap-2">
             <Bot className="h-5 w-5 text-primary" />
-            <h2 className="text-base font-semibold">Contract Chatbot</h2>
+            <h2 className="text-base font-semibold">Interact</h2>
           </div>
 
           <div className="flex flex-1 items-center gap-2 text-sm text-muted-foreground">

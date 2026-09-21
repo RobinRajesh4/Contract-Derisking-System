@@ -387,7 +387,7 @@ async def analyze(payload: AnalyzeRequest):
             raise HTTPException(status_code=404, detail="policy_id not found")
 
     if policy_obj:
-        enriched, summary = apply_policy(results, policy_obj)
+        enriched, summary = apply_policy(results, policy_obj, llm=llm)
         results = enriched
         policy_summary = summary
 

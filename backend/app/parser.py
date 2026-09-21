@@ -207,6 +207,36 @@ def extract_text_from_file(filename: str, content: bytes) -> tuple[str, dict, Li
         return text, ocr_info, [text]
 
 
+ORDINAL_WORDS = [
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
+    "eighteen", "nineteen", "twenty", "twenty-one", "twenty-two", "twenty-three",
+    "twenty-four", "twenty-five", "twenty-six", "twenty-seven", "twenty-eight",
+    "twenty-nine", "thirty",
+]
+_ORDINAL_ALT = "|".join(ORDINAL_WORDS)
+
+# Keyword-based heading, e.g. "CLAUSE ONE - PURPOSE:", "Article 1: Term",
+# "Section Two - Payment". Deliberately stricter than just "keyword +
+# number somewhere nearby", because that alone also matches
+# mid-sentence cross-references like "as per Clause Eight below" or
+# "in Section 4 of Schedule A" - which are NOT headings and would
+# wrongly fragment a clause that merely refers to another one. Two
+# things distinguish a real heading from a cross-reference:
+#   1. The keyword itself is capitalized ("CLAUSE"/"Clause", not
+#      "clause") - cross-references are usually lowercase mid-sentence.
+#   2. A separator (-, –, —, :, or .) immediately follows the number,
+#      then the title text begins with a capital letter - a
+#      cross-reference is instead followed directly by an ordinary
+#      lowercase word ("below", "of Schedule A", etc.) with no
+#      separator.
+_KEYWORD_HEADING = (
+    r"\b(?:CLAUSE|Clause|ARTICLE|Article|SECTION|Section)\s+"
+    r"(?:\d{1,3}|(?i:" + _ORDINAL_ALT + r"))"
+    r"\s*[\-\u2013\u2014:.]\s*[A-Z]"
+)
+
+
 def split_into_clauses(text: str) -> List[str]:
     if not text:
         return []
@@ -214,24 +244,34 @@ def split_into_clauses(text: str) -> List[str]:
     t = re.sub(r"\r\n?", "\n", text).strip()
     t = re.sub(r"\n{3,}", "\n\n", t)
 
-    # Primary strategy: split right before numbered ALL-CAPS clause
-    # headings (e.g. "2. TERM", "18. SIGNATURES AND CONSENT"), which is
-    # how most contracts label their sections. This is done with a
-    # zero-width lookahead directly on the pattern itself, so it works
-    # whether or not the PDF's extracted text preserves a newline or
-    # blank line before the heading (real-world PDF text extraction
-    # often doesn't).
+    # Primary strategy: split right before clause headings. Two heading
+    # conventions are recognized:
+    #   1. Numbered ALL-CAPS headings, e.g. "2. TERM",
+    #      "18. SIGNATURES AND CONSENT" - the most common convention.
+    #      Requires ALL-CAPS words immediately after the number so real
+    #      body text containing a stray number isn't mistaken for a
+    #      heading.
+    #   2. Keyword + number/spelled-out-ordinal headings (see
+    #      _KEYWORD_HEADING above), e.g. "CLAUSE ONE - PURPOSE",
+    #      "Article 1: Term", "Section Two - Payment".
+    # Both are zero-width lookaheads so the split works whether or not
+    # the PDF's extracted text preserves a newline before the heading
+    # (real-world PDF text extraction often doesn't).
     HEADER_RE = re.compile(
         r"(?=\b\d{1,2}[\.\)]\s+[A-Z]{2,}(?:[\s&/\-]+[A-Z]{2,}){0,6}\b)"
+        r"|(?=" + _KEYWORD_HEADING + r")"
     )
     parts = HEADER_RE.split(t)
     parts = [p.strip() for p in parts if p and p.strip()]
-
+ 
     # If headings were found, the first chunk is whatever came before the
     # very first heading (document title, party names, recitals, etc.)
     # - unless the document has no preamble and a heading is the first
     # thing in the text. Drop it in the former case; it isn't a clause.
-    FIRST_HEADING_RE = re.compile(r"^\d{1,2}[\.\)]\s+[A-Z]{2,}")
+    FIRST_HEADING_RE = re.compile(
+        r"^\d{1,2}[\.\)]\s+[A-Z]{2,}"
+        r"|^" + _KEYWORD_HEADING
+    )
     if len(parts) > 1 and not FIRST_HEADING_RE.match(parts[0]):
         parts = parts[1:]
 
@@ -271,6 +311,29 @@ def split_into_clauses(text: str) -> List[str]:
                 return True
         return False
     refined = [c for c in refined if not is_noise(c)]
+
+    # Deduplicate identical/near-identical clauses. Some PDF generators
+    # reprint the same full clause list on every page (a source-document
+    # artifact, not something clause-splitting can prevent), which would
+    # otherwise multiply every clause by however many times it's
+    # repeated. Compare just the normalized opening portion of each
+    # clause rather than the full text, since the last repetition often
+    # has trailing content (e.g. a signature block) merged onto it,
+    # which would otherwise make it fail an exact-match comparison and
+    # slip through as a false "new" clause.
+    def _dedup_key(clause: str) -> str:
+        normalized = re.sub(r"\s+", " ", clause).strip().lower()
+        return normalized[:80]
+
+    seen_keys = set()
+    deduped: List[str] = []
+    for clause in refined:
+        key = _dedup_key(clause)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped.append(clause)
+    refined = deduped
 
     return refined
 
@@ -350,3 +413,4 @@ def extract_metadata(clause_text: str) -> Dict[str, Any]:
         "expiry_related": bool(expiry_hint),
         "length": len(text),
     }
+    

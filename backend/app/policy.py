@@ -64,7 +64,9 @@ def _policy_match(clause_text: str, check_text: str) -> bool:
 
 
 def apply_policy(
-    clauses: List[Dict[str, Any]], policy: Dict[str, Any]
+    clauses: List[Dict[str, Any]],
+    policy: Dict[str, Any],
+    llm: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     domain_map = {}
     for d in policy.get("domains", []):
@@ -89,17 +91,49 @@ def apply_policy(
         violations: List[Dict[str, Any]] = []
         score = 0
 
-        for mp in mps:
+        # Prefer a real LLM judgment of whether the clause satisfies
+        # each check's intent. Fall back to keyword matching only when
+        # no LLM is available, the call fails outright (llm_results is
+        # None), or - per individual check - the model's response
+        # omitted that particular check id (that one entry is None).
+        llm_results: Optional[List[Optional[Dict[str, Any]]]] = None
+        if llm is not None and mps:
+            try:
+                llm_results = llm.evaluate_policy_compliance(text, mps)
+            except Exception as error:
+                print(f"Policy compliance LLM call raised: {error}")
+                llm_results = None
+
+        evaluation_method = "llm" if llm_results is not None else "keyword"
+
+        for idx, mp in enumerate(mps):
             pid = mp.get("id")
             check = mp.get("check", "")
             weight = int(mp.get("risk_weight", 0))
-            ok = _policy_match(text, check)
+
+            llm_entry = llm_results[idx] if llm_results is not None else None
+
+            if llm_entry is not None:
+                ok = bool(llm_entry.get("matched"))
+                reason = llm_entry.get("reason", "")
+            else:
+                ok = _policy_match(text, check)
+                reason = (
+                    "Evaluated by keyword fallback (LLM omitted this check)."
+                    if llm_results is not None
+                    else "Evaluated by keyword fallback (no LLM available)."
+                )
+
             if ok:
                 matched.append(pid)
             else:
-                # treat as violation and accumulate risk score
                 violations.append(
-                    {"id": pid, "name": mp.get("name"), "risk_weight": weight}
+                    {
+                        "id": pid,
+                        "name": mp.get("name"),
+                        "risk_weight": weight,
+                        "reason": reason,
+                    }
                 )
                 score += weight
 
@@ -115,6 +149,7 @@ def apply_policy(
                     "matched_policies": matched,
                     "violations": violations,
                     "policy_score": score,
+                    "evaluation_method": evaluation_method,
                 },
             }
         )
@@ -130,3 +165,4 @@ def apply_policy(
         "domains_covered": len(policy.get("domains", [])),
     }
     return enriched, summary
+    

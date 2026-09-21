@@ -1029,6 +1029,125 @@ Only report facts you can support from the given text.
             "extraction_method": "local_fallback",
         }
 
+    def evaluate_policy_compliance(
+        self,
+        clause_text: str,
+        micro_policies: List[Dict[str, Any]],
+    ) -> Optional[List[Optional[Dict[str, Any]]]]:
+        """
+        Judge one clause against all of its domain's micro-policy
+        checks in a single call - based on the clause's actual meaning,
+        not keyword overlap with each check's description. This
+        replaces _policy_match's keyword-counting for the common case;
+        callers should fall back to it only when this returns None
+        (no provider available, or the call failed outright) or for
+        any individual check this returns None for (the model omitted
+        that check id from its response).
+
+        Returns a list aligned 1:1 with micro_policies, each entry
+        either {"id", "matched", "reason"} or None.
+        """
+
+        if not micro_policies:
+            return []
+
+        provider = self._get_provider()
+        if not provider.is_available():
+            return None
+
+        checks_payload = [
+            {
+                "id": mp.get("id"),
+                "name": mp.get("name"),
+                "check": mp.get("check"),
+            }
+            for mp in micro_policies
+        ]
+        checks_json = json.dumps(checks_payload, ensure_ascii=False)
+
+        prompt = f"""
+Evaluate this single contract clause against each policy check below.
+
+Clause:
+{clause_text}
+
+Policy checks (evaluate every one, independently):
+{checks_json}
+
+For each check, decide whether the clause actually satisfies its
+intent, based on meaning, not shared words. A clause that achieves
+the same effect using different wording still counts as satisfied.
+A clause that merely shares vocabulary with the check without
+actually satisfying its requirement does not count as satisfied.
+Consider negation carefully (e.g. "shall not be limited" is the
+opposite of "shall be limited").
+
+Return exactly one compact JSON object of this form:
+{{"results": [{{"id": "<check id>", "matched": true, "reason": "<short reason>"}}]}}
+
+Requirements:
+1. Include exactly one result per check id given above.
+2. matched must be a JSON boolean (true or false), never null or a string.
+3. reason must be a short (under 20 words) plain-language justification
+   tied to what the clause actually says.
+4. Return no text before or after the JSON object.
+5. Return no Markdown.
+""".strip()
+
+        system = """
+You are a contract-compliance assistant.
+Judge each policy check strictly on whether the clause's actual
+meaning satisfies it, not on shared vocabulary.
+Return exactly one JSON object. No reasoning outside it. No Markdown.
+""".strip()
+
+        try:
+            content = provider.invoke(
+                prompt,
+                system=system,
+                temperature=0,
+            )
+
+            result = parse_llm_json(content, required_keys={"results"})
+            raw_results = result.get("results")
+
+            if not isinstance(raw_results, list):
+                raise ValueError("'results' must be a JSON array")
+
+            by_id: Dict[str, Dict[str, Any]] = {}
+            for item in raw_results:
+                if not isinstance(item, dict):
+                    continue
+                check_id = item.get("id")
+                if check_id is None:
+                    continue
+
+                matched = item.get("matched")
+                if not isinstance(matched, bool):
+                    matched = str(matched).strip().lower() in {"true", "yes", "y"}
+
+                reason = item.get("reason")
+                reason = str(reason).strip() if reason else ""
+
+                by_id[str(check_id)] = {"matched": matched, "reason": reason}
+
+            # Align 1:1 with the input order; a missing id becomes None
+            # so the caller can fall back to keyword matching for just
+            # that one check rather than discarding the whole clause.
+            aligned: List[Optional[Dict[str, Any]]] = []
+            for mp in micro_policies:
+                check_id = str(mp.get("id"))
+                if check_id in by_id:
+                    aligned.append({"id": mp.get("id"), **by_id[check_id]})
+                else:
+                    aligned.append(None)
+
+            return aligned
+
+        except Exception as error:
+            print(f"LLM policy compliance evaluation failed: {error}")
+            return None
+
     def generate_recommendation(
         self,
         text: str,
