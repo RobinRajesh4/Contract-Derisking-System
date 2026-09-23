@@ -9,7 +9,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 
 import {
-  Bot,
+  MessageSquare,
   Send,
   User,
   ChevronRight,
@@ -245,7 +245,7 @@ export default function Chat() {
       <div className="shrink-0 border-b bg-muted/60 px-6 py-3">
         <div className="flex flex-wrap items-center gap-4">
           <div className="flex items-center gap-2">
-            <Bot className="h-5 w-5 text-primary" />
+            <MessageSquare className="h-5 w-5 text-primary" />
             <h2 className="text-base font-semibold">Interact</h2>
           </div>
 
@@ -311,7 +311,7 @@ export default function Chat() {
                 >
                   {isBot && (
                     <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-primary/10">
-                      <Bot className="h-4 w-4 text-primary" />
+                      <MessageSquare  className="h-4 w-4 text-primary" />
                     </div>
                   )}
 
@@ -445,7 +445,7 @@ export default function Chat() {
             {isLoading && (
               <div className="flex gap-3">
                 <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-primary/10">
-                  <Bot className="h-4 w-4 animate-pulse text-primary" />
+                  <MessageSquare  className="h-4 w-4 animate-pulse text-primary" />
                 </div>
                 <div className="flex items-center gap-1.5 rounded-xl bg-muted px-4 py-3">
                   <div className="h-1.5 w-1.5 animate-bounce rounded-full bg-primary/50" />
