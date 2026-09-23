@@ -975,7 +975,7 @@ export default function AnalysisDetail() {
 
                   <div className="flex items-center gap-2 text-sm">
                     <span className="text-muted-foreground">
-                      Above Threshold:
+                      Exceeds Risk Threshold:
                     </span>
 
                     <Badge
@@ -1026,6 +1026,26 @@ export default function AnalysisDetail() {
                           >
                             <AlertTriangle className="h-3 w-3" />
                             {m.name || m.id} ({m.risk_weight})
+                          </Badge>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {a.policy_summary.not_applicable_checks &&
+                  a.policy_summary.not_applicable_checks.length > 0 && (
+                    <div className="space-y-2 pt-1">
+                      <h4 className="text-sm font-semibold text-muted-foreground">
+                        Not applicable to this contract
+                        {a.policy_summary.contract_type
+                          ? ` (${a.policy_summary.contract_type})`
+                          : ""}{" "}
+                        ({a.policy_summary.not_applicable_checks.length})
+                      </h4>
+                      <div className="flex flex-wrap gap-2">
+                        {a.policy_summary.not_applicable_checks.map((m: any) => (
+                          <Badge key={m.id} variant="outline" title={m.reason || undefined}>
+                            {m.name || m.id}
                           </Badge>
                         ))}
                       </div>

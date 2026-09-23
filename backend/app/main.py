@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from fastapi.responses import FileResponse
+from fastapi.concurrency import run_in_threadpool
 from typing import List as TypingList
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -9,6 +10,7 @@ import orjson
 import os
 from dotenv import load_dotenv
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 # Load env from .env (GROQ_API_KEY, QDRANT_URL, etc.)
 load_dotenv()
@@ -123,67 +125,88 @@ else:
 
 
 
-@app.post("/upload")
-async def upload(file: UploadFile = File(...)):
-    try:
-        content = await file.read()
-        text, ocr_info, pages = extract_text_from_file(file.filename, content)
-        if not text or not text.strip():
-            raise HTTPException(status_code=400, detail="No text could be extracted from the file")
-        clauses = split_into_clauses(text)
-        clause_pages = assign_clause_pages(clauses, pages)
-        items = []
-        for idx, clause_text in enumerate(clauses, start=1):
-            meta = extract_metadata(clause_text)
-            items.append({
-                "id": idx,
-                "text": clause_text,
-                "metadata": meta,
-                "page": clause_pages[idx - 1],
-            })
+def _process_upload(
+    filename: str,
+    content: bytes,
+    content_type: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Does all the actual (blocking) work for one uploaded file: text/OCR
+    extraction, clause splitting, per-clause metadata, contract-level
+    LLM metadata extraction, persisting to the store, saving the
+    original file, and RAG indexing.
 
-        try:
-            contract_metadata = llm.extract_contract_metadata(text, file.filename)
-        except Exception as error:
-            print(f"Contract metadata extraction failed for {file.filename}: {error}")
-            contract_metadata = None
+    Deliberately synchronous - this is meant to be run via
+    run_in_threadpool from the async route handlers below, so a slow
+    upload (OCR, or a slow LLM call) occupies a worker thread instead
+    of blocking the single asyncio event loop that every other
+    request - to any endpoint, from any user - also depends on.
 
-        analysis_id = store.save_analysis({
-            "filename": file.filename,
-            "clauses": items,
-            "status": "uploaded",
-            "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-            "file_size": len(content),
-            "ocr_info": ocr_info,
-            "contract_metadata": contract_metadata,
+    Raises ValueError if no text could be extracted (caller decides
+    how to surface that - as a 400 for a single upload, or as a
+    per-file error entry for a batch upload).
+    """
+    text, ocr_info, pages = extract_text_from_file(filename, content)
+    if not text or not text.strip():
+        raise ValueError("No text could be extracted from the file")
+
+    clauses = split_into_clauses(text)
+    clause_pages = assign_clause_pages(clauses, pages)
+    items = []
+    for idx, clause_text in enumerate(clauses, start=1):
+        meta = extract_metadata(clause_text)
+        items.append({
+            "id": idx,
+            "text": clause_text,
+            "metadata": meta,
+            "page": clause_pages[idx - 1],
         })
 
-        _persist_original_file(
-            analysis_id, file.filename, content, file.content_type
+    try:
+        contract_metadata = llm.extract_contract_metadata(text, filename)
+    except Exception as error:
+        print(f"Contract metadata extraction failed for {filename}: {error}")
+        contract_metadata = None
+
+    analysis_id = store.save_analysis({
+        "filename": filename,
+        "clauses": items,
+        "status": "uploaded",
+        "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "file_size": len(content),
+        "ocr_info": ocr_info,
+        "contract_metadata": contract_metadata,
+    })
+
+    _persist_original_file(analysis_id, filename, content, content_type)
+
+    if rag is not None:
+        try:
+            rag.upsert_clauses(analysis_id, items)
+            print(f"Indexed {len(items)} clauses for analysis {analysis_id}")
+        except Exception as error:
+            print(f"RAG indexing failed for {analysis_id}: {error}")
+
+    return {
+        "analysis_id": analysis_id,
+        "total_clauses": len(items),
+        "ocr_info": ocr_info,
+    }
+
+
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    # Only file.read() needs to happen on the event loop; everything
+    # else is blocking work and runs on a worker thread instead
+    # (see _process_upload's docstring for why).
+    content = await file.read()
+    try:
+        result = await run_in_threadpool(
+            _process_upload, file.filename, content, file.content_type
         )
-        # Upsert clauses into Qdrant for later retrieval (best-effort)
-        if rag is not None:
-            try:
-                rag.upsert_clauses(
-                    analysis_id,
-                    items,
-                )
-
-                print(
-                    f"Indexed {len(items)} clauses "
-                    f"for analysis {analysis_id}"
-                )
-
-            except Exception as error:
-                print(
-                    f"RAG indexing failed for "
-                    f"{analysis_id}: {error}"
-                )
-        return {
-            "analysis_id": analysis_id, 
-            "total_clauses": len(items),
-            "ocr_info": ocr_info
-        }
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
@@ -199,66 +222,12 @@ async def batch_upload(files: TypingList[UploadFile] = File(...)):
     for file in files:
         try:
             content = await file.read()
-            text, ocr_info, pages = extract_text_from_file(file.filename, content)
-            if not text or not text.strip():
-                errors.append({"filename": file.filename, "error": "No text could be extracted"})
-                continue
-                
-            clauses = split_into_clauses(text)
-            clause_pages = assign_clause_pages(clauses, pages)
-            items = []
-            for idx, clause_text in enumerate(clauses, start=1):
-                meta = extract_metadata(clause_text)
-                items.append({
-                    "id": idx,
-                    "text": clause_text,
-                    "metadata": meta,
-                    "page": clause_pages[idx - 1],
-                })
-
-            try:
-                contract_metadata = llm.extract_contract_metadata(text, file.filename)
-            except Exception as meta_error:
-                print(f"Contract metadata extraction failed for {file.filename}: {meta_error}")
-                contract_metadata = None
-
-            analysis_id = store.save_analysis({
-                "filename": file.filename,
-                "clauses": items,
-                "status": "uploaded",
-                "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                "file_size": len(content),
-                "ocr_info": ocr_info,
-                "contract_metadata": contract_metadata,
-            })
-
-            _persist_original_file(
-                analysis_id, file.filename, content, file.content_type
+            processed = await run_in_threadpool(
+                _process_upload, file.filename, content, file.content_type
             )
-            
-            if rag is not None:
-                try:
-                    rag.upsert_clauses(
-                        analysis_id,
-                        items,
-                    )
-
-                    print(
-                        f"Indexed {len(items)} clauses "
-                        f"for analysis {analysis_id}"
-                    )
-
-                except Exception as error:
-                    print(
-                        f"RAG indexing failed for "
-                        f"{analysis_id}: {error}"
-                    )
-            
             results.append({
                 "filename": file.filename,
-                "analysis_id": analysis_id,
-                "total_clauses": len(items),
-                "ocr_info": ocr_info
+                **processed,
             })
         except Exception as e:
             errors.append({"filename": file.filename, "error": str(e)})
@@ -272,7 +241,7 @@ async def batch_upload(files: TypingList[UploadFile] = File(...)):
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze(payload: AnalyzeRequest):
+def analyze(payload: AnalyzeRequest):
     # determine source text
     if payload.analysis_id:
         record = store.get_analysis(payload.analysis_id)
@@ -359,7 +328,8 @@ async def analyze(payload: AnalyzeRequest):
         return title
 
     results: List[Dict[str, Any]] = []
-    for c in clauses:
+
+    def _classify_one(c: Dict[str, Any]) -> Dict[str, Any]:
         ctx = None
         if rag is not None:
             try:
@@ -368,13 +338,25 @@ async def analyze(payload: AnalyzeRequest):
             except Exception:
                 ctx = None
         classification = llm.classify_clause(c["text"], c.get("metadata", {}), context=ctx)
-        # merge
-        result = {
+        return {
             **c,
             "classification": classification,
             "title": _make_title(c.get("text", ""), classification or {}),
         }
-        results.append(result)
+
+    # Each clause's classification is an independent LLM call, so fire
+    # them concurrently instead of one at a time - this is what was
+    # making /analyze take minutes on a slow remote model (see
+    # llm_concurrency's comment for the tradeoff this involves).
+    concurrency = max(1, int(get_settings().get("llm_concurrency", 4)))
+    if len(clauses) <= 1 or concurrency <= 1:
+        for c in clauses:
+            results.append(_classify_one(c))
+    else:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            # map() preserves input order in its output order, even
+            # though the underlying calls complete out of order.
+            results = list(executor.map(_classify_one, clauses))
 
     # optional policy evaluation
     policy_summary = None
@@ -425,7 +407,7 @@ async def analyze(payload: AnalyzeRequest):
 
 
 @app.get("/rag/status")
-async def rag_status():
+def rag_status():
     if rag is None:
         return {"enabled": False}
     try:
@@ -441,19 +423,19 @@ async def rag_status():
 
 
 @app.get("/clauses")
-async def list_analyses():
+def list_analyses():
     return store.list_analyses()
 
 
 @app.get("/clauses/{analysis_id}")
-async def get_analysis(analysis_id: str):
+def get_analysis(analysis_id: str):
     data = store.get_analysis(analysis_id)
     if not data:
         raise HTTPException(status_code=404, detail="Not found")
     return data
 
 @app.get("/clauses/{analysis_id}/file")
-async def get_analysis_file(analysis_id: str):
+def get_analysis_file(analysis_id: str):
     data = store.get_analysis(analysis_id)
     if not data:
         raise HTTPException(status_code=404, detail="Not found")
@@ -472,14 +454,14 @@ async def get_analysis_file(analysis_id: str):
     )
 
 @app.get("/")
-async def root():
+def root():
     return {"status": "ok"}
 
 
 # --- Policy management endpoints ---
 
 @app.post("/policy")
-async def upsert_policy(policy: Dict[str, Any] = Body(...)):
+def upsert_policy(policy: Dict[str, Any] = Body(...)):
     try:
         pid = save_policy(policy)
         return {"policy_id": pid, "status": "saved"}
@@ -488,7 +470,7 @@ async def upsert_policy(policy: Dict[str, Any] = Body(...)):
 
 
 @app.get("/policy/{policy_id}")
-async def get_policy_endpoint(policy_id: str):
+def get_policy_endpoint(policy_id: str):
     p = get_policy(policy_id)
     if not p:
         raise HTTPException(status_code=404, detail="Not found")
@@ -496,12 +478,12 @@ async def get_policy_endpoint(policy_id: str):
 
 
 @app.get("/policies")
-async def list_policies_endpoint():
+def list_policies_endpoint():
     return list_policies()
 
 
 @app.post("/recommend")
-async def generate_recommendation(payload: Dict[str, Any] = Body(...)):
+def generate_recommendation(payload: Dict[str, Any] = Body(...)):
     """Generate alternative wording recommendation for a high-risk clause."""
     text = payload.get("text", "")
     risk_level = payload.get("risk_level", "")
@@ -519,7 +501,7 @@ async def generate_recommendation(payload: Dict[str, Any] = Body(...)):
 
 
 @app.post("/summary/{analysis_id}")
-async def generate_summary(analysis_id: str):
+def generate_summary(analysis_id: str):
     """Generate AI-powered executive summary for a contract."""
     analysis = store.get_analysis(analysis_id)
     if not analysis:
@@ -539,7 +521,7 @@ async def generate_summary(analysis_id: str):
 
 
 @app.get("/contracts")
-async def list_contracts(include_expired: bool = True):
+def list_contracts(include_expired: bool = True):
     """
     Return the contract directory (filename + extracted metadata) for
     every stored analysis. Powers listing/filtering UI and is the same
@@ -563,6 +545,7 @@ async def list_contracts(include_expired: bool = True):
             "analysis_id": a.get("analysis_id"),
             "filename": a.get("filename"),
             "customer_name": cm.get("customer_name"),
+            "lender_name": cm.get("lender_name"),
             "contract_about": cm.get("contract_about"),
             "start_date": cm.get("start_date"),
             "end_date": cm.get("end_date"),
@@ -580,7 +563,7 @@ async def list_contracts(include_expired: bool = True):
 
 
 @app.post("/contracts/backfill-metadata")
-async def backfill_contract_metadata(force: bool = False):
+def backfill_contract_metadata(force: bool = False):
     """
     Extract contract_metadata for analyses that were uploaded before
     this feature existed (or, with force=true, re-extract for all
@@ -593,26 +576,75 @@ async def backfill_contract_metadata(force: bool = False):
     skipped = []
     failed = []
 
-    for a in analyses:
+    def _backfill_one(a: Dict[str, Any]):
         analysis_id = a.get("analysis_id")
 
-        if not force and a.get("contract_metadata"):
-            skipped.append(analysis_id)
-            continue
-
-        clauses = a.get("results") or a.get("clauses") or []
-        contract_text = " ".join(c.get("text", "") for c in clauses).strip()
+        # Prefer re-parsing the original stored file over joined clause
+        # text: clause splitting deliberately drops the preamble (where
+        # party/lender names normally live, e.g. "between Bank Of
+        # America Inc. (the "BANK") and ..."), so contracts analyzed
+        # before lender_name existed can only pick it up by going back
+        # to the source PDF, not from what's already stored as clauses.
+        contract_text = ""
+        file_path = a.get("file_path")
+        if file_path and os.path.exists(file_path):
+            try:
+                with open(file_path, "rb") as f:
+                    raw_bytes = f.read()
+                contract_text, _ocr_info, _pages = extract_text_from_file(
+                    a.get("filename") or os.path.basename(file_path),
+                    raw_bytes,
+                )
+                contract_text = (contract_text or "").strip()
+            except Exception as error:
+                print(
+                    f"Could not re-parse original file for {analysis_id}, "
+                    f"falling back to stored clause text: {error}"
+                )
 
         if not contract_text:
-            failed.append({"analysis_id": analysis_id, "error": "No clause text stored for this analysis"})
-            continue
+            clauses = a.get("results") or a.get("clauses") or []
+            contract_text = " ".join(c.get("text", "") for c in clauses).strip()
+
+        if not contract_text:
+            return ("failed", analysis_id, "No clause text stored for this analysis")
 
         try:
             contract_metadata = llm.extract_contract_metadata(contract_text, a.get("filename"))
             store.update_analysis(analysis_id, {"contract_metadata": contract_metadata})
-            updated.append(analysis_id)
+            return ("updated", analysis_id, None)
         except Exception as error:
-            failed.append({"analysis_id": analysis_id, "error": str(error)})
+            return ("failed", analysis_id, str(error))
+
+    to_process = []
+    for a in analyses:
+        analysis_id = a.get("analysis_id")
+        if not force and a.get("contract_metadata"):
+            skipped.append(analysis_id)
+            continue
+        to_process.append(a)
+
+    # Each contract's metadata extraction is an independent LLM call -
+    # this loop used to run them one at a time, which is why a
+    # force=true backfill across every stored contract could sit for
+    # minutes with zero visible progress in the HTTP response. Fire
+    # them concurrently instead, same as /analyze's per-clause loop.
+    try:
+        concurrency = max(1, int(get_settings().get("llm_concurrency", 4)))
+    except Exception:
+        concurrency = 4
+
+    if len(to_process) <= 1 or concurrency <= 1:
+        outcomes = [_backfill_one(a) for a in to_process]
+    else:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            outcomes = list(executor.map(_backfill_one, to_process))
+
+    for status, analysis_id, error in outcomes:
+        if status == "updated":
+            updated.append(analysis_id)
+        else:
+            failed.append({"analysis_id": analysis_id, "error": error})
 
     return {
         "updated": updated,
@@ -629,7 +661,7 @@ class ChatRequest(BaseModel):
 
 
 @app.post("/chat")
-async def chat_endpoint(
+def chat_endpoint(
     request: ChatRequest,
 ):
     """
@@ -768,6 +800,7 @@ async def chat_endpoint(
                     f"ID: {a.get('analysis_id')}",
                     f"Name: {file_name}",
                     f"Customer: {_fmt(cm.get('customer_name'))}",
+                    f"Lender/Bank: {_fmt(cm.get('lender_name'))}",
                     f"About: {_fmt(cm.get('contract_about'))}",
                     f"Start: {_fmt(cm.get('start_date'))}",
                     f"End: {_fmt(cm.get('end_date'))}",
@@ -829,6 +862,8 @@ Question:
 
     system_prompt = """
 You are a highly capable contract analysis assistant. You answer factual questions, make comparative risk judgments, draft new clauses, and filter/list contracts.
+
+You have no tools or functions available and cannot call any. Answer directly from the excerpts and directory given to you in this prompt - never emit a tool call, function call, or code block claiming to search/browse/fetch anything.
 
 Guidelines:
 1. Always be specific, precise, and correct. Double-check every fact, name, date, and number against the excerpts before answering.
@@ -1097,7 +1132,7 @@ def extract_structured_terms(
 
 
 @app.post("/compare")
-async def compare_contracts(
+def compare_contracts(
     payload: Dict[str, Any] = Body(...),
 ):
     """Compare two previously analyzed contracts."""
@@ -1531,7 +1566,7 @@ async def compare_contracts(
 # --- LLM Settings endpoints ---
 
 @app.get("/settings")
-async def get_llm_settings():
+def get_llm_settings():
     """Get current LLM settings and provider status."""
     return {
         "settings": get_settings(),
@@ -1540,7 +1575,7 @@ async def get_llm_settings():
 
 
 @app.post("/settings")
-async def update_llm_settings(settings: Dict[str, Any] = Body(...)):
+def update_llm_settings(settings: Dict[str, Any] = Body(...)):
     """Update LLM settings (provider, model, url)."""
     allowed_keys = ["provider", "ollama_url", "ollama_model", "groq_model"]
     filtered = {k: v for k, v in settings.items() if k in allowed_keys}
@@ -1559,7 +1594,7 @@ async def update_llm_settings(settings: Dict[str, Any] = Body(...)):
 
 
 @app.get("/settings/test")
-async def test_llm_connection():
+def test_llm_connection():
     """Test the current LLM provider connection."""
     from .llm_providers import get_llm_provider
 

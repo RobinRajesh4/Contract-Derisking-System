@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "policies")
@@ -95,6 +96,11 @@ def apply_policy(
     for d in policy.get("domains", []):
         domain_map[d.get("domain_name", "")] = d
 
+    # Optional free-text organization context (e.g. "Our primary
+    # jurisdiction is Delaware, USA."), passed to the LLM so checks
+    # that refer to "the company's ..." can actually be evaluated.
+    policy_context = str(policy.get("context") or "")
+
     # Group clause indices by domain.
     clauses_by_domain: Dict[str, List[int]] = {}
     for idx, c in enumerate(clauses):
@@ -111,52 +117,112 @@ def apply_policy(
     # per-check afterward instead of per-clause.
     clause_check_results: Dict[int, Dict[str, Dict[str, Any]]] = {}
 
+    def _evaluate_clause(idx: int, mps: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        text = clauses[idx].get("text", "")
+
+        llm_results: Optional[List[Optional[Dict[str, Any]]]] = None
+        if llm is not None:
+            try:
+                llm_results = llm.evaluate_policy_compliance(
+                    text, mps, context=policy_context
+                )
+            except Exception as error:
+                print(f"Policy compliance LLM call raised: {error}")
+                llm_results = None
+
+        per_check: Dict[str, Dict[str, Any]] = {}
+        for mp_idx, mp in enumerate(mps):
+            pid = mp.get("id")
+            check = mp.get("check", "")
+            llm_entry = llm_results[mp_idx] if llm_results is not None else None
+
+            if llm_entry is not None:
+                per_check[pid] = {
+                    "matched": bool(llm_entry.get("matched")),
+                    "reason": llm_entry.get("reason", ""),
+                    "method": "llm",
+                }
+            else:
+                ok = _policy_match(text, check)
+                per_check[pid] = {
+                    "matched": ok,
+                    "reason": (
+                        "Evaluated by keyword fallback (LLM omitted this check)."
+                        if llm_results is not None
+                        else "Evaluated by keyword fallback (no LLM available)."
+                    ),
+                    "method": "keyword",
+                }
+
+        return per_check
+
+    # Each clause's compliance check is an independent LLM call
+    # (already bundled across that clause's own checks into one call -
+    # see the docstring above), so fire them concurrently across
+    # clauses instead of one at a time. See llm_concurrency's comment
+    # in llm_providers.py for the tradeoff this involves.
+    try:
+        from .llm_providers import get_settings as _get_llm_settings
+        concurrency = max(1, int(_get_llm_settings().get("llm_concurrency", 4)))
+    except Exception:
+        concurrency = 4
+
+    jobs: List[Tuple[int, List[Dict[str, Any]]]] = []
     for domain, idxs in clauses_by_domain.items():
         dspec = domain_map.get(domain) or {}
         mps = dspec.get("micro_policies", [])
         if not mps:
             continue
-
         for idx in idxs:
-            text = clauses[idx].get("text", "")
+            jobs.append((idx, mps))
 
-            llm_results: Optional[List[Optional[Dict[str, Any]]]] = None
-            if llm is not None:
-                try:
-                    llm_results = llm.evaluate_policy_compliance(text, mps)
-                except Exception as error:
-                    print(f"Policy compliance LLM call raised: {error}")
-                    llm_results = None
+    if len(jobs) <= 1 or concurrency <= 1:
+        for idx, mps in jobs:
+            clause_check_results[idx] = _evaluate_clause(idx, mps)
+    else:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            future_to_idx = {
+                executor.submit(_evaluate_clause, idx, mps): idx
+                for idx, mps in jobs
+            }
+            for future in future_to_idx:
+                idx = future_to_idx[future]
+                clause_check_results[idx] = future.result()
 
-            per_check: Dict[str, Dict[str, Any]] = {}
-            for mp_idx, mp in enumerate(mps):
-                pid = mp.get("id")
-                check = mp.get("check", "")
-                llm_entry = llm_results[mp_idx] if llm_results is not None else None
-
-                if llm_entry is not None:
-                    per_check[pid] = {
-                        "matched": bool(llm_entry.get("matched")),
-                        "reason": llm_entry.get("reason", ""),
-                        "method": "llm",
-                    }
-                else:
-                    ok = _policy_match(text, check)
-                    per_check[pid] = {
-                        "matched": ok,
-                        "reason": (
-                            "Evaluated by keyword fallback (LLM omitted this check)."
-                            if llm_results is not None
-                            else "Evaluated by keyword fallback (no LLM available)."
-                        ),
-                        "method": "keyword",
-                    }
-
-            clause_check_results[idx] = per_check
+    # Step 1b: ONE contract-level call deciding which checks are even
+    # applicable to this kind of contract (e.g. invoice-documentation
+    # rules don't apply to a consumer loan). Only checks in domains the
+    # contract actually has clauses in are asked about; a required
+    # domain with zero clauses is never filtered out. If the LLM is
+    # unavailable or omits a check, that check is treated as
+    # applicable (fail toward flagging, as before).
+    applicability: Dict[str, Dict[str, Any]] = {}
+    contract_type = ""
+    if llm is not None and hasattr(llm, "evaluate_check_applicability"):
+        checks_in_play: List[Dict[str, Any]] = []
+        for domain, idxs in clauses_by_domain.items():
+            if idxs:
+                checks_in_play.extend(
+                    (domain_map.get(domain) or {}).get("micro_policies", [])
+                )
+        if checks_in_play:
+            try:
+                app_res = llm.evaluate_check_applicability(
+                    [c.get("text", "") for c in clauses],
+                    checks_in_play,
+                    context=policy_context,
+                )
+            except Exception as error:
+                print(f"Applicability LLM call raised: {error}")
+                app_res = None
+            if app_res:
+                applicability = app_res.get("by_id", {}) or {}
+                contract_type = app_res.get("contract_type", "") or ""
 
     # Step 2: aggregate per check, across every clause in its domain -
     # satisfied if ANY clause in that domain satisfies it.
     missing_requirements: List[Dict[str, Any]] = []
+    not_applicable_checks: List[Dict[str, Any]] = []
     non_compliant_items: List[str] = []
     total_score = 0
 
@@ -215,6 +281,22 @@ def apply_policy(
             if satisfied:
                 continue
 
+            # Not satisfied - but only a genuine gap if the check
+            # applies to this kind of contract at all. Never applied
+            # to a required domain the contract has no clauses in.
+            app = applicability.get(str(pid)) if idxs else None
+            if app is not None and app.get("applicable") is False:
+                not_applicable_checks.append(
+                    {
+                        "id": pid,
+                        "name": name,
+                        "domain": domain,
+                        "risk_weight": weight,
+                        "reason": app.get("reason", ""),
+                    }
+                )
+                continue
+
             total_score += weight
             non_compliant_items.append(pid)
             missing_requirements.append(
@@ -265,6 +347,8 @@ def apply_policy(
         ),
         "non_compliant_items": non_compliant_items,
         "missing_requirements": missing_requirements,
+        "not_applicable_checks": not_applicable_checks,
+        "contract_type": contract_type,
         "domains_covered": len(policy.get("domains", [])),
     }
     return enriched, summary

@@ -41,6 +41,7 @@ SUMMARY_KEYS = {
 
 CONTRACT_METADATA_KEYS = {
     "customer_name",
+    "lender_name",
     "contract_about",
     "start_date",
     "end_date",
@@ -53,12 +54,44 @@ CONTRACT_METADATA_KEYS = {
 }
 
 
-def remove_markdown_fences(content: str) -> str:
+def remove_reasoning_traces(content: str) -> str:
     """
-    Remove Markdown code fences surrounding an LLM response.
+    Strip <think>...</think> (and similar) reasoning blocks that
+    "thinking" models - Qwen3, DeepSeek-R1, etc. - can prepend before
+    their actual JSON answer when thinking mode isn't explicitly
+    disabled in the request. Handles both a closed block and one left
+    open because the response was cut off mid-thought.
     """
 
-    cleaned = content.strip()
+    cleaned = re.sub(
+        r"<think>.*?</think>",
+        "",
+        content,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # An unclosed <think> at the very start means the model never
+    # finished reasoning (or the tag simply wasn't closed) - in that
+    # case there is nothing usable before it, so drop everything up to
+    # the last </think>-less tag rather than feeding raw reasoning text
+    # into the JSON parser.
+    cleaned = re.sub(
+        r"^\s*<think>.*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    return cleaned.strip()
+
+
+def remove_markdown_fences(content: str) -> str:
+    """
+    Remove Markdown code fences and reasoning-model "thinking" blocks
+    surrounding an LLM response.
+    """
+
+    cleaned = remove_reasoning_traces(content.strip())
 
     cleaned = re.sub(
         r"^\s*```(?:json)?\s*",
@@ -598,6 +631,7 @@ def normalize_contract_metadata(result: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "customer_name": _clean_optional_str(result.get("customer_name")),
+        "lender_name": _clean_optional_str(result.get("lender_name")),
         "contract_about": _clean_optional_str(result.get("contract_about")),
         "start_date": _clean_optional_date(result.get("start_date")),
         "end_date": _clean_optional_date(result.get("end_date")),
@@ -815,6 +849,7 @@ Contract text:
 Return exactly one compact JSON object with these keys:
 
 customer_name
+lender_name
 contract_about
 start_date
 end_date
@@ -829,29 +864,37 @@ Requirements:
 
 1. customer_name: the counterparty / client / customer name as a string.
    Use null if it truly cannot be determined.
-2. contract_about: a short (3-8 word) description of what the contract
+2. lender_name: for a loan, financing, or credit agreement, the actual
+   name of the lender / bank / financial institution extending credit
+   (this is usually named in the preamble, e.g. "between Bank Of
+   America Inc. (the \"BANK\") and ..."). Use null if the contract is
+   not a financing/loan agreement, or if no specific institution name
+   is given (a generic label like "the BANK" or "the LENDER" with no
+   real name attached does NOT count - use null in that case, don't
+   invent a name).
+3. contract_about: a short (3-8 word) description of what the contract
    is for, e.g. "IT services agreement" or "Data processing agreement".
-3. start_date and end_date: ISO format YYYY-MM-DD if a specific date is
+4. start_date and end_date: ISO format YYYY-MM-DD if a specific date is
    stated or can be computed (e.g. "3 years from execution"). Use null
    if not determinable. Do not guess a date that is not supported by
    the text.
-4. contract_value: the total contract value as a plain number (no
+5. contract_value: the total contract value as a plain number (no
    currency symbols, no commas). Use null if not stated.
-5. currency: the ISO currency code (e.g. INR, USD) if determinable,
+6. currency: the ISO currency code (e.g. INR, USD) if determinable,
    else null.
-6. ip_shared_with_customer: true if the contract assigns, licenses, or
+7. ip_shared_with_customer: true if the contract assigns, licenses, or
    otherwise shares intellectual property ownership/rights with the
    customer; false if IP is retained solely by the provider; null if
    the contract has no IP clause at all.
-7. indemnification_clause_present: true or false.
-8. indemnification_strength: one of "Weak", "Standard", "Strong", or
+8. indemnification_clause_present: true or false.
+9. indemnification_strength: one of "Weak", "Standard", "Strong", or
    null if there is no indemnification clause. "Weak" means the
    clause is one-sided against the drafting party, has low/no caps
    protecting the drafting party, or has narrow/limited coverage.
-9. governing_law: the governing law / jurisdiction if stated, else null.
-10. Do not invent facts. Use null wherever the text does not support
+10. governing_law: the governing law / jurisdiction if stated, else null.
+11. Do not invent facts. Use null wherever the text does not support
     a confident answer.
-11. Do not return Markdown.
+12. Do not return Markdown.
 12. Do not return text before or after the JSON.
 """.strip()
 
@@ -903,13 +946,50 @@ Only report facts you can support from the given text.
 
         text = contract_text or ""
 
+        # Connector words that can sit right before a name and get
+        # mistakenly swallowed by the capitalized-word-run pattern
+        # below (e.g. "Between Bank Of America Inc." at a sentence
+        # start, where "Between" is capitalized too).
+        _LEADING_STOPWORDS_RE = re.compile(
+            r"^(?:Between|And|Among|This|Entered|Into|By)\s+", re.IGNORECASE
+        )
+
         customer_name = None
         customer_match = re.search(
-            r"(?:Customer|Client)\s*[:\-]\s*([A-Za-z0-9 .,&()'\-]{2,80})",
+            r"(?:Customer|Client|Borrower)\s*[:\-]\s*"
+            r"([A-Za-z][A-Za-z .'\-]{1,60}?)(?=\s*[,.(]|\s*$)",
             text,
+            re.IGNORECASE,
         )
         if customer_match:
             customer_name = customer_match.group(1).strip().rstrip(".,")
+
+        # Two preamble styles seen in practice:
+        # 1. Labeled: "LENDER: Financial Bank Of America Inc., ..."
+        # 2. Parenthetical: "between Bank Of America Inc. (the "BANK")
+        #    and ...". Try the labeled style first since it gives a
+        #    cleaner, more explicit match; fall back to parenthetical.
+        # Deliberately conservative either way - only fires when an
+        # actual name is present, not on the generic label alone.
+        lender_name = None
+        lender_label_match = re.search(
+            r"(?:Lender|Bank)\s*[:\-]\s*"
+            r"([A-Za-z][A-Za-z0-9 .,&'\-]{1,60}?)(?=\s*[,.(]|\s*$)",
+            text,
+            re.IGNORECASE,
+        )
+        if lender_label_match:
+            lender_name = lender_label_match.group(1).strip().rstrip(".,")
+        else:
+            lender_paren_match = re.search(
+                r"\b((?:[A-Z][A-Za-z0-9&.\-]*\s+){0,5}[A-Z][A-Za-z0-9&.\-]*)\s*"
+                r"\(\s*(?:the\s+)?[\"\u201c]?(?:BANK|LENDER)[\"\u201d]?\s*\)",
+                text,
+            )
+            if lender_paren_match:
+                lender_name = _LEADING_STOPWORDS_RE.sub(
+                    "", lender_paren_match.group(1).strip().rstrip(".,")
+                ).strip()
 
         date_pattern = (
             r"\b(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}"
@@ -1017,6 +1097,7 @@ Only report facts you can support from the given text.
 
         return {
             "customer_name": customer_name,
+            "lender_name": lender_name,
             "contract_about": None,
             "start_date": start_date,
             "end_date": end_date,
@@ -1033,6 +1114,7 @@ Only report facts you can support from the given text.
         self,
         clause_text: str,
         micro_policies: List[Dict[str, Any]],
+        context: str = "",
     ) -> Optional[List[Optional[Dict[str, Any]]]]:
         """
         Judge one clause against all of its domain's micro-policy
@@ -1065,10 +1147,17 @@ Only report facts you can support from the given text.
         ]
         checks_json = json.dumps(checks_payload, ensure_ascii=False)
 
+        context_block = (
+            f"Organization context (use it to resolve references such as "
+            f"'our primary jurisdiction'):\n{context.strip()}\n\n"
+            if context and context.strip()
+            else ""
+        )
+
         prompt = f"""
 Evaluate this single contract clause against each policy check below.
 
-Clause:
+{context_block}Clause:
 {clause_text}
 
 Policy checks (evaluate every one, independently):
@@ -1081,6 +1170,12 @@ A clause that merely shares vocabulary with the check without
 actually satisfying its requirement does not count as satisfied.
 Consider negation carefully (e.g. "shall not be limited" is the
 opposite of "shall be limited").
+Be strict about the mechanism a check names. Choosing a court or
+forum is NOT binding arbitration; choosing a forum is NOT the same as
+naming governing law; a termination clause that removes or waives
+notice does NOT satisfy a minimum-notice requirement. If a check
+depends on a fact you cannot see (e.g. "the company's primary
+jurisdiction" with no context given), do not assume it is met.
 
 Return exactly one compact JSON object of this form:
 {{"results": [{{"id": "<check id>", "matched": true, "reason": "<short reason>"}}]}}
@@ -1146,6 +1241,114 @@ Return exactly one JSON object. No reasoning outside it. No Markdown.
 
         except Exception as error:
             print(f"LLM policy compliance evaluation failed: {error}")
+            return None
+
+    def evaluate_check_applicability(
+        self,
+        clause_texts: List[str],
+        micro_policies: List[Dict[str, Any]],
+        context: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Decide, once per contract, which policy checks are even
+        applicable to this KIND of contract (e.g. invoice-documentation
+        rules do not apply to a consumer loan). One call covers all
+        checks, so it adds a single LLM request per analysis.
+
+        Returns {"contract_type": str, "by_id": {id: {"applicable": bool,
+        "reason": str}}} or None if no provider / the call failed. Ids
+        the model omits are simply absent from by_id; callers should
+        treat absent ids as applicable (fail toward flagging).
+        """
+
+        if not micro_policies or not clause_texts:
+            return None
+
+        provider = self._get_provider()
+        if not provider.is_available():
+            return None
+
+        clauses_block = "\n".join(
+            f"{i + 1}. {(t or '').strip()[:300]}"
+            for i, t in enumerate(clause_texts[:40])
+        )
+        checks_json = json.dumps(
+            [
+                {"id": mp.get("id"), "name": mp.get("name"), "check": mp.get("check")}
+                for mp in micro_policies
+            ],
+            ensure_ascii=False,
+        )
+        context_block = (
+            f"Organization context:\n{context.strip()}\n\n"
+            if context and context.strip()
+            else ""
+        )
+
+        prompt = f"""
+Below are the clauses of one contract, then a list of policy checks.
+
+{context_block}Contract clauses:
+{clauses_block}
+
+Policy checks:
+{checks_json}
+
+First infer what kind of contract this is (e.g. "consumer asset
+financing agreement", "SaaS subscription", "NDA").
+
+Then, for each check, decide whether it is APPLICABLE to that kind of
+contract: would a competent lawyer reviewing this type of contract
+reasonably expect the check's subject to be addressed in it? Set
+applicable to false ONLY when the requirement is clearly irrelevant to
+this type of agreement (for example, invoice documentation rules for a
+loan, or a mutual-indemnification rule for a one-sided lender
+agreement). When unsure, set applicable to true. Whether the contract
+currently satisfies the check is NOT your concern here.
+
+Return exactly one compact JSON object of this form:
+{{"contract_type": "<short label>", "results": [{{"id": "<check id>", "applicable": true, "reason": "<under 20 words>"}}]}}
+
+Requirements:
+1. Include exactly one result per check id.
+2. applicable must be a JSON boolean.
+3. Return no text before or after the JSON object. No Markdown.
+""".strip()
+
+        system = """
+You are a contract-review assistant deciding which policy checks are
+relevant to a given type of contract.
+Return exactly one JSON object. No reasoning outside it. No Markdown.
+""".strip()
+
+        try:
+            content = provider.invoke(prompt, system=system, temperature=0)
+            result = parse_llm_json(content, required_keys={"results"})
+            raw = result.get("results")
+            if not isinstance(raw, list):
+                raise ValueError("'results' must be a JSON array")
+
+            by_id: Dict[str, Dict[str, Any]] = {}
+            for item in raw:
+                if not isinstance(item, dict) or item.get("id") is None:
+                    continue
+                applicable = item.get("applicable")
+                if not isinstance(applicable, bool):
+                    applicable = str(applicable).strip().lower() not in {
+                        "false", "no", "n",
+                    }
+                reason = item.get("reason")
+                by_id[str(item["id"])] = {
+                    "applicable": applicable,
+                    "reason": str(reason).strip() if reason else "",
+                }
+
+            return {
+                "contract_type": str(result.get("contract_type") or "").strip(),
+                "by_id": by_id,
+            }
+        except Exception as error:
+            print(f"LLM check-applicability evaluation failed: {error}")
             return None
 
     def generate_recommendation(

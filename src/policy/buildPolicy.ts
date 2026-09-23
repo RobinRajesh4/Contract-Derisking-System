@@ -3,6 +3,7 @@ import { ROOT_DOMAIN_LABELS, uiLabels, uiPolicies, UILibraryPolicy, PolicyLabel,
 export interface CompiledPolicy {
   policy_id: string;
   risk_threshold?: number;
+  context?: string;
   domains: Array<{
     domain_name: string;
     micro_policies: Array<{
@@ -36,8 +37,8 @@ function collectPoliciesForRoot(rootId: string, labels: PolicyLabel[], policies:
   return policies.filter(p => p.labelIds.some(lid => ids.has(lid)));
 }
 
-export function buildCompiledPolicy(options?: { includeRoots?: string[]; policyId?: string; riskThreshold?: number }): CompiledPolicy {
-  const { includeRoots, policyId = "default_ui_policy", riskThreshold = 10 } = options || {};
+export function buildCompiledPolicy(options?: { includeRoots?: string[]; policyId?: string; riskThreshold?: number; context?: string }): CompiledPolicy {
+  const { includeRoots, policyId = "default_ui_policy", riskThreshold = 10, context } = options || {};
 
   const roots = Object.keys(ROOT_DOMAIN_LABELS).filter(rootId => !includeRoots || includeRoots.includes(rootId));
 
@@ -56,6 +57,7 @@ export function buildCompiledPolicy(options?: { includeRoots?: string[]; policyI
   return {
     policy_id: policyId,
     risk_threshold: riskThreshold,
+    ...(context ? { context } : {}),
     domains,
   };
 }

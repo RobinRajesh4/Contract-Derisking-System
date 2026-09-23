@@ -27,6 +27,17 @@ _settings: Dict[str, Any] = {
     "ollama_url": "http://localhost:11434",
     "ollama_model": "deepseek-r1:14b",
     "groq_model": "llama-3.1-70b-versatile",
+    # Set to false only for a trusted internal server whose certificate
+    # your OS/Python doesn't trust (e.g. a corporate self-signed CA).
+    # Prefer installing the company's root CA instead of disabling this.
+    "ollama_verify_ssl": True,
+    # How many LLM calls this app fires at once against Ollama, for the
+    # per-clause classification and compliance loops. Higher can cut
+    # wall-clock time a lot on a server with spare capacity, but a
+    # single shared box may just queue extra concurrent requests
+    # rather than truly parallelize them - tune this down if raising it
+    # doesn't help, or if it starts causing timeouts under load.
+    "llm_concurrency": 4,
 }
 
 SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "settings.json")
@@ -79,6 +90,80 @@ class BaseLLMProvider(ABC):
         pass
 
 
+def _ollama_text(resp) -> str:
+    """Extract generated text from an ollama client response.
+
+    Handles both plain dicts (chat: {"message": {"content": ...}},
+    generate: {"response": ...}) and the pydantic response objects that
+    newer ollama client versions return.
+
+    Raises ValueError if no usable text is found, rather than falling
+    back to str(resp) - a raw response repr (e.g. from a gpt-oss reply
+    that routed its answer into a hallucinated tool_calls field instead
+    of content) is not a valid chat answer, and dumping it as one is
+    worse than surfacing a clear failure so invoke() can try its next
+    fallback tier (HTTP /api/generate, which uses a plain completion
+    call rather than a chat template and is less prone to this).
+    """
+    if isinstance(resp, dict):
+        msg = resp.get("message")
+        if isinstance(msg, dict) and msg.get("content"):
+            return msg["content"]
+        text = resp.get("response") or resp.get("content") or resp.get("text")
+        if text:
+            return text
+        raise ValueError(
+            "Ollama response had no usable text field "
+            f"(keys present: {list(resp.keys())})"
+        )
+
+    msg = getattr(resp, "message", None)
+    content = getattr(msg, "content", None) if msg is not None else None
+    if content:
+        return content
+
+    generate_text = getattr(resp, "response", None)
+    if generate_text:
+        return generate_text
+
+    # Nothing in content/response - check whether the model routed its
+    # answer into a tool call instead (observed with gpt-oss on Ollama),
+    # so the failure is diagnosable rather than a silent empty string.
+    tool_calls = getattr(msg, "tool_calls", None) if msg is not None else None
+    if tool_calls:
+        raise ValueError(
+            "Ollama model returned an empty content field and instead "
+            f"emitted tool_calls it was never asked to make: {tool_calls!r}. "
+            "This model likely needs 'think: False' and/or an explicit "
+            "\"you have no tools\" instruction in the system prompt."
+        )
+
+    raise ValueError("Ollama response had no usable text field")
+
+
+def _ollama_options(temperature: float) -> Dict[str, Any]:
+    """Ollama only honours sampling params inside an `options` object;
+    a top-level `temperature` is silently ignored. A fixed seed makes
+    temperature=0 runs reproducible."""
+    opts: Dict[str, Any] = {"temperature": float(temperature)}
+    if float(temperature) == 0.0:
+        opts["seed"] = 0
+    return opts
+
+
+def _ollama_think_kwarg(model: str) -> Dict[str, Any]:
+    """"Thinking" models (Qwen3, DeepSeek-R1, gpt-oss, ...) reason out
+    loud by default, which is pure overhead for the strict-JSON
+    micro-tasks this app runs and can also leak <think> text ahead of
+    the JSON (parse_llm_json strips that as a safety net regardless).
+    Ollama's `think` request param turns it off on models that support
+    it; unsupported models simply ignore the field."""
+    name = (model or "").lower()
+    if any(tag in name for tag in ("qwen3", "deepseek-r1", "gpt-oss")):
+        return {"think": False}
+    return {}
+
+
 class GroqProvider(BaseLLMProvider):
     """Groq API provider using LangChain."""
     
@@ -104,6 +189,7 @@ class OllamaProvider(BaseLLMProvider):
         self.base_url = _settings.get("ollama_url", "http://localhost:11434")
         # ensure default selects the exact offline model tag with :latest
         self.model = _settings.get("ollama_model", "llama3.2:latest")
+        self.verify_ssl = bool(_settings.get("ollama_verify_ssl", True))
 
     def invoke(self, prompt: str, system: Optional[str] = None, temperature: float = 0) -> str:
         """Invoke Ollama. Prefer the `ollama` python client if available, then HTTP, then LangChain wrapper.
@@ -121,38 +207,38 @@ class OllamaProvider(BaseLLMProvider):
                 except concurrent.futures.TimeoutError:
                     raise TimeoutError("Ollama invocation timed out")
 
-        # 1) Try using the ollama python client if installed
+        # 1) Try using the ollama python client, pointed explicitly at
+        # base_url. The module-level ollama.chat()/generate() functions
+        # always talk to localhost (or $OLLAMA_HOST) and ignore any URL
+        # we pass in, so we must build an ollama.Client bound to
+        # base_url instead - otherwise a non-default ollama_url setting
+        # (like a company server) is silently never used here.
         if OLLAMA_PY_AVAILABLE and _ollama_module is not None:
             try:
                 def _call_client():
-                    # top-level convenience functions
-                    if hasattr(_ollama_module, "chat"):
-                        messages = []
-                        if system:
-                            messages.append({"role": "system", "content": system})
-                        messages.append({"role": "user", "content": prompt})
-                        resp = _ollama_module.chat(model=self.model, messages=messages, temperature=temperature)
-                        if isinstance(resp, dict):
-                            return resp.get("content") or resp.get("text") or str(resp)
-                        return str(resp)
+                    client_kwargs: Dict[str, Any] = {"host": self.base_url}
+                    if not self.verify_ssl:
+                        client_kwargs["verify"] = False
 
-                    if hasattr(_ollama_module, "generate"):
-                        resp = _ollama_module.generate(model=self.model, prompt=full_prompt, temperature=temperature)
-                        if isinstance(resp, dict):
-                            return resp.get("text") or json.dumps(resp)
-                        return str(resp)
+                    if hasattr(_ollama_module, "Client"):
+                        client = _ollama_module.Client(**client_kwargs)
+                    elif hasattr(_ollama_module, "Ollama"):
+                        client = _ollama_module.Ollama(**client_kwargs)
+                    else:
+                        raise RuntimeError("No usable client class on ollama module")
 
-                    if hasattr(_ollama_module, "Ollama"):
-                        client = _ollama_module.Ollama()
-                        if hasattr(client, "chat"):
-                            messages = []
-                            if system:
-                                messages.append({"role": "system", "content": system})
-                            messages.append({"role": "user", "content": prompt})
-                            resp = client.chat(model=self.model, messages=messages, temperature=temperature)
-                            if isinstance(resp, dict):
-                                return resp.get("response") or resp.get("text") or str(resp)
-                            return str(resp)
+                    messages = []
+                    if system:
+                        messages.append({"role": "system", "content": system})
+                    messages.append({"role": "user", "content": prompt})
+
+                    think_kwarg = _ollama_think_kwarg(self.model)
+                    if hasattr(client, "chat"):
+                        resp = client.chat(model=self.model, messages=messages, options=_ollama_options(temperature), **think_kwarg)
+                        return _ollama_text(resp)
+                    if hasattr(client, "generate"):
+                        resp = client.generate(model=self.model, prompt=full_prompt, options=_ollama_options(temperature), **think_kwarg)
+                        return _ollama_text(resp)
 
                     raise RuntimeError("No usable method found on ollama client")
 
@@ -168,10 +254,10 @@ class OllamaProvider(BaseLLMProvider):
         if REQUESTS_AVAILABLE and _requests_module is not None:
             try:
                 url = f"{self.base_url}/api/generate"
-                payload = {"model": self.model, "prompt": full_prompt, "temperature": float(temperature), "stream": False}
+                payload = {"model": self.model, "prompt": full_prompt, "options": _ollama_options(temperature), "stream": False, **_ollama_think_kwarg(self.model)}
 
                 def _call_http():
-                    r = _requests_module.post(url, json=payload, timeout=TIMEOUT_SEC)
+                    r = _requests_module.post(url, json=payload, timeout=TIMEOUT_SEC, verify=self.verify_ssl)
                     r.raise_for_status()
                     # try to parse JSON if present
                     try:
@@ -193,11 +279,16 @@ class OllamaProvider(BaseLLMProvider):
             from langchain_ollama import ChatOllama
 
             def _call_langchain():
-                llm = ChatOllama(
-                    model=self.model,
-                    base_url=self.base_url,
-                    temperature=temperature,
-                )
+                kwargs: Dict[str, Any] = {
+                    "model": self.model,
+                    "base_url": self.base_url,
+                    "temperature": temperature,
+                }
+                if not self.verify_ssl:
+                    # Supported on recent langchain_ollama; older
+                    # versions ignore unknown kwargs via **kwargs.
+                    kwargs["client_kwargs"] = {"verify": False}
+                llm = ChatOllama(**kwargs)
                 out = llm.invoke(full_prompt)
                 return getattr(out, "content", "")
 
@@ -211,8 +302,14 @@ class OllamaProvider(BaseLLMProvider):
         """Check if Ollama is running and the model is available."""
         try:
             import urllib.request
+            import ssl
             req = urllib.request.Request(f"{self.base_url}/api/tags", method="GET")
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            context = None
+            if not self.verify_ssl:
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(req, timeout=5, context=context) as resp:
                 return resp.status == 200
         except Exception:
             return False
