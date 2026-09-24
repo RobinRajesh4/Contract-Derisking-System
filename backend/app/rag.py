@@ -124,11 +124,24 @@ class RAGStore:
         )
 
     def reset(self) -> None:
-        """Drop and recreate this model's collection (used by reindex)."""
+        """
+        Remove every point in this model's collection (used by reindex
+        and by tests). Deletes points in place rather than dropping and
+        recreating the collection: on Windows, Qdrant's on-disk storage
+        can fail to release a just-deleted collection's segment files
+        before a same-named one is recreated on the same client, so the
+        "new" collection silently keeps serving the old data and points
+        pile up across resets instead of being cleared.
+        """
         with _QDRANT_LOCK:
-            if self.client.collection_exists(self.collection):
-                self.client.delete_collection(self.collection)
-            self._ensure_collection_locked()
+            if not self.client.collection_exists(self.collection):
+                self._ensure_collection_locked()
+                return
+            self.client.delete(
+                collection_name=self.collection,
+                points_selector=qmodels.FilterSelector(filter=qmodels.Filter()),
+                wait=True,
+            )
 
     def count(self) -> int:
         with _QDRANT_LOCK:
