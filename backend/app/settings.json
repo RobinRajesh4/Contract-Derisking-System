@@ -3,5 +3,6 @@
   "ollama_url": "https://librechat.eplpg.com/ollama",
   "ollama_model": "qwen3:8b",
   "ollama_verify_ssl": false,
-  "llm_concurrency": 4
+  "llm_concurrency": 4,
+  "ollama_num_ctx": 16384
 }

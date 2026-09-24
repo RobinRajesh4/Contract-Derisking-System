@@ -771,11 +771,33 @@ def chat_endpoint(
     if not request.analysis_id or request.analysis_id == "all":
         all_analyses = store.list_analyses()
         if all_analyses:
+            def _numeric_value(a: Dict[str, Any]) -> float:
+                cm = a.get("contract_metadata") or {}
+                raw_value = cm.get("contract_value")
+                if isinstance(raw_value, (int, float)):
+                    return float(raw_value)
+                return float("-inf")
+
+            # Small local models are unreliable at correctly sorting a
+            # list of numbers themselves when asked to "list highest
+            # first" - the LLM was observed producing tables that
+            # claimed to be descending but weren't. Pre-sorting here,
+            # in code, turns the model's job from "compute a sort
+            # order" (error-prone) into "transcribe rows in the order
+            # given" (much more reliable), and removes the numeric
+            # reasoning failure mode entirely rather than trying to
+            # prompt it away.
+            all_analyses = sorted(all_analyses, key=_numeric_value, reverse=True)
+
             dir_lines = [
                 "\nAvailable Contracts Directory (authoritative structured data - "
                 "use this, not guesswork from excerpts, to answer listing/filtering/"
                 "date/value/customer/IP questions; a field being 'unknown' means it "
-                "genuinely could not be determined from the contract, don't invent one):"
+                "genuinely could not be determined from the contract, don't invent one).\n"
+                "This list is ALREADY SORTED by contract value, highest first "
+                "(entries with an unknown value are listed last). If asked to rank, "
+                "list, or compare by value, preserve this order exactly - do not "
+                "re-sort or re-compute the order yourself:"
             ]
             for a in all_analyses:
                 file_name = a.get("filename") or f"Contract {a.get('analysis_id')}"

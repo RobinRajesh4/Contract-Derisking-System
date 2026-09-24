@@ -38,6 +38,19 @@ _settings: Dict[str, Any] = {
     # rather than truly parallelize them - tune this down if raising it
     # doesn't help, or if it starts causing timeouts under load.
     "llm_concurrency": 4,
+    # Ollama's default context window is a mere 2048 tokens unless
+    # explicitly overridden. This app's prompts routinely exceed that -
+    # the /chat "Available Contracts Directory" alone grows with every
+    # uploaded contract, on top of a long system prompt, instructions,
+    # and multiple RAG excerpts. Past the limit, Ollama silently
+    # truncates the request, so the model never sees the data it needs
+    # and fabricates a plausible-sounding answer instead of admitting
+    # it doesn't know - this is the single most likely cause of
+    # "hallucinated" numbers that match nothing in any excerpt.
+    # Raise this further if you have many contracts uploaded and still
+    # see ungrounded answers; lower it only if the server can't handle
+    # the memory cost of a larger context.
+    "ollama_num_ctx": 8192,
 }
 
 SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "settings.json")
@@ -144,8 +157,19 @@ def _ollama_text(resp) -> str:
 def _ollama_options(temperature: float) -> Dict[str, Any]:
     """Ollama only honours sampling params inside an `options` object;
     a top-level `temperature` is silently ignored. A fixed seed makes
-    temperature=0 runs reproducible."""
-    opts: Dict[str, Any] = {"temperature": float(temperature)}
+    temperature=0 runs reproducible.
+
+    Also sets num_ctx explicitly - Ollama's default is only 2048
+    tokens, which this app's longer prompts (chat's contract
+    directory, policy compliance prompts with many checks, etc.) can
+    silently exceed, causing truncation the caller never sees and
+    answers that aren't grounded in the real prompt content. See
+    ollama_num_ctx's comment in _settings for the full explanation.
+    """
+    opts: Dict[str, Any] = {
+        "temperature": float(temperature),
+        "num_ctx": int(_settings.get("ollama_num_ctx", 8192)),
+    }
     if float(temperature) == 0.0:
         opts["seed"] = 0
     return opts
@@ -283,6 +307,7 @@ class OllamaProvider(BaseLLMProvider):
                     "model": self.model,
                     "base_url": self.base_url,
                     "temperature": temperature,
+                    "num_ctx": int(_settings.get("ollama_num_ctx", 8192)),
                 }
                 if not self.verify_ssl:
                     # Supported on recent langchain_ollama; older

@@ -264,16 +264,18 @@ def split_into_clauses(text: str) -> List[str]:
     parts = HEADER_RE.split(t)
     parts = [p.strip() for p in parts if p and p.strip()]
  
-    # If headings were found, the first chunk is whatever came before the
-    # very first heading (document title, party names, recitals, etc.)
-    # - unless the document has no preamble and a heading is the first
-    # thing in the text. Drop it in the former case; it isn't a clause.
-    FIRST_HEADING_RE = re.compile(
-        r"^\d{1,2}[\.\)]\s+[A-Z]{2,}"
-        r"|^" + _KEYWORD_HEADING
-    )
-    if len(parts) > 1 and not FIRST_HEADING_RE.match(parts[0]):
-        parts = parts[1:]
+    # If headings were found, the first chunk is whatever came before
+    # the very first heading (document title, party names, financed
+    # amount, recitals, etc.). This is kept as the document's first
+    # clause rather than discarded: it's frequently where the only
+    # mention of financial amounts, lender/borrower names, and other
+    # identifying details live, and dropping it made that information
+    # permanently unreachable by clause search, chat citations, and
+    # "jump to clause" highlighting alike - there was nothing for any
+    # of those to point to. The length/noise filters below still apply
+    # to it same as any other clause, so a trivial or boilerplate-only
+    # preamble (e.g. just a document title) is naturally filtered out
+    # rather than needing special-case handling here.
 
     # Fallback: if that found hardly any headings (e.g. a document that
     # doesn't use ALL-CAPS numbered section titles), split on blank-line

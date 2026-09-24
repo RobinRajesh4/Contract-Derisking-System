@@ -1038,7 +1038,19 @@ Only report facts you can support from the given text.
                 currency_raw.lower(),
                 currency_raw.upper(),
             )
-            contract_value = value_match.group(2).replace(",", "")
+            contract_value_str = value_match.group(2).replace(",", "")
+            try:
+                # Match normalize_contract_metadata's behavior (the LLM
+                # extraction path): store as a real float, not a string.
+                # Left as a string here, this silently broke every
+                # downstream isinstance(value, (int, float)) check - the
+                # chat directory's "Value: ..." display and the sort-
+                # by-value fix both treat a non-numeric type as
+                # "unknown", so a fallback-extracted contract would
+                # always show as unknown even with a real value found.
+                contract_value = float(contract_value_str)
+            except (TypeError, ValueError):
+                contract_value = None
 
         lowered = text.lower()
 

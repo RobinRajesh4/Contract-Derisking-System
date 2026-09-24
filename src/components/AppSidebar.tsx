@@ -19,9 +19,11 @@ import {
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem,
+  useSidebar,
 } from "@/components/ui/sidebar";
 
 import worldlineLogo from "@/assets/worldline-logo.svg";
+import worldlineIcon from "@/assets/worldline-icon.svg";
 
 
 const navItems = [
@@ -56,7 +58,7 @@ const navItems = [
     icon: GitCompare,
   },
   {
-    title: "Interact",
+    title: "Chatbot",
     url: "/chat",
     icon: MessageSquare,
   },
@@ -64,11 +66,18 @@ const navItems = [
 
 
 export function AppSidebar() {
+  const { state } = useSidebar();
+  const isCollapsed = state === "collapsed";
+
   return (
     <Sidebar collapsible="icon">
       <SidebarContent>
-        <div className="border-b border-sidebar-border p-4">
-          < img src={worldlineLogo} alt="Worldline" className="h-8 w-auto" / >
+        <div className="border-b border-sidebar-border p-4 flex items-center justify-center">
+          <img
+            src={isCollapsed ? worldlineIcon : worldlineLogo}
+            alt="Worldline"
+            className={isCollapsed ? "h-8 w-8" : "h-8 w-auto"}
+          />
         </div>
 
         <SidebarGroup>
