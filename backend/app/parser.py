@@ -1,5 +1,5 @@
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 from pypdf import PdfReader
 from io import BytesIO
 import os
@@ -237,9 +237,21 @@ _KEYWORD_HEADING = (
 )
 
 
-def split_into_clauses(text: str) -> List[str]:
+def split_document(text: str) -> Tuple[Optional[str], List[str]]:
+    """
+    Split a contract's text into (header, clauses).
+
+    header: everything before the first clause heading - title, parties,
+      lender/borrower, financed amount, recitals - or None when the
+      document starts straight with a clause or has no headings. It is
+      real, citable document text (searchable, and "jump to" can
+      highlight it), but it is not an operative clause: it creates no
+      obligation, so it must never be risk-classified, policy-scored or
+      counted as a clause. Callers keep it separate from the clause list.
+    clauses: the operative clauses, in document order.
+    """
     if not text:
-        return []
+        return None, []
     # Normalize line endings
     t = re.sub(r"\r\n?", "\n", text).strip()
     t = re.sub(r"\n{3,}", "\n\n", t)
@@ -258,24 +270,28 @@ def split_into_clauses(text: str) -> List[str]:
     # the PDF's extracted text preserves a newline before the heading
     # (real-world PDF text extraction often doesn't).
     HEADER_RE = re.compile(
-        r"(?=\b\d{1,2}[\.\)]\s+[A-Z]{2,}(?:[\s&/\-]+[A-Z]{2,}){0,6}\b)"
+        # (?<![\d.,]) stops "$45,892.00. CLAUSE ONE" being read as a
+        # numbered heading "00. CLAUSE", which cut the cents off amounts.
+        r"(?<![\d.,])(?=\b\d{1,2}[\.\)]\s+[A-Z]{2,}(?:[\s&/\-]+[A-Z]{2,}){0,6}\b)"
         r"|(?=" + _KEYWORD_HEADING + r")"
     )
     parts = HEADER_RE.split(t)
     parts = [p.strip() for p in parts if p and p.strip()]
  
-    # If headings were found, the first chunk is whatever came before
-    # the very first heading (document title, party names, financed
-    # amount, recitals, etc.). This is kept as the document's first
-    # clause rather than discarded: it's frequently where the only
-    # mention of financial amounts, lender/borrower names, and other
-    # identifying details live, and dropping it made that information
-    # permanently unreachable by clause search, chat citations, and
-    # "jump to clause" highlighting alike - there was nothing for any
-    # of those to point to. The length/noise filters below still apply
-    # to it same as any other clause, so a trivial or boilerplate-only
-    # preamble (e.g. just a document title) is naturally filtered out
-    # rather than needing special-case handling here.
+    # If headings were found, the first chunk is whatever came before the
+    # very first heading (document title, party names, recitals, etc.)
+    # - unless the document has no preamble and a heading is the first
+    # thing in the text. Drop it in the former case; it isn't a clause.
+    FIRST_HEADING_RE = re.compile(
+        r"^\d{1,2}[\.\)]\s+[A-Z]{2,}"
+        r"|^" + _KEYWORD_HEADING
+    )
+    header: Optional[str] = None
+    if len(parts) > 1 and not FIRST_HEADING_RE.match(parts[0]):
+        header = re.sub(r"\s+", " ", parts[0]).strip()
+        if len(header) < 20:
+            header = None  # just a title - nothing worth citing
+        parts = parts[1:]
 
     # Fallback: if that found hardly any headings (e.g. a document that
     # doesn't use ALL-CAPS numbered section titles), split on blank-line
@@ -337,7 +353,120 @@ def split_into_clauses(text: str) -> List[str]:
         deduped.append(clause)
     refined = deduped
 
-    return refined
+    return header, refined
+
+
+def split_into_clauses(text: str) -> List[str]:
+    """Operative clauses only (see split_document)."""
+    return split_document(text)[1]
+
+
+_WORD_RE = re.compile(r"[a-z0-9]{3,}")
+
+
+def coverage_report(text: str, header: Optional[str], clauses: List[str]) -> Dict[str, Any]:
+    """
+    Check that splitting didn't silently lose document text.
+
+    Compares the distinct words of the source with the distinct words
+    kept in header + clauses. Distinct words (not character counts)
+    make this robust to PDFs that repeat the same page, which the
+    splitter deliberately de-duplicates. Removed boilerplate (page
+    numbers, signature lines) costs very little. A low ratio means
+    real content was dropped - e.g. an unrecognized heading style made
+    most of a document fall outside the clauses - and the analysis for
+    that document should not be trusted until it's looked at.
+    """
+    source_words = set(_WORD_RE.findall((text or "").lower()))
+    kept = " ".join(([header] if header else []) + list(clauses)).lower()
+    kept_words = set(_WORD_RE.findall(kept))
+    if not source_words:
+        return {"ratio": 1.0, "ok": True, "missing_sample": []}
+    missing = sorted(source_words - kept_words)
+    ratio = 1 - len(missing) / len(source_words)
+    return {
+        "ratio": round(ratio, 3),
+        "ok": ratio >= 0.95,
+        "missing_sample": missing[:20],
+    }
+
+
+# ---------------------------------------------------------------- facts
+#
+# Labeled fields ("FINANCED AMOUNT: $45,892.00", "LENDER: ...") are read
+# straight from the document text. When a document labels a value, the
+# label is the authority - an LLM reading is only used when there is no
+# label, and even then must be found verbatim in the text (see
+# llm_agent.ground_metadata).
+
+_CURRENCY_SYMBOLS = {"$": "USD", "US$": "USD", "\u20b9": "INR", "\u20ac": "EUR", "\u00a3": "GBP", "Rs.": "INR", "Rs": "INR"}
+_MONEY_RE = re.compile(
+    r"(?P<cur>US\$|\$|\u20b9|\u20ac|\u00a3|Rs\.?|INR|USD|EUR|GBP)\s?"
+    r"(?P<num>\d{1,3}(?:,\d{2,3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
+    r"|(?P<num2>\d{1,3}(?:,\d{2,3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s?(?P<cur2>INR|USD|EUR|GBP)\b"
+)
+_AMOUNT_LABELS = (
+    r"FINANCED\s+AMOUNT|LOAN\s+AMOUNT|PRINCIPAL(?:\s+AMOUNT)?|"
+    r"TOTAL\s+CONTRACT\s+VALUE|CONTRACT\s+VALUE|TOTAL\s+VALUE|"
+    r"CONTRACT\s+PRICE|TOTAL\s+(?:FEES?|PRICE|AMOUNT)|PURCHASE\s+PRICE"
+)
+_PARTY_LABELS = {
+    "lender_name": r"LENDER|BANK|CREDITOR",
+    "customer_name": r"BORROWER|CUSTOMER|CLIENT|DEBTOR",
+}
+
+
+def _currency_code(raw: str) -> str:
+    raw = (raw or "").strip()
+    return _CURRENCY_SYMBOLS.get(raw, raw.upper().rstrip("."))
+
+
+def find_money_amounts(text: str) -> List[Dict[str, Any]]:
+    """Every currency amount written in the text."""
+    found = []
+    for m in _MONEY_RE.finditer(text or ""):
+        num = m.group("num") or m.group("num2")
+        cur = m.group("cur") or m.group("cur2")
+        try:
+            value = float(num.replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+        found.append({"value": value, "currency": _currency_code(cur), "text": m.group(0).strip()})
+    return found
+
+
+def extract_labeled_facts(text: str) -> Dict[str, Any]:
+    """
+    Values the document states under an explicit label, e.g.
+    'FINANCED AMOUNT: $45,892.00.', 'LENDER: FINANCIAL BANK OF AMERICA Inc., ...'.
+    Only the first occurrence of each label is used. Keys are absent
+    when the document has no such label.
+    """
+    t = re.sub(r"\s+", " ", text or "")
+    facts: Dict[str, Any] = {}
+
+    m = re.search(r"\b(?P<label>" + _AMOUNT_LABELS + r")\s*[:\-]\s*(?P<rest>.{0,60})", t, re.IGNORECASE)
+    if m:
+        amounts = find_money_amounts(m.group("rest"))
+        if amounts:
+            facts["contract_value"] = amounts[0]["value"]
+            facts["currency"] = amounts[0]["currency"]
+            facts["contract_value_text"] = amounts[0]["text"]
+            facts["contract_value_label"] = re.sub(r"\s+", " ", m.group("label").upper())
+
+    for key, labels in _PARTY_LABELS.items():
+        m = re.search(
+            r"(?:^|[\s.;])(?:" + labels + r")\s*:\s*"
+            r"(?P<name>[A-Za-z0-9][A-Za-z0-9 .&'\-]{1,80}?)"
+            r"(?=\s*(?:,|;|\(|\.\s|\.$|\bresiding\b|\bregistered\b|\bheadquartered\b|\bholder\b|$))",
+            t,
+            re.IGNORECASE,
+        )
+        if m:
+            name = m.group("name").strip().rstrip(".,")
+            if name and name.lower() not in {"the bank", "the lender", "the borrower", "the client"}:
+                facts[key] = name
+    return facts
 
 def assign_clause_pages(clauses: List[str], pages: List[str]) -> List[int]:
     """

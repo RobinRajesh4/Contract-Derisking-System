@@ -1,0 +1,4460 @@
+diff --git a/backend/app/chat_router.py b/backend/app/chat_router.py
+new file mode 100644
+index 0000000..c962ef0
+--- /dev/null
++++ b/backend/app/chat_router.py
+@@ -0,0 +1,403 @@
++"""
++Answers chat questions that are really database questions - highest,
++lowest, totals, counts, "which contracts are with bank X", "what is
++the financed amount of Contract_7" - exactly, in code, from the stored
++contract directory.
++
++A language model is used only to translate the question into a small,
++validated query spec (ChatQuerySpec). It never sorts, compares or adds
++numbers itself: those steps are ordinary Python below, so the answer is
++the same every time and can't contradict itself.
++
++Anything that needs clause wording is marked "semantic" and goes to
++the normal retrieval + LLM path in main.py.
++"""
++import re
++from typing import Any, Dict, List, Optional, Tuple
++
++from .schemas import ChatQuerySpec, QueryFilter, parse_money
++
++_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
++
++FIELD_LABELS = {
++    "filename": "Contract",
++    "customer_name": "Borrower / customer",
++    "lender_name": "Lender",
++    "contract_about": "Type",
++    "governing_law": "Governing law",
++    "currency": "Currency",
++    "contract_value": "Amount",
++    "start_date": "Start date",
++    "end_date": "End date",
++    "indemnification_clause_present": "Indemnification clause",
++    "ip_shared_with_customer": "IP shared with customer",
++}
++
++_CURRENCY_SYMBOL = {"USD": "$", "INR": "₹", "EUR": "€", "GBP": "£"}
++
++
++# ------------------------------------------------------------------ routing
++
++ROUTER_SYSTEM = (
++    "You translate questions about a set of contracts into a JSON query "
++    "spec. Return only the JSON object."
++)
++
++
++def build_router_prompt(question: str, history: List[Dict[str, str]]) -> str:
++    convo = ""
++    if history:
++        lines = [
++            f"{turn.get('role', 'user')}: {str(turn.get('content', ''))[:400]}"
++            for turn in history[-4:]
++        ]
++        convo = "Conversation so far (use it to resolve follow-ups such as 'and the lowest?'):\n" + "\n".join(lines) + "\n\n"
++
++    return f"""Decide how to answer the question below.
++
++Each contract has these directory fields:
++filename, customer_name (borrower / customer), lender_name, contract_about
++(type of contract), governing_law, currency, contract_value (financed amount /
++total contract value), start_date, end_date (YYYY-MM-DD),
++indemnification_clause_present, ip_shared_with_customer.
++
++kind = "structured" ONLY when the answer can be computed from those fields
++alone: ranking (highest, lowest, largest, smallest, top N, newest, oldest,
++earliest, latest), counting, totals, averages, or listing / filtering by
++those fields, or looking up one of those fields for a named contract.
++
++kind = "semantic" when the answer needs the wording of clauses: what a clause
++says, obligations, interest rates, penalties, fees, termination terms, risks,
++comparing terms, drafting, or explanations.
++
++Rules for structured specs:
++- "the highest / the lowest / the largest" (singular) -> limit 1.
++- plural without a number ("the lowest amounts") -> limit null (list all, sorted).
++- "top 3" -> limit 3.
++- highest / largest / latest / newest -> order "desc"; lowest / smallest /
++  earliest / oldest -> order "asc".
++- filters use op "contains" for names, "greater_than"/"less_than" for amounts,
++  "before"/"after" for dates (value YYYY-MM-DD or YYYY), "is_true"/"is_false"
++  for yes/no fields.
++- A named contract such as "Contract_7" is a filter on filename (contains).
++
++Examples:
++Q: Which contract has the highest financed amount?
++A: {{"kind":"structured","operation":"list","sort_by":"contract_value","order":"desc","limit":1,"filters":[]}}
++Q: which contracts have the least financial amounts
++A: {{"kind":"structured","operation":"list","sort_by":"contract_value","order":"asc","limit":null,"filters":[]}}
++Q: How many contracts are with Financial Bank of America?
++A: {{"kind":"structured","operation":"count","sort_by":null,"order":"desc","limit":null,"filters":[{{"field":"lender_name","op":"contains","value":"Financial Bank of America"}}]}}
++Q: What is the total amount financed?
++A: {{"kind":"structured","operation":"sum","sort_by":null,"order":"desc","limit":null,"filters":[]}}
++Q: Loans above $50,000 ending before 2027
++A: {{"kind":"structured","operation":"list","sort_by":"contract_value","order":"desc","limit":null,"filters":[{{"field":"contract_value","op":"greater_than","value":"50000"}},{{"field":"end_date","op":"before","value":"2027"}}]}}
++Q: Who is the lender in Contract_3?
++A: {{"kind":"structured","operation":"list","sort_by":null,"order":"desc","limit":null,"filters":[{{"field":"filename","op":"contains","value":"Contract_3"}}]}}
++Q: What is the interest rate in Contract_5?
++A: {{"kind":"semantic","operation":"list","sort_by":null,"order":"desc","limit":null,"filters":[]}}
++Q: Which contracts have the harshest default penalties?
++A: {{"kind":"semantic","operation":"list","sort_by":null,"order":"desc","limit":null,"filters":[]}}
++
++{convo}Question: {question}
++"""
++
++
++def route_question(llm_client: Any, question: str, history: List[Dict[str, str]]) -> Optional[ChatQuerySpec]:
++    """The spec, or None if routing failed (caller then uses the semantic path)."""
++    try:
++        return llm_client.structured_call(
++            ChatQuerySpec,
++            build_router_prompt(question, history),
++            ROUTER_SYSTEM,
++            task="quality",
++        )
++    except Exception as error:
++        print(f"[chat] question routing failed, using retrieval instead: {error}")
++        return None
++
++
++# ------------------------------------------------------------------ execution
++
++def _field(a: Dict[str, Any], field: str) -> Any:
++    if field == "filename":
++        return a.get("filename")
++    value = (a.get("contract_metadata") or {}).get(field)
++    if field == "contract_value":
++        return parse_money(value)
++    if field in ("start_date", "end_date"):
++        return value if isinstance(value, str) and _DATE_RE.match(value) else None
++    if isinstance(value, str) and not value.strip():
++        return None
++    return value
++
++
++def _norm(text: Any) -> str:
++    text = re.sub(r"[^a-z0-9 ]", " ", str(text or "").lower())
++    return re.sub(r"\s+", " ", text).strip()
++
++
++def _date_bound(value: str, op: str) -> Optional[str]:
++    value = (value or "").strip()
++    if _DATE_RE.match(value):
++        return value
++    if re.fullmatch(r"\d{4}", value):
++        return f"{value}-01-01" if op == "before" else f"{value}-12-31"
++    if re.fullmatch(r"\d{4}-\d{2}", value):
++        return f"{value}-01" if op == "before" else f"{value}-31"
++    return None
++
++
++def _matches(a: Dict[str, Any], f: QueryFilter) -> Optional[bool]:
++    """True/False, or None when this contract has no value for the field."""
++    value = _field(a, f.field)
++    if f.op in ("is_true", "is_false"):
++        if value is None:
++            return None
++        return bool(value) is (f.op == "is_true")
++    if value is None:
++        return None
++    if f.op in ("contains", "equals"):
++        want, have = _norm(f.value), _norm(value)
++        if f.field == "filename":
++            # "Contract_3" must not match "Contract_31"
++            return bool(re.search(r"(?<![a-z0-9])" + re.escape(want) + r"(?![0-9])", have))
++        return want in have if f.op == "contains" else want == have
++    if f.op in ("greater_than", "less_than"):
++        limit = parse_money(f.value)
++        number = value if isinstance(value, (int, float)) else parse_money(value)
++        if limit is None or number is None:
++            return None
++        return number > limit if f.op == "greater_than" else number < limit
++    if f.op in ("before", "after"):
++        bound = _date_bound(f.value or "", f.op)
++        if bound is None or not isinstance(value, str):
++            return None
++        return value < bound if f.op == "before" else value > bound
++    return None
++
++
++def format_money(value: Optional[float], currency: Optional[str]) -> str:
++    if value is None:
++        return "not found"
++    code = (currency or "").upper()
++    symbol = _CURRENCY_SYMBOL.get(code)
++    if symbol:
++        return f"{symbol}{value:,.2f}"
++    return f"{value:,.2f} {code}".strip()
++
++
++def _display(a: Dict[str, Any], field: str) -> str:
++    if field == "contract_value":
++        return format_money(_field(a, "contract_value"), _field(a, "currency"))
++    value = _field(a, field)
++    if value is None:
++        return "not found"
++    if isinstance(value, bool):
++        return "Yes" if value else "No"
++    return str(value)
++
++
++def _name(a: Dict[str, Any]) -> str:
++    return a.get("filename") or f"Contract {a.get('analysis_id')}"
++
++
++def _names(items: List[Dict[str, Any]]) -> str:
++    return ", ".join(_name(a) for a in items)
++
++
++def execute_spec(spec: ChatQuerySpec, analyses: List[Dict[str, Any]]) -> Dict[str, Any]:
++    """
++    Run a structured spec over the contract records.
++
++    Returns {"answer": markdown, "rows": [records in answer order],
++    "excluded": {...}} - rows are what the answer's references point to.
++    """
++    notes: List[str] = []
++    selected = list(analyses)
++
++    # Filters: a contract with no value for a filtered field can't be
++    # checked, so it's reported by name rather than silently treated
++    # as a non-match.
++    for f in spec.filters:
++        kept, unknown = [], []
++        for a in selected:
++            result = _matches(a, f)
++            if result is None:
++                unknown.append(a)
++            elif result:
++                kept.append(a)
++        if unknown and f.field != "filename":
++            notes.append(
++                f"Could not check {FIELD_LABELS.get(f.field, f.field).lower()} for: {_names(unknown)} "
++                "(not found in those documents)."
++            )
++        selected = kept
++
++    value_involved = spec.sort_by == "contract_value" or spec.operation in ("sum", "average") or any(
++        f.field == "contract_value" for f in spec.filters
++    )
++
++    if not selected:
++        answer = "No contracts match that."
++        if notes:
++            answer += "\n\n" + "\n".join(f"- {n}" for n in notes)
++        return {"answer": answer, "rows": [], "notes": notes}
++
++    # Aggregates --------------------------------------------------------
++    if spec.operation in ("sum", "average"):
++        have = [a for a in selected if _field(a, "contract_value") is not None]
++        missing = [a for a in selected if _field(a, "contract_value") is None]
++        by_currency: Dict[str, List[Dict[str, Any]]] = {}
++        for a in have:
++            by_currency.setdefault((_field(a, "currency") or "unknown currency").upper(), []).append(a)
++        lines = []
++        for code, items in sorted(by_currency.items()):
++            values = [_field(a, "contract_value") for a in items]
++            total = sum(values)
++            if spec.operation == "sum":
++                lines.append(f"- **{format_money(total, code)}** across {len(items)} contract(s)")
++            else:
++                lines.append(
++                    f"- **{format_money(total / len(items), code)}** average across {len(items)} contract(s)"
++                )
++        title = "Total amount" if spec.operation == "sum" else "Average amount"
++        answer = f"**{title}**" + (" (per currency; different currencies are not added together)" if len(by_currency) > 1 else "") + ":\n" + "\n".join(lines)
++        if missing:
++            notes.append(f"No amount found in: {_names(missing)} (not included).")
++        rows = sorted(have, key=lambda a: _field(a, "contract_value"), reverse=True)
++        answer += "\n\n" + _table(rows, ["contract_value"])
++        if notes:
++            answer += "\n\n" + "\n".join(f"- {n}" for n in notes)
++        return {"answer": answer, "rows": rows, "notes": notes}
++
++    # Sorting -------------------------------------------------------------
++    groups: List[Tuple[Optional[str], List[Dict[str, Any]]]] = [(None, selected)]
++    if spec.sort_by:
++        have = [a for a in selected if _field(a, spec.sort_by) is not None]
++        missing = [a for a in selected if _field(a, spec.sort_by) is None]
++        if missing:
++            notes.append(
++                f"No {FIELD_LABELS[spec.sort_by].lower()} found in: {_names(missing)} (left out of the ranking)."
++            )
++        reverse = spec.order == "desc"
++        if spec.sort_by == "contract_value":
++            # Never rank a USD amount against an INR amount by number.
++            by_currency: Dict[str, List[Dict[str, Any]]] = {}
++            for a in have:
++                by_currency.setdefault((_field(a, "currency") or "unknown currency").upper(), []).append(a)
++            if len(by_currency) > 1:
++                notes.append("Amounts are ranked separately per currency; different currencies aren't compared.")
++            groups = [
++                (code, sorted(items, key=lambda a: _field(a, "contract_value"), reverse=reverse))
++                for code, items in sorted(by_currency.items())
++            ]
++        else:
++            groups = [(None, sorted(have, key=lambda a: str(_field(a, spec.sort_by)).lower(), reverse=reverse))]
++
++    # Limit, keeping ties at the cut-off ------------------------------------
++    if spec.limit:
++        limited = []
++        for code, items in groups:
++            if len(items) > spec.limit and spec.sort_by:
++                edge = _field(items[spec.limit - 1], spec.sort_by)
++                cut = spec.limit
++                while cut < len(items) and _field(items[cut], spec.sort_by) == edge:
++                    cut += 1
++                items = items[:cut]
++            elif len(items) > spec.limit:
++                items = items[:spec.limit]
++            limited.append((code, items))
++        groups = limited
++
++    rows = [a for _, items in groups for a in items]
++    if not rows:
++        answer = "None of the matching contracts have that information recorded."
++        if notes:
++            answer += "\n\n" + "\n".join(f"- {n}" for n in notes)
++        return {"answer": answer, "rows": [], "notes": notes}
++
++    columns: List[str] = []
++    if value_involved or spec.sort_by == "contract_value":
++        columns.append("contract_value")
++    for f in spec.filters:
++        if f.field not in columns and f.field not in ("filename", "contract_value"):
++            columns.append(f.field)
++    if spec.sort_by and spec.sort_by not in columns:
++        columns.append(spec.sort_by)
++    if not columns:
++        # Lookup of a named contract, or a plain filter: show the parties
++        # and the amount.
++        columns = ["customer_name", "lender_name", "contract_value"]
++
++    # Lead sentence -----------------------------------------------------
++    if spec.operation == "count":
++        lead = f"**{len(rows)}** contract{'s' if len(rows) != 1 else ''} match."
++    elif spec.limit == 1 and spec.sort_by and len(groups) == 1 and len(rows) == 1:
++        a = rows[0]
++        word = {
++            ("contract_value", "desc"): "highest amount",
++            ("contract_value", "asc"): "lowest amount",
++            ("end_date", "asc"): "earliest end date",
++            ("end_date", "desc"): "latest end date",
++            ("start_date", "asc"): "earliest start date",
++            ("start_date", "desc"): "latest start date",
++        }.get((spec.sort_by, spec.order), f"{spec.order} {FIELD_LABELS.get(spec.sort_by, spec.sort_by)}")
++        lead = f"**{_name(a)}** has the {word}: **{_display(a, spec.sort_by)}**."
++    elif spec.limit == 1 and spec.sort_by and len(rows) > 1 and len(groups) == 1:
++        lead = f"{len(rows)} contracts are tied:"
++    elif spec.limit == 1 and spec.sort_by == "contract_value" and len(groups) > 1:
++        which = "Highest" if spec.order == "desc" else "Lowest"
++        lead = f"{which} amount in each currency:"
++    elif spec.sort_by:
++        direction = "highest first" if spec.order == "desc" else "lowest first"
++        if spec.sort_by in ("start_date", "end_date"):
++            direction = "latest first" if spec.order == "desc" else "earliest first"
++        lead = f"Sorted by {FIELD_LABELS[spec.sort_by].lower()}, {direction}:"
++    else:
++        lead = f"{len(rows)} matching contract{'s' if len(rows) != 1 else ''}:"
++
++    parts = [lead]
++    for code, items in groups:
++        if not items:
++            continue
++        if code and len(groups) > 1:
++            parts.append(f"\n**{code}**")
++        parts.append(_table(items, columns, start=rows.index(items[0]) + 1))
++    if notes:
++        parts.append("\n".join(f"- {n}" for n in notes))
++    return {"answer": "\n\n".join(parts), "rows": rows, "notes": notes}
++
++
++def _table(items: List[Dict[str, Any]], columns: List[str], start: int = 1) -> str:
++    header = ["#", "Contract"] + [FIELD_LABELS.get(c, c) for c in columns] + ["Source", "Link"]
++    lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
++    for i, a in enumerate(items, start=start):
++        cells = [str(i), _name(a)] + [_display(a, c).replace("|", "/") for c in columns]
++        cells.append(f"[{i}](#source-{i})")
++        cells.append(f"[View](#contract-{a.get('analysis_id')})")
++        lines.append("| " + " | ".join(cells) + " |")
++    return "\n".join(lines)
++
++
++def sources_for_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    """
++    References for a structured answer: each contract's header, which
++    is where the parties and the amount are written, so "jump to"
++    lands on the actual figure. Numbered to match the table rows.
++    """
++    sources = []
++    for i, a in enumerate(rows, start=1):
++        header = a.get("header") or {}
++        meta = a.get("contract_metadata") or {}
++        text = header.get("text") or meta.get("contract_value_text") or ""
++        sources.append({
++            "source_number": i,
++            "analysis_id": a.get("analysis_id"),
++            "filename": _name(a),
++            "clause_id": "header" if header.get("text") else None,
++            "text": text,
++            "score": None,
++            "kind": "header",
++        })
++    return sources
+diff --git a/backend/app/llm_providers.py b/backend/app/llm_providers.py
+index 3686554..cbc975d 100644
+--- a/backend/app/llm_providers.py
++++ b/backend/app/llm_providers.py
+@@ -1,69 +1,83 @@
+ """
+-LLM Provider abstraction for supporting multiple AI backends (Groq, Ollama).
++LLM provider abstraction (Ollama, Groq).
++
++Two model "tiers" are used, selected per task:
++- "bulk":    many small calls per contract (clause classification,
++             policy compliance, check applicability). Speed matters.
++- "quality": one call per contract or per chat question (contract
++             metadata extraction, executive summary, chat answers,
++             chat question routing). Accuracy matters more than speed.
+ """
+ from typing import Optional, Dict, Any
+ from abc import ABC, abstractmethod
+-import os
+ import json
++import os
++import threading
++import time
+ 
+-try:
+-    import ollama as _ollama_module  # optional python client for Ollama
+-    OLLAMA_PY_AVAILABLE = True
+-except Exception:
+-    _ollama_module = None
+-    OLLAMA_PY_AVAILABLE = False
+-
+-try:
+-    import requests as _requests_module  # used for HTTP fallback to Ollama API
+-    REQUESTS_AVAILABLE = True
+-except Exception:
+-    _requests_module = None
+-    REQUESTS_AVAILABLE = False
++import requests
+ 
+ 
+ # Global settings stored in memory (persisted to settings.json)
+ _settings: Dict[str, Any] = {
+     "provider": "ollama",  # "groq" or "ollama"
+     "ollama_url": "http://localhost:11434",
+-    "ollama_model": "deepseek-r1:14b",
++    # Model for the many small per-clause calls.
++    "ollama_model": "qwen3:8b",
++    # Model for per-contract extraction, summaries and chat.
++    "ollama_quality_model": "qwen3:32b",
+     "groq_model": "llama-3.1-70b-versatile",
+     # Set to false only for a trusted internal server whose certificate
+     # your OS/Python doesn't trust (e.g. a corporate self-signed CA).
+     # Prefer installing the company's root CA instead of disabling this.
+     "ollama_verify_ssl": True,
+-    # How many LLM calls this app fires at once against Ollama, for the
+-    # per-clause classification and compliance loops. Higher can cut
+-    # wall-clock time a lot on a server with spare capacity, but a
+-    # single shared box may just queue extra concurrent requests
+-    # rather than truly parallelize them - tune this down if raising it
+-    # doesn't help, or if it starts causing timeouts under load.
++    # How many LLM calls run at once for the per-clause loops. A shared
++    # server may queue rather than parallelize extra requests; lower
++    # this if raising it doesn't help or causes timeouts.
+     "llm_concurrency": 4,
+-    # Ollama's default context window is a mere 2048 tokens unless
+-    # explicitly overridden. This app's prompts routinely exceed that -
+-    # the /chat "Available Contracts Directory" alone grows with every
+-    # uploaded contract, on top of a long system prompt, instructions,
+-    # and multiple RAG excerpts. Past the limit, Ollama silently
+-    # truncates the request, so the model never sees the data it needs
+-    # and fabricates a plausible-sounding answer instead of admitting
+-    # it doesn't know - this is the single most likely cause of
+-    # "hallucinated" numbers that match nothing in any excerpt.
+-    # Raise this further if you have many contracts uploaded and still
+-    # see ungrounded answers; lower it only if the server can't handle
+-    # the memory cost of a larger context.
+-    "ollama_num_ctx": 8192,
++    # Ollama's default context window is only 2048 tokens. Anything
++    # past it is silently cut off, and the model then answers without
++    # the data it needed. Keep this comfortably above the longest
++    # prompt (the chat prompt grows with the number of contracts).
++    "ollama_num_ctx": 16384,
++    # Seconds to wait for one LLM response before giving up.
++    "llm_timeout_sec": 240,
++    # Embeddings for clause search. Leave embedding_url empty to use
++    # ollama_url. Changing the model needs a re-index
++    # (POST /admin/reindex); each model gets its own collection, so
++    # switching back and forth never mixes incompatible vectors.
++    "embedding_url": "",
++    "embedding_model": "qwen3-embedding:8b",
+ }
+ 
+ SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "settings.json")
+ 
++# Keys the /settings endpoint may change.
++EDITABLE_SETTINGS = [
++    "provider",
++    "ollama_url",
++    "ollama_model",
++    "ollama_quality_model",
++    "groq_model",
++    "ollama_verify_ssl",
++    "llm_concurrency",
++    "ollama_num_ctx",
++    "llm_timeout_sec",
++    "embedding_url",
++    "embedding_model",
++]
++
++
++class LLMError(RuntimeError):
++    """An LLM call failed or returned nothing usable."""
++
+ 
+ def load_settings() -> Dict[str, Any]:
+     """Load settings from file."""
+-    global _settings
+     try:
+         if os.path.exists(SETTINGS_FILE):
+             with open(SETTINGS_FILE, "r") as f:
+-                saved = json.load(f)
+-                _settings.update(saved)
++                _settings.update(json.load(f))
+     except Exception as e:
+         print(f"Error loading settings: {e}")
+     return _settings
+@@ -71,7 +85,6 @@ def load_settings() -> Dict[str, Any]:
+ 
+ def save_settings(settings: Dict[str, Any]) -> None:
+     """Save settings to file."""
+-    global _settings
+     _settings.update(settings)
+     try:
+         with open(SETTINGS_FILE, "w") as f:
+@@ -89,282 +102,257 @@ def get_settings() -> Dict[str, Any]:
+ load_settings()
+ 
+ 
+-class BaseLLMProvider(ABC):
+-    """Abstract base class for LLM providers."""
+-    
+-    @abstractmethod
+-    def invoke(self, prompt: str, system: Optional[str] = None, temperature: float = 0) -> str:
+-        """Invoke the LLM with a prompt and return the response content."""
+-        pass
+-    
+-    @abstractmethod
+-    def is_available(self) -> bool:
+-        """Check if this provider is configured and available."""
+-        pass
++def verify_ssl() -> bool:
++    return bool(_settings.get("ollama_verify_ssl", True))
+ 
+ 
+-def _ollama_text(resp) -> str:
+-    """Extract generated text from an ollama client response.
+-
+-    Handles both plain dicts (chat: {"message": {"content": ...}},
+-    generate: {"response": ...}) and the pydantic response objects that
+-    newer ollama client versions return.
+-
+-    Raises ValueError if no usable text is found, rather than falling
+-    back to str(resp) - a raw response repr (e.g. from a gpt-oss reply
+-    that routed its answer into a hallucinated tool_calls field instead
+-    of content) is not a valid chat answer, and dumping it as one is
+-    worse than surfacing a clear failure so invoke() can try its next
+-    fallback tier (HTTP /api/generate, which uses a plain completion
+-    call rather than a chat template and is less prone to this).
+-    """
+-    if isinstance(resp, dict):
+-        msg = resp.get("message")
+-        if isinstance(msg, dict) and msg.get("content"):
+-            return msg["content"]
+-        text = resp.get("response") or resp.get("content") or resp.get("text")
+-        if text:
+-            return text
+-        raise ValueError(
+-            "Ollama response had no usable text field "
+-            f"(keys present: {list(resp.keys())})"
+-        )
++_warned_insecure = False
+ 
+-    msg = getattr(resp, "message", None)
+-    content = getattr(msg, "content", None) if msg is not None else None
+-    if content:
+-        return content
+-
+-    generate_text = getattr(resp, "response", None)
+-    if generate_text:
+-        return generate_text
+-
+-    # Nothing in content/response - check whether the model routed its
+-    # answer into a tool call instead (observed with gpt-oss on Ollama),
+-    # so the failure is diagnosable rather than a silent empty string.
+-    tool_calls = getattr(msg, "tool_calls", None) if msg is not None else None
+-    if tool_calls:
+-        raise ValueError(
+-            "Ollama model returned an empty content field and instead "
+-            f"emitted tool_calls it was never asked to make: {tool_calls!r}. "
+-            "This model likely needs 'think: False' and/or an explicit "
+-            "\"you have no tools\" instruction in the system prompt."
+-        )
+ 
+-    raise ValueError("Ollama response had no usable text field")
++def silence_insecure_warning_if_needed() -> None:
++    """When certificate checks are deliberately off for an internal
++    server, urllib3 prints a warning on every single request, burying
++    the useful log lines. Silence it once, and say so once."""
++    global _warned_insecure
++    if verify_ssl() or _warned_insecure:
++        return
++    try:
++        import urllib3
+ 
++        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
++    except Exception:
++        pass
++    print(
++        "[settings] ollama_verify_ssl is false: HTTPS certificate checks "
++        "are disabled for the Ollama server."
++    )
++    _warned_insecure = True
++
++
++def model_for_task(task: str = "bulk") -> str:
++    if task == "quality":
++        return str(
++            _settings.get("ollama_quality_model")
++            or _settings.get("ollama_model")
++        )
++    return str(_settings.get("ollama_model"))
+ 
+-def _ollama_options(temperature: float) -> Dict[str, Any]:
+-    """Ollama only honours sampling params inside an `options` object;
+-    a top-level `temperature` is silently ignored. A fixed seed makes
+-    temperature=0 runs reproducible.
+ 
+-    Also sets num_ctx explicitly - Ollama's default is only 2048
+-    tokens, which this app's longer prompts (chat's contract
+-    directory, policy compliance prompts with many checks, etc.) can
+-    silently exceed, causing truncation the caller never sees and
+-    answers that aren't grounded in the real prompt content. See
+-    ollama_num_ctx's comment in _settings for the full explanation.
+-    """
+-    opts: Dict[str, Any] = {
+-        "temperature": float(temperature),
+-        "num_ctx": int(_settings.get("ollama_num_ctx", 8192)),
+-    }
+-    if float(temperature) == 0.0:
+-        opts["seed"] = 0
+-    return opts
+-
+-
+-def _ollama_think_kwarg(model: str) -> Dict[str, Any]:
+-    """"Thinking" models (Qwen3, DeepSeek-R1, gpt-oss, ...) reason out
+-    loud by default, which is pure overhead for the strict-JSON
+-    micro-tasks this app runs and can also leak <think> text ahead of
+-    the JSON (parse_llm_json strips that as a safety net regardless).
+-    Ollama's `think` request param turns it off on models that support
+-    it; unsupported models simply ignore the field."""
++def _think_value(model: str) -> Optional[Any]:
++    """Reasoning models think out loud by default, which slows every
++    call and can put text ahead of the JSON. Turn it off where the
++    model allows it. gpt-oss cannot switch reasoning off, only lower
++    it; other models don't take the field at all."""
+     name = (model or "").lower()
+-    if any(tag in name for tag in ("qwen3", "deepseek-r1", "gpt-oss")):
+-        return {"think": False}
+-    return {}
++    if "gpt-oss" in name:
++        return "low"
++    if any(tag in name for tag in ("qwen3", "deepseek-r1")):
++        return False
++    return None
++
++
++class BaseLLMProvider(ABC):
++    """Abstract base class for LLM providers."""
++
++    model: str = ""
++
++    @abstractmethod
++    def invoke(
++        self,
++        prompt: str,
++        system: Optional[str] = None,
++        temperature: float = 0,
++        json_schema: Optional[Dict[str, Any]] = None,
++    ) -> str:
++        """Return the model's text reply. When json_schema is given,
++        providers that support it constrain the output to that schema.
++        Raises LLMError on failure instead of returning an empty
++        string, so callers can't mistake a failure for an answer."""
++
++    @abstractmethod
++    def is_available(self) -> bool:
++        """Check if this provider is configured and reachable."""
+ 
+ 
+ class GroqProvider(BaseLLMProvider):
+     """Groq API provider using LangChain."""
+-    
+-    def __init__(self):
++
++    def __init__(self, model: Optional[str] = None):
+         self.api_key = os.getenv("GROQ_API_KEY")
+-        self.model = _settings.get("groq_model", "llama-3.1-70b-versatile")
+-    
+-    def invoke(self, prompt: str, system: Optional[str] = None, temperature: float = 0) -> str:
++        self.model = model or _settings.get("groq_model", "llama-3.1-70b-versatile")
++
++    def invoke(self, prompt, system=None, temperature=0, json_schema=None) -> str:
+         from langchain_groq import ChatGroq
++
+         llm = ChatGroq(model=self.model, temperature=temperature)
+         full_prompt = f"{system}\n{prompt}" if system else prompt
+         out = llm.invoke(full_prompt)
+-        return getattr(out, "content", "")
+-    
++        text = getattr(out, "content", "") or ""
++        if not text.strip():
++            raise LLMError("Groq returned an empty response")
++        return text
++
+     def is_available(self) -> bool:
+         return bool(self.api_key)
+ 
+ 
+-class OllamaProvider(BaseLLMProvider):
+-    """Ollama local provider. Tries: (1) local `ollama` python client, (2) HTTP /api/generate, (3) langchain_ollama."""
+-
+-    def __init__(self):
+-        self.base_url = _settings.get("ollama_url", "http://localhost:11434")
+-        # ensure default selects the exact offline model tag with :latest
+-        self.model = _settings.get("ollama_model", "llama3.2:latest")
+-        self.verify_ssl = bool(_settings.get("ollama_verify_ssl", True))
++# Remembered once per process: an older Ollama server that rejects
++# JSON-schema "format" or the "think" field is retried without them,
++# and later calls skip straight to what works.
++_server_caps = {"format_schema": True, "think": True}
++_availability_cache: Dict[str, Any] = {"url": None, "ok": False, "at": 0.0}
++_availability_lock = threading.Lock()
+ 
+-    def invoke(self, prompt: str, system: Optional[str] = None, temperature: float = 0) -> str:
+-        """Invoke Ollama. Prefer the `ollama` python client if available, then HTTP, then LangChain wrapper.
+-        All external calls are constrained with a short timeout so server endpoints don't hang."""
+-        import concurrent.futures
+ 
+-        full_prompt = f"{system}\n{prompt}" if system else prompt
+-        TIMEOUT_SEC = 120
+-
+-        def _run_with_timeout(fn, timeout=TIMEOUT_SEC):
+-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+-                fut = ex.submit(fn)
+-                try:
+-                    return fut.result(timeout=timeout)
+-                except concurrent.futures.TimeoutError:
+-                    raise TimeoutError("Ollama invocation timed out")
+-
+-        # 1) Try using the ollama python client, pointed explicitly at
+-        # base_url. The module-level ollama.chat()/generate() functions
+-        # always talk to localhost (or $OLLAMA_HOST) and ignore any URL
+-        # we pass in, so we must build an ollama.Client bound to
+-        # base_url instead - otherwise a non-default ollama_url setting
+-        # (like a company server) is silently never used here.
+-        if OLLAMA_PY_AVAILABLE and _ollama_module is not None:
++class OllamaProvider(BaseLLMProvider):
++    """Ollama over its HTTP /api/chat endpoint."""
++
++    def __init__(self, model: Optional[str] = None):
++        self.base_url = str(_settings.get("ollama_url", "http://localhost:11434")).rstrip("/")
++        self.model = model or model_for_task("bulk")
++        self.verify = verify_ssl()
++        silence_insecure_warning_if_needed()
++
++    def _payload(self, prompt, system, temperature, json_schema, use_format, use_think):
++        messages = []
++        if system:
++            messages.append({"role": "system", "content": system})
++        messages.append({"role": "user", "content": prompt})
++
++        options: Dict[str, Any] = {
++            "temperature": float(temperature),
++            "num_ctx": int(_settings.get("ollama_num_ctx", 8192)),
++        }
++        if float(temperature) == 0.0:
++            options["seed"] = 0
++
++        payload: Dict[str, Any] = {
++            "model": self.model,
++            "messages": messages,
++            "stream": False,
++            "options": options,
++        }
++        think = _think_value(self.model)
++        if use_think and think is not None:
++            payload["think"] = think
++        if json_schema is not None:
++            payload["format"] = json_schema if use_format else "json"
++        return payload
++
++    def invoke(self, prompt, system=None, temperature=0, json_schema=None) -> str:
++        timeout = float(_settings.get("llm_timeout_sec", 240))
++        use_format = _server_caps["format_schema"]
++        use_think = _server_caps["think"]
++        last_error: Optional[str] = None
++
++        for attempt in range(3):
++            payload = self._payload(prompt, system, temperature, json_schema, use_format, use_think)
+             try:
+-                def _call_client():
+-                    client_kwargs: Dict[str, Any] = {"host": self.base_url}
+-                    if not self.verify_ssl:
+-                        client_kwargs["verify"] = False
+-
+-                    if hasattr(_ollama_module, "Client"):
+-                        client = _ollama_module.Client(**client_kwargs)
+-                    elif hasattr(_ollama_module, "Ollama"):
+-                        client = _ollama_module.Ollama(**client_kwargs)
+-                    else:
+-                        raise RuntimeError("No usable client class on ollama module")
+-
+-                    messages = []
+-                    if system:
+-                        messages.append({"role": "system", "content": system})
+-                    messages.append({"role": "user", "content": prompt})
+-
+-                    think_kwarg = _ollama_think_kwarg(self.model)
+-                    if hasattr(client, "chat"):
+-                        resp = client.chat(model=self.model, messages=messages, options=_ollama_options(temperature), **think_kwarg)
+-                        return _ollama_text(resp)
+-                    if hasattr(client, "generate"):
+-                        resp = client.generate(model=self.model, prompt=full_prompt, options=_ollama_options(temperature), **think_kwarg)
+-                        return _ollama_text(resp)
+-
+-                    raise RuntimeError("No usable method found on ollama client")
+-
+-                return _run_with_timeout(_call_client, TIMEOUT_SEC)
+-            except TimeoutError:
+-                # Timeout - move to HTTP fallback
+-                pass
+-            except Exception:
+-                # Other error - move to HTTP fallback
+-                pass
+-
+-        # 2) HTTP fallback to Ollama local API
+-        if REQUESTS_AVAILABLE and _requests_module is not None:
++                r = requests.post(
++                    f"{self.base_url}/api/chat",
++                    json=payload,
++                    timeout=timeout,
++                    verify=self.verify,
++                )
++            except requests.Timeout:
++                raise LLMError(
++                    f"Ollama model {self.model} did not answer within {timeout:.0f}s"
++                )
++            except requests.RequestException as e:
++                last_error = f"network error: {e}"
++                time.sleep(1.5)
++                continue
++
++            if r.status_code == 400:
++                body = r.text.lower()
++                # Older servers: retry without the newer request fields.
++                if "format" in payload and use_format and "format" in body:
++                    _server_caps["format_schema"] = False
++                    use_format = False
++                    continue
++                if "think" in payload and "think" in body:
++                    _server_caps["think"] = False
++                    use_think = False
++                    continue
++            if r.status_code >= 400:
++                raise LLMError(
++                    f"Ollama returned HTTP {r.status_code} for model "
++                    f"{self.model}: {r.text[:300]}"
++                )
++
+             try:
+-                url = f"{self.base_url}/api/generate"
+-                payload = {"model": self.model, "prompt": full_prompt, "options": _ollama_options(temperature), "stream": False, **_ollama_think_kwarg(self.model)}
+-
+-                def _call_http():
+-                    r = _requests_module.post(url, json=payload, timeout=TIMEOUT_SEC, verify=self.verify_ssl)
+-                    r.raise_for_status()
+-                    # try to parse JSON if present
+-                    try:
+-                        j = r.json()
+-                        if isinstance(j, dict):
+-                            return j.get("text") or j.get("response") or json.dumps(j)
+-                        return str(j)
+-                    except Exception:
+-                        return r.text
+-
+-                return _run_with_timeout(_call_http, TIMEOUT_SEC)
+-            except TimeoutError:
+-                pass
+-            except Exception:
+-                pass
+-
+-        # 3) Fallback to langchain_ollama (existing behavior) with timeout
+-        try:
+-            from langchain_ollama import ChatOllama
+-
+-            def _call_langchain():
+-                kwargs: Dict[str, Any] = {
+-                    "model": self.model,
+-                    "base_url": self.base_url,
+-                    "temperature": temperature,
+-                    "num_ctx": int(_settings.get("ollama_num_ctx", 8192)),
+-                }
+-                if not self.verify_ssl:
+-                    # Supported on recent langchain_ollama; older
+-                    # versions ignore unknown kwargs via **kwargs.
+-                    kwargs["client_kwargs"] = {"verify": False}
+-                llm = ChatOllama(**kwargs)
+-                out = llm.invoke(full_prompt)
+-                return getattr(out, "content", "")
+-
+-            return _run_with_timeout(_call_langchain, TIMEOUT_SEC)
+-        except TimeoutError:
+-            return ""
+-        except Exception:
+-            return ""
++                data = r.json()
++            except ValueError:
++                raise LLMError("Ollama returned a non-JSON response")
++
++            # Ollama silently cuts prompts that don't fit the context
++            # window, and the model then answers without that part.
++            # A prompt that used every slot was almost certainly cut.
++            num_ctx = int(_settings.get("ollama_num_ctx", 8192))
++            evaluated = int(data.get("prompt_eval_count") or 0)
++            if evaluated >= num_ctx - 8:
++                raise LLMError(
++                    f"The request to {self.model} filled the whole context window "
++                    f"({num_ctx} tokens), so part of it was cut off and the answer "
++                    "could not be trusted. Increase ollama_num_ctx in settings.json."
++                )
++
++            message = data.get("message") or {}
++            content = message.get("content") or ""
++            if content.strip():
++                return content
++            if message.get("tool_calls"):
++                raise LLMError(
++                    f"{self.model} returned a tool call instead of an answer"
++                )
++            if message.get("thinking"):
++                raise LLMError(
++                    f"{self.model} returned only reasoning and no answer"
++                )
++            raise LLMError(f"{self.model} returned an empty response")
++
++        raise LLMError(f"Could not reach Ollama at {self.base_url} ({last_error})")
+ 
+     def is_available(self) -> bool:
+-        """Check if Ollama is running and the model is available."""
+-        try:
+-            import urllib.request
+-            import ssl
+-            req = urllib.request.Request(f"{self.base_url}/api/tags", method="GET")
+-            context = None
+-            if not self.verify_ssl:
+-                context = ssl.create_default_context()
+-                context.check_hostname = False
+-                context.verify_mode = ssl.CERT_NONE
+-            with urllib.request.urlopen(req, timeout=5, context=context) as resp:
+-                return resp.status == 200
+-        except Exception:
+-            return False
+-
+-
+-def get_llm_provider() -> BaseLLMProvider:
+-    """Get the currently configured LLM provider."""
+-    provider_name = _settings.get("provider", "groq")
+-    
+-    if provider_name == "ollama":
+-        return OllamaProvider()
+-    else:
+-        return GroqProvider()
++        """Checked before every call, so cache the result briefly
++        instead of listing every model on the server each time."""
++        with _availability_lock:
++            now = time.time()
++            if (
++                _availability_cache["url"] == self.base_url
++                and now - _availability_cache["at"] < 30
++            ):
++                return _availability_cache["ok"]
++            try:
++                r = requests.get(
++                    f"{self.base_url}/api/tags", timeout=5, verify=self.verify
++                )
++                ok = r.status_code == 200
++            except requests.RequestException:
++                ok = False
++            _availability_cache.update({"url": self.base_url, "ok": ok, "at": now})
++            return ok
++
++
++def get_llm_provider(task: str = "bulk") -> BaseLLMProvider:
++    """Provider for a task tier: "bulk" or "quality"."""
++    if _settings.get("provider", "ollama") == "ollama":
++        return OllamaProvider(model=model_for_task(task))
++    return GroqProvider()
+ 
+ 
+ def get_provider_status() -> Dict[str, Any]:
+     """Get status of all providers."""
+     groq = GroqProvider()
+     ollama = OllamaProvider()
+-    
+     return {
+         "current_provider": _settings.get("provider", "groq"),
+-        "groq": {
+-            "available": groq.is_available(),
+-            "model": groq.model,
+-        },
++        "groq": {"available": groq.is_available(), "model": groq.model},
+         "ollama": {
+             "available": ollama.is_available(),
+             "url": ollama.base_url,
+-            "model": ollama.model,
+-        }
++            "model": model_for_task("bulk"),
++            "quality_model": model_for_task("quality"),
++            "embedding_model": _settings.get("embedding_model"),
++        },
+     }
+-
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 9511375..a0afea8 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -10,16 +10,30 @@ import orjson
+ import os
+ from dotenv import load_dotenv
+ import re
++import hashlib
++import threading
+ from concurrent.futures import ThreadPoolExecutor
+ 
+ # Load env from .env (GROQ_API_KEY, QDRANT_URL, etc.)
+ load_dotenv()
+ 
+-from .parser import extract_text_from_file, split_into_clauses, extract_metadata, assign_clause_pages
++from .parser import (
++    extract_text_from_file,
++    split_document,
++    extract_metadata,
++    assign_clause_pages,
++    coverage_report,
++)
+ from .store import Store
+ from .mcp.llm_agent import LLMClient
+ from .policy import save_policy, get_policy, list_policies, apply_policy
+-from .llm_providers import get_settings, save_settings, get_provider_status, load_settings
++from .llm_providers import (
++    EDITABLE_SETTINGS,
++    get_settings,
++    save_settings,
++    get_provider_status,
++    load_settings,
++)
+ try:
+     from .rag import RAGStore
+ except Exception as error:
+@@ -125,42 +139,67 @@ else:
+ 
+ 
+ 
+-def _process_upload(
++def build_document(text: str, pages: List[str]) -> Dict[str, Any]:
++    """
++    Split extracted text into the contract header and its clauses, with
++    page numbers, plus a check that nothing was silently dropped.
++    """
++    header_text, clause_texts = split_document(text)
++    page_numbers = assign_clause_pages(
++        ([header_text] if header_text else []) + clause_texts, pages or [text]
++    )
++    header = None
++    if header_text:
++        header = {"id": "header", "text": header_text, "page": page_numbers[0]}
++        page_numbers = page_numbers[1:]
++
++    clauses = [
++        {
++            "id": idx,
++            "text": clause_text,
++            "metadata": extract_metadata(clause_text),
++            "page": page_numbers[idx - 1],
++        }
++        for idx, clause_text in enumerate(clause_texts, start=1)
++    ]
++    coverage = coverage_report(text, header_text, clause_texts)
++    if not coverage["ok"]:
++        print(
++            f"[parse] only {coverage['ratio']:.0%} of the document's words ended up "
++            f"in the header/clauses; e.g. missing: {coverage['missing_sample'][:8]}"
++        )
++    return {"header": header, "clauses": clauses, "parse_quality": coverage}
++
++
++_ingest_lock = threading.Lock()
++
++
++def ingest_document(
+     filename: str,
+     content: bytes,
+     content_type: Optional[str],
++    analysis_id: Optional[str] = None,
+ ) -> Dict[str, Any]:
+     """
+-    Does all the actual (blocking) work for one uploaded file: text/OCR
+-    extraction, clause splitting, per-clause metadata, contract-level
+-    LLM metadata extraction, persisting to the store, saving the
+-    original file, and RAG indexing.
+-
+-    Deliberately synchronous - this is meant to be run via
+-    run_in_threadpool from the async route handlers below, so a slow
+-    upload (OCR, or a slow LLM call) occupies a worker thread instead
+-    of blocking the single asyncio event loop that every other
+-    request - to any endpoint, from any user - also depends on.
+-
+-    Raises ValueError if no text could be extracted (caller decides
+-    how to surface that - as a 400 for a single upload, or as a
+-    per-file error entry for a batch upload).
++    Parse, extract and index one document.
++
++    - New file: creates a record.
++    - The same file uploaded again (same bytes), or a re-index: updates
++      the existing record in place, so one document never becomes
++      several records that all show up in search and chat.
++    - If re-parsing changed the clauses, the old risk analysis no
++      longer matches them and is cleared; the record goes back to
++      "uploaded" and needs /analyze again.
++
++    Blocking; routes call it through run_in_threadpool.
++    Raises ValueError if no text could be extracted.
+     """
+     text, ocr_info, pages = extract_text_from_file(filename, content)
+     if not text or not text.strip():
+         raise ValueError("No text could be extracted from the file")
+ 
+-    clauses = split_into_clauses(text)
+-    clause_pages = assign_clause_pages(clauses, pages)
+-    items = []
+-    for idx, clause_text in enumerate(clauses, start=1):
+-        meta = extract_metadata(clause_text)
+-        items.append({
+-            "id": idx,
+-            "text": clause_text,
+-            "metadata": meta,
+-            "page": clause_pages[idx - 1],
+-        })
++    content_hash = hashlib.sha256(content).hexdigest()
++    doc = build_document(text, pages)
+ 
+     try:
+         contract_metadata = llm.extract_contract_metadata(text, filename)
+@@ -168,32 +207,68 @@ def _process_upload(
+         print(f"Contract metadata extraction failed for {filename}: {error}")
+         contract_metadata = None
+ 
+-    analysis_id = store.save_analysis({
++    fields = {
+         "filename": filename,
+-        "clauses": items,
+-        "status": "uploaded",
+-        "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
++        "header": doc["header"],
++        "clauses": doc["clauses"],
++        "parse_quality": doc["parse_quality"],
+         "file_size": len(content),
+         "ocr_info": ocr_info,
+         "contract_metadata": contract_metadata,
+-    })
++        "content_hash": content_hash,
++    }
++
++    with _ingest_lock:
++        existing = store.get_analysis(analysis_id) if analysis_id else None
++        if existing is None:
++            existing = store.find_by_content_hash(content_hash)
++        reprocessed = existing is not None
++
++        clauses_changed = True
++        if reprocessed:
++            analysis_id = existing["analysis_id"]
++            old_texts = [c.get("text") for c in existing.get("clauses", [])]
++            clauses_changed = old_texts != [c["text"] for c in doc["clauses"]]
++            if clauses_changed:
++                fields.update({
++                    "status": "uploaded",
++                    "results": None,
++                    "policy_summary": None,
++                    "summary": None,
++                })
++            store.update_analysis(analysis_id, fields)
++        else:
++            analysis_id = store.save_analysis({
++                **fields,
++                "status": "uploaded",
++                "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
++            })
+ 
+     _persist_original_file(analysis_id, filename, content, content_type)
+ 
++    indexed = 0
+     if rag is not None:
+         try:
+-            rag.upsert_clauses(analysis_id, items)
+-            print(f"Indexed {len(items)} clauses for analysis {analysis_id}")
++            indexed = rag.index_analysis(analysis_id, doc["clauses"], doc["header"])
++            print(f"Indexed {indexed} passages for analysis {analysis_id}")
+         except Exception as error:
+             print(f"RAG indexing failed for {analysis_id}: {error}")
+ 
+     return {
+         "analysis_id": analysis_id,
+-        "total_clauses": len(items),
++        "total_clauses": len(doc["clauses"]),
+         "ocr_info": ocr_info,
++        "reprocessed": reprocessed,
++        "clauses_changed": clauses_changed,
++        "parse_quality": doc["parse_quality"],
+     }
+ 
+ 
++# Old name, kept for anything that still imports it.
++def _process_upload(filename, content, content_type):
++    return ingest_document(filename, content, content_type)
++
++
+ @app.post("/upload")
+ async def upload(file: UploadFile = File(...)):
+     # Only file.read() needs to happen on the event loop; everything
+@@ -249,11 +324,14 @@ def analyze(payload: AnalyzeRequest):
+             raise HTTPException(status_code=404, detail="analysis_id not found")
+         clauses = record.get("clauses", [])
+     elif payload.text:
+-        clauses_text = split_into_clauses(payload.text)
+-        clauses = [{"id": i+1, "text": t, "metadata": extract_metadata(t)} for i, t in enumerate(clauses_text)]
++        doc = build_document(payload.text, [payload.text])
++        clauses = doc["clauses"]
++        record = {"header": doc["header"]}
+         # persist a transient analysis
+         analysis_id = store.save_analysis({
+             "filename": None,
++            "header": doc["header"],
++            "parse_quality": doc["parse_quality"],
+             "clauses": clauses,
+             "status": "uploaded",
+             "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+@@ -377,6 +455,10 @@ def analyze(payload: AnalyzeRequest):
+     update_payload: Dict[str, Any] = {
+         "status": "analyzed",
+         "results": results,
++        # Stored so a later re-index can re-run the exact same policy
++        # (the app builds its policy in the browser; the backend can't
++        # reconstruct it).
++        "policy_used": policy_obj,
+     }
+     if policy_summary:
+         update_payload["policy_summary"] = policy_summary
+@@ -386,7 +468,12 @@ def analyze(payload: AnalyzeRequest):
+     # (generate_contract_summary counts high/medium/low risk clauses -
+     # doing this at /upload instead would always report 0 high-risk
+     # clauses, since classification hasn't run yet at that point).
+-    contract_text = " ".join(c.get("text", "") for c in results)
++    # The header (parties, amounts) gives the summary its context;
++    # it's included as text only, never as a scored clause.
++    header_text = ((record or {}).get("header") or {}).get("text", "")
++    contract_text = " ".join(
++        ([header_text] if header_text else []) + [c.get("text", "") for c in results]
++    )
+     try:
+         executive_summary = llm.generate_contract_summary(contract_text, results)
+     except Exception as error:
+@@ -653,282 +740,368 @@ def backfill_contract_metadata(force: bool = False):
+     }
+ 
+ 
+-class ChatRequest(BaseModel):
+-    message: str
+-    analysis_id: Optional[str] = None
+-    top_k: int = 5
++# --- One-time / on-demand re-index ------------------------------------
+ 
++_reindex_state: Dict[str, Any] = {"running": False}
++_reindex_lock = threading.Lock()
+ 
+ 
+-@app.post("/chat")
+-def chat_endpoint(
+-    request: ChatRequest,
++def _file_bytes(record: Dict[str, Any]) -> Optional[bytes]:
++    path = record.get("file_path")
++    if path and os.path.exists(path):
++        with open(path, "rb") as f:
++            return f.read()
++    return None
++
++
++def _run_reindex(reanalyze: str, remove_duplicates: bool, reset_index: bool) -> None:
++    state = _reindex_state
++    try:
++        analyses = store.list_analyses()  # newest first
++        state.update({"total": len(analyses), "done": 0, "phase": "checking duplicates"})
++
++        # Duplicates: same file bytes stored more than once.
++        by_hash: Dict[str, List[Dict[str, Any]]] = {}
++        for a in analyses:
++            content = _file_bytes(a)
++            h = a.get("content_hash") or (hashlib.sha256(content).hexdigest() if content else None)
++            if h:
++                by_hash.setdefault(h, []).append(a)
++        duplicate_groups = [g for g in by_hash.values() if len(g) > 1]
++        removed = []
++        for group in duplicate_groups:
++            keep, extras = group[0], group[1:]
++            state["duplicates"].append({
++                "kept": {"analysis_id": keep["analysis_id"], "filename": keep.get("filename")},
++                "extra_copies": [{"analysis_id": e["analysis_id"], "filename": e.get("filename")} for e in extras],
++            })
++            if remove_duplicates:
++                for e in extras:
++                    store.delete_analysis(e["analysis_id"])
++                    if rag is not None:
++                        rag.delete_analysis(e["analysis_id"])
++                    removed.append(e["analysis_id"])
++        state["removed_duplicates"] = removed
++        analyses = [a for a in analyses if a["analysis_id"] not in set(removed)]
++        state["total"] = len(analyses)
++
++        if reset_index and rag is not None:
++            state["phase"] = "resetting search index"
++            rag.reset()
++
++        state["phase"] = "re-parsing, extracting and indexing"
++
++        def _one(a: Dict[str, Any]) -> Dict[str, Any]:
++            aid = a["analysis_id"]
++            try:
++                content = _file_bytes(a)
++                if content is not None:
++                    info = ingest_document(a.get("filename") or aid, content, a.get("content_type"), analysis_id=aid)
++                    changed = info["clauses_changed"]
++                else:
++                    # No original file (text submissions): keep clauses,
++                    # re-index what's stored.
++                    if rag is not None:
++                        rag.index_analysis(aid, a.get("clauses", []), a.get("header"))
++                    changed = False
++                return {"analysis_id": aid, "filename": a.get("filename"), "ok": True, "clauses_changed": changed}
++            except Exception as error:
++                return {"analysis_id": aid, "filename": a.get("filename"), "ok": False, "error": str(error)}
++            finally:
++                state["done"] = state.get("done", 0) + 1
++
++        concurrency = max(1, int(get_settings().get("llm_concurrency", 4)))
++        with ThreadPoolExecutor(max_workers=concurrency) as ex:
++            outcomes = list(ex.map(_one, analyses))
++        state["results"] = outcomes
++
++        # Re-run risk analysis where needed, with the policy each
++        # contract was originally analyzed with.
++        state["phase"] = "re-analyzing"
++        to_analyze = []
++        for o in outcomes:
++            if not o["ok"]:
++                continue
++            record = store.get_analysis(o["analysis_id"]) or {}
++            needs = (
++                reanalyze == "all"
++                or (reanalyze == "changed" and (o["clauses_changed"] or record.get("status") != "analyzed"))
++            )
++            if not needs:
++                continue
++            if record.get("policy_used"):
++                to_analyze.append(record)
++            # Analyzed before policies were stored (or never analyzed):
++            # the app's policy isn't known here. Re-uploading the same
++            # file in the app refreshes this record and analyzes it.
++            else:
++                state["needs_analysis"].append({"analysis_id": record.get("analysis_id"), "filename": record.get("filename")})
++
++        state.update({"total": len(to_analyze), "done": 0})
++        for record in to_analyze:
++            try:
++                analyze(AnalyzeRequest(analysis_id=record["analysis_id"], policy=record["policy_used"]))
++                state["reanalyzed"].append(record.get("filename"))
++            except Exception as error:
++                state["errors"].append({"filename": record.get("filename"), "error": str(error)})
++            state["done"] += 1
++
++        state["phase"] = "finished"
++    except Exception as error:
++        state["phase"] = "failed"
++        state["errors"].append({"error": str(error)})
++    finally:
++        state["running"] = False
++        state["finished_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
++
++
++@app.post("/admin/reindex")
++def start_reindex(
++    reanalyze: str = "changed",
++    remove_duplicates: bool = False,
++    reset_index: bool = True,
+ ):
+     """
+-    Chat with indexed contracts using local Qdrant retrieval.
+-
+-    If analysis_id is provided, retrieval is restricted to
+-    that particular contract. Otherwise, all indexed
+-    contracts are searched.
++    Rebuild every stored contract with the current parser, metadata
++    extraction and search index. Runs in the background; poll
++    GET /admin/reindex/status.
++
++    reanalyze: "changed" (default) re-runs risk analysis only where the
++      clauses came out different; "all"; or "none".
++    remove_duplicates: delete extra copies of files uploaded more than
++      once (keeps the newest). Default false: only reported.
++    reset_index: rebuild the search index from scratch (default true).
+     """
++    if reanalyze not in {"changed", "all", "none"}:
++        raise HTTPException(status_code=400, detail="reanalyze must be changed, all or none")
++    with _reindex_lock:
++        if _reindex_state.get("running"):
++            return {"started": False, "message": "A re-index is already running", "status": _reindex_state}
++        _reindex_state.clear()
++        _reindex_state.update({
++            "running": True,
++            "started_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
++            "phase": "starting",
++            "done": 0,
++            "total": 0,
++            "duplicates": [],
++            "removed_duplicates": [],
++            "results": [],
++            "reanalyzed": [],
++            "needs_analysis": [],
++            "errors": [],
++        })
++        threading.Thread(
++            target=_run_reindex, args=(reanalyze, remove_duplicates, reset_index), daemon=True
++        ).start()
++    return {"started": True, "message": "Re-index started. Poll GET /admin/reindex/status."}
+ 
+-    if rag is None:
+-        raise HTTPException(
+-            status_code=503,
+-            detail="RAG system is not initialized",
+-        )
+ 
+-    query = request.message.strip()
++@app.get("/admin/reindex/status")
++def reindex_status():
++    return _reindex_state
+ 
+-    if not query:
+-        raise HTTPException(
+-            status_code=400,
+-            detail="message is required",
+-        )
+ 
+-    top_k = max(
+-        1,
+-        min(request.top_k, 10),
+-    )
++class ChatTurn(BaseModel):
++    role: str
++    content: str
+ 
+-    try:
+-        results = rag.query(
+-            query,
+-            top_k=top_k,
+-            filter_by_analysis=request.analysis_id,
+-        )
+ 
+-    except Exception as error:
+-        raise HTTPException(
+-            status_code=500,
+-            detail=(
+-                "Contract retrieval failed: "
+-                f"{error}"
+-            ),
+-        )
++class ChatRequest(BaseModel):
++    message: str
++    analysis_id: Optional[str] = None
++    top_k: int = 5
++    # Recent turns of this conversation, oldest first, so follow-ups
++    # ("and the lowest?", "that's wrong, check again") make sense.
++    history: List[ChatTurn] = []
+ 
+-    if not results:
+-        return {
+-            "reply": (
+-                "I could not find any relevant contract "
+-                "clauses to answer that question."
+-            ),
+-            "sources": [],
+-        }
+ 
+-    context_parts = []
+-    sources = []
+-    filename_cache: Dict[str, str] = {}
++def _directory_line(a: Dict[str, Any]) -> str:
++    from .chat_router import format_money
+ 
+-    for index, result in enumerate(
+-        results,
+-        start=1,
+-    ):
+-        clause_text = str(
+-            result.get("text", "")
+-        ).strip()
++    cm = a.get("contract_metadata") or {}
+ 
+-        if not clause_text:
+-            continue
++    def _fmt(value):
++        if isinstance(value, bool):
++            return "yes" if value else "no"
++        return value if value not in (None, "") else "not found"
+ 
+-        result_analysis_id = result.get("analysis_id")
++    value = cm.get("contract_value")
++    value_display = (
++        format_money(float(value), cm.get("currency"))
++        if isinstance(value, (int, float)) else "not found"
++    )
++    fields = [
++        f"ID: {a.get('analysis_id')}",
++        f"Name: {a.get('filename') or 'Contract ' + str(a.get('analysis_id'))}",
++        f"Borrower/customer: {_fmt(cm.get('customer_name'))}",
++        f"Lender: {_fmt(cm.get('lender_name'))}",
++        f"About: {_fmt(cm.get('contract_about'))}",
++        f"Start: {_fmt(cm.get('start_date'))}",
++        f"End: {_fmt(cm.get('end_date'))}",
++        f"Amount: {value_display}",
++        f"Governing law: {_fmt(cm.get('governing_law'))}",
++        f"Indemnification clause: {_fmt(cm.get('indemnification_clause_present'))}",
++    ]
++    return "- " + " | ".join(fields)
++
++
++# Whole-contract context is used when chatting about one contract and it
++# fits; retrieval only picks a few passages, the whole text can't miss one.
++_SINGLE_CONTRACT_CHAR_BUDGET = 16000
++
++CHAT_SYSTEM_PROMPT = """
++You are a contract analysis assistant for legal review. You answer questions
++about the contracts provided, compare terms, assess risk and draft wording.
++
++You have no tools and cannot call any. Answer only from the directory and the
++numbered sources in the prompt.
++
++Rules:
++1. Every fact you state (name, amount, date, rate, term) must come from the
++   sources or the directory. Cite the source it came from as [Source N](#source-N).
++   If something isn't in them, say it isn't in the provided documents. Never
++   guess or fill in a value.
++2. Do not compute rankings, totals or comparisons of amounts in your head; if
++   asked, describe what the sources say and note that exact ranking is
++   available by asking directly (e.g. "which contract has the highest amount").
++3. If the conversation shows an earlier answer was wrong or inconsistent, say so
++   plainly and give the correct answer from the sources.
++4. For yes/no questions, start with Yes / No / Partially / It depends, then one
++   or two sentences of reasoning.
++5. When listing contracts, use a Markdown table and a link column with
++   [View](#contract-<ID>) using the directory ID.
++6. When drafting clause wording, put the draft in a blockquote, separate from
++   your explanation.
++7. Be concise. Don't repeat caveats.
++""".strip()
+ 
+-        if result_analysis_id not in filename_cache:
+-            source_analysis = store.get_analysis(result_analysis_id) or {}
+-            filename_cache[result_analysis_id] = (
+-                source_analysis.get("filename") or f"Contract {result_analysis_id}"
+-            )
+ 
+-        contract_label = filename_cache[result_analysis_id]
++def _history_block(history: List[Dict[str, str]]) -> str:
++    if not history:
++        return ""
++    lines = []
++    for turn in history[-6:]:
++        role = "User" if turn.get("role") == "user" else "Assistant"
++        lines.append(f"{role}: {str(turn.get('content', ''))[:1500]}")
++    return "Conversation so far:\n" + "\n".join(lines) + "\n\n"
+ 
+-        context_parts.append(
+-            f"[Contract: {contract_label} | Source {index}]\n{clause_text}"
+-        )
+ 
+-        sources.append(
+-            {
+-                "source_number": index,
+-                "analysis_id": result_analysis_id,
+-                "filename": contract_label,
+-                "clause_id": result.get(
+-                    "clause_id"
+-                ),
+-                "text": clause_text,
+-                "score": result.get("score"),
+-            }
+-        )
++@app.post("/chat")
++def chat_endpoint(request: ChatRequest):
++    """
++    Answer a question about the stored contracts.
++
++    1. Questions answerable from contract fields (highest/lowest amount,
++       totals, counts, lookups, filters by lender/date/amount) are
++       answered in code, exactly, with each contract's header as the
++       reference (see chat_router).
++    2. Everything else gets the relevant passages (or the whole contract,
++       when one contract is selected) and an LLM answer that must cite them.
++    """
++    from .chat_router import execute_spec, route_question, sources_for_rows
++    from .mcp.llm_agent import remove_reasoning_traces
+ 
+-    if not context_parts:
++    query = request.message.strip()
++    if not query:
++        raise HTTPException(status_code=400, detail="message is required")
++
++    history = [
++        {"role": t.role, "content": t.content}
++        for t in (request.history or [])
++        if t.content and t.content.strip()
++    ][-8:]
++
++    single = request.analysis_id if request.analysis_id not in (None, "", "all") else None
++    all_analyses = store.list_analyses()
++    scope = [a for a in all_analyses if a.get("analysis_id") == single] if single else all_analyses
++    if single and not scope:
++        raise HTTPException(status_code=404, detail="analysis_id not found")
++
++    # 1) Structured questions: exact answer from the directory.
++    spec = route_question(llm, query, history)
++    if spec is not None and spec.kind == "structured":
++        result = execute_spec(spec, scope)
+         return {
+-            "reply": (
+-                "Relevant records were found, but no "
+-                "readable clause text was available."
+-            ),
+-            "sources": [],
++            "reply": result["answer"],
++            "sources": sources_for_rows(result["rows"]),
++            "route": "structured",
++            "query_spec": spec.model_dump(),
+         }
+ 
+-    global_context = ""
+-    if not request.analysis_id or request.analysis_id == "all":
+-        all_analyses = store.list_analyses()
+-        if all_analyses:
+-            def _numeric_value(a: Dict[str, Any]) -> float:
+-                cm = a.get("contract_metadata") or {}
+-                raw_value = cm.get("contract_value")
+-                if isinstance(raw_value, (int, float)):
+-                    return float(raw_value)
+-                return float("-inf")
+-
+-            # Small local models are unreliable at correctly sorting a
+-            # list of numbers themselves when asked to "list highest
+-            # first" - the LLM was observed producing tables that
+-            # claimed to be descending but weren't. Pre-sorting here,
+-            # in code, turns the model's job from "compute a sort
+-            # order" (error-prone) into "transcribe rows in the order
+-            # given" (much more reliable), and removes the numeric
+-            # reasoning failure mode entirely rather than trying to
+-            # prompt it away.
+-            all_analyses = sorted(all_analyses, key=_numeric_value, reverse=True)
+-
+-            dir_lines = [
+-                "\nAvailable Contracts Directory (authoritative structured data - "
+-                "use this, not guesswork from excerpts, to answer listing/filtering/"
+-                "date/value/customer/IP questions; a field being 'unknown' means it "
+-                "genuinely could not be determined from the contract, don't invent one).\n"
+-                "This list is ALREADY SORTED by contract value, highest first "
+-                "(entries with an unknown value are listed last). If asked to rank, "
+-                "list, or compare by value, preserve this order exactly - do not "
+-                "re-sort or re-compute the order yourself:"
+-            ]
+-            for a in all_analyses:
+-                file_name = a.get("filename") or f"Contract {a.get('analysis_id')}"
+-                cm = a.get("contract_metadata") or {}
+-
+-                def _fmt(value):
+-                    return value if value not in (None, "") else "unknown"
+-
+-                raw_value = cm.get("contract_value")
+-                if isinstance(raw_value, (int, float)):
+-                    value_str = (
+-                        str(int(raw_value))
+-                        if float(raw_value).is_integer()
+-                        else str(raw_value)
+-                    )
+-                    currency_str = _fmt(cm.get("currency"))
+-                    value_display = f"{value_str} {currency_str}".strip()
+-                else:
+-                    value_display = "unknown"
+-
+-                fields = [
+-                    f"ID: {a.get('analysis_id')}",
+-                    f"Name: {file_name}",
+-                    f"Customer: {_fmt(cm.get('customer_name'))}",
+-                    f"Lender/Bank: {_fmt(cm.get('lender_name'))}",
+-                    f"About: {_fmt(cm.get('contract_about'))}",
+-                    f"Start: {_fmt(cm.get('start_date'))}",
+-                    f"End: {_fmt(cm.get('end_date'))}",
+-                    f"Value: {value_display}",
+-                    f"IP shared with customer: {_fmt(cm.get('ip_shared_with_customer'))}",
+-                    f"Indemnification present: {_fmt(cm.get('indemnification_clause_present'))}",
+-                    f"Indemnification strength: {_fmt(cm.get('indemnification_strength'))}",
+-                    f"Governing law: {_fmt(cm.get('governing_law'))}",
+-                ]
+-                dir_lines.append("- " + " | ".join(fields))
+-            global_context = "\n".join(dir_lines) + "\n\n"
+-
+-    context = "\n\n".join(
+-        context_parts
+-    )
+-
+-    prompt = f"""
+-Use the context provided below to answer the question.
+-If the question asks to list contracts based on specific criteria (e.g. by customer, end date, value, a clause type, IP terms), use the Available Contracts Directory in combination with the excerpts to form your answer.
+-
+-When listing contracts, respond as a Markdown table. Choose ONLY the columns that are relevant to what was asked - don't always use the same fixed columns:
+-- Listing by end date / expiry -> # | customer name | date of contract ending | contract about | link, sorted soonest-ending first
+-- Listing by customer name -> # | customer name | date of contract ending | contract about | link, sorted active contracts first
+-- Listing by a clause topic (e.g. "which contracts share IP with customer") -> # | customer name | contract about | link (omit date/value columns that weren't asked for)
+-- Listing by contract value -> # | contract date | contract value | link
+-Always include a 'link' column using the exact format: [View](#contract-<ID>) where <ID> is the contract's ID from the Available Contracts Directory.
+-Pick the sort order and columns that best fit the specific question asked, rather than a single fixed template.
+-
+-If the question is a yes/no clause-quality check (e.g. "is the indemnification clause weaker in these contracts", "does X contract have Y protection"), lead with a short, direct answer: Yes / No / Partially / It depends, followed by one or two sentences of the specific reasoning. Don't write a long essay for a yes/no question.
+-
+-If the question asks to compare, rank, or pick the "best"/"worst"/"safest" contract:
+-- Group the excerpts by contract.
+-- Weigh them against each other on the risk indicators, obligations,
+-  and terms present in the excerpts (e.g. termination rights, liability,
+-  payment terms, one-sided clauses, ambiguity/contradictions).
+-- State which contract you'd recommend and why, referencing contract
+-  names and source numbers.
+-- If two or more contracts are genuinely tied or the excerpts don't cover
+-  enough ground to compare them, say so explicitly and explain what's
+-  missing, rather than refusing outright.
+-- If every retrieved excerpt is from the same single contract, say so
+-  plainly (name that contract) instead of implying there's nothing to compare.
+-
+-Only fall back to "I do not know based on the provided contract documents."
+-if the excerpts contain no information at all relevant to the question.
+-
+-Do not invent contract terms that aren't in the excerpts.
+-Be specific, precise, and correct - double check names, dates, and numbers
+-against the excerpts before answering.
+-Keep answers concise; don't pad with repeated caveats.
+-
+-{global_context}
+-Contract excerpts:
+-{context}
+-
+-Question:
+-{query}
+-""".strip()
+-
+-    system_prompt = """
+-You are a highly capable contract analysis assistant. You answer factual questions, make comparative risk judgments, draft new clauses, and filter/list contracts.
++    # 2) Semantic questions: passages + LLM.
++    passages: List[Dict[str, Any]] = []
++    if single:
++        record = scope[0]
++        header = record.get("header")
++        clauses = record.get("clauses") or []
++        total_chars = len((header or {}).get("text", "")) + sum(len(c.get("text", "")) for c in clauses)
++        if total_chars <= _SINGLE_CONTRACT_CHAR_BUDGET:
++            if header and header.get("text"):
++                passages.append({"analysis_id": single, "clause_id": "header", "kind": "header", "text": header["text"], "score": None})
++            passages.extend(
++                {"analysis_id": single, "clause_id": c.get("id"), "kind": "clause", "text": c.get("text", ""), "score": None}
++                for c in clauses
++            )
+ 
+-You have no tools or functions available and cannot call any. Answer directly from the excerpts and directory given to you in this prompt - never emit a tool call, function call, or code block claiming to search/browse/fetch anything.
++    if not passages:
++        if rag is None:
++            raise HTTPException(status_code=503, detail="Contract search is not available (RAG failed to start; see the server log).")
++        top_k = max(1, min(request.top_k, 10))
++        try:
++            passages = rag.query(query, top_k=top_k, filter_by_analysis=single)
++        except Exception as error:
++            raise HTTPException(status_code=500, detail=f"Contract search failed: {error}")
+ 
+-Guidelines:
+-1. Always be specific, precise, and correct. Double-check every fact, name, date, and number against the excerpts before answering.
+-2. If asked to list contracts, ALWAYS respond as a Markdown table, but pick columns and sort order to match what was actually asked (see examples in the prompt) rather than one fixed template for every listing question. Use [View](#contract-<ID>) for links, where <ID> is the contract's ID from the Available Contracts Directory.
+-3. If asked a yes/no clause-quality question, answer with Yes / No / Partially / It depends up front, then briefly justify it. Don't over-explain a simple question.
+-4. Be proactive: end with a relevant, specific follow-up question tied to what was just asked (e.g. "do you want me to list expired contracts too?", "would you like me to draft an amended clause for this?") - not a generic closing line every time.
+-5. When you reference a specific excerpt, you MUST cite it using a Markdown link in the exact format: [Source N](#source-N). This citation is required on every claim you make based on an excerpt.
+-6. If drafting a new contract or clause, provide the drafted text clearly in a Markdown blockquote or code block, clearly separated from your explanation.
+-7. Use standard Markdown formatting (bold, italic, lists, tables) freely to make your response readable.
+-""".strip()
++    names = {a.get("analysis_id"): (a.get("filename") or f"Contract {a.get('analysis_id')}") for a in all_analyses}
++    context_parts, sources = [], []
++    for index, p in enumerate(passages, start=1):
++        text = str(p.get("text", "")).strip()
++        if not text:
++            continue
++        label = names.get(p.get("analysis_id"), f"Contract {p.get('analysis_id')}")
++        where = "contract header (parties, amounts)" if p.get("kind") == "header" else f"clause {p.get('clause_id')}"
++        context_parts.append(f"[Source {index} | {label} | {where}]\n{text}")
++        sources.append({
++            "source_number": index,
++            "analysis_id": p.get("analysis_id"),
++            "filename": label,
++            "clause_id": p.get("clause_id"),
++            "text": text,
++            "score": p.get("score"),
++            "kind": p.get("kind", "clause"),
++        })
+ 
+-    provider = llm._get_provider()
++    # Directory rows only for the contracts being discussed, so the
++    # prompt doesn't grow with every contract ever uploaded.
++    cited = {src["analysis_id"] for src in sources}
++    directory = "\n".join(
++        _directory_line(a) for a in scope if single or a.get("analysis_id") in cited
++    )
++    prompt = (
++        _history_block(history)
++        + "Contracts directory (fields extracted from each document; 'not found' means the document doesn't state it):\n"
++        + (directory or "(none)")
++        + "\n\nSources:\n"
++        + ("\n\n".join(context_parts) if context_parts else "(no passages matched this question)")
++        + f"\n\nQuestion: {query}"
++    )
+ 
++    provider = llm._get_provider("quality")
+     if not provider.is_available():
+-        raise HTTPException(
+-            status_code=503,
+-            detail=(
+-                "The configured AI provider is unavailable. "
+-                "Check the Ollama or Groq settings."
+-            ),
+-        )
+-
++        raise HTTPException(status_code=503, detail="The configured AI provider is unavailable. Check the Ollama or Groq settings.")
+     try:
+-        reply = provider.invoke(
+-            prompt,
+-            system=system_prompt,
+-            temperature=0,
+-        )
+-
++        reply = provider.invoke(prompt, system=CHAT_SYSTEM_PROMPT, temperature=0)
+     except Exception as error:
+-        raise HTTPException(
+-            status_code=500,
+-            detail=(
+-                "AI response generation failed: "
+-                f"{error}"
+-            ),
+-        )
++        raise HTTPException(status_code=500, detail=f"AI response generation failed: {error}")
+ 
+     return {
+-        "reply": str(reply).strip(),
++        "reply": remove_reasoning_traces(str(reply)).strip(),
+         "sources": sources,
++        "route": "semantic",
+     }
+ 
++
+ term_labels = {
+     "effective_date": "Effective Date",
+     "contract_duration": "Contract Duration",
+@@ -1599,8 +1772,7 @@ def get_llm_settings():
+ @app.post("/settings")
+ def update_llm_settings(settings: Dict[str, Any] = Body(...)):
+     """Update LLM settings (provider, model, url)."""
+-    allowed_keys = ["provider", "ollama_url", "ollama_model", "groq_model"]
+-    filtered = {k: v for k, v in settings.items() if k in allowed_keys}
++    filtered = {k: v for k, v in settings.items() if k in EDITABLE_SETTINGS}
+ 
+     if "provider" in filtered and filtered["provider"] not in ["groq", "ollama"]:
+         raise HTTPException(status_code=400, detail="Invalid provider. Must be 'groq' or 'ollama'")
+diff --git a/backend/app/mcp/llm_agent.py b/backend/app/mcp/llm_agent.py
+index 7299b92..e389853 100644
+--- a/backend/app/mcp/llm_agent.py
++++ b/backend/app/mcp/llm_agent.py
+@@ -2,8 +2,18 @@ from typing import Any, Dict, List, Optional
+ import json
+ import re
+ 
++from pydantic import BaseModel, ValidationError
++
+ from .utils import MCPConfig, mcp_post
+-from ..llm_providers import get_llm_provider
++from ..llm_providers import get_llm_provider, LLMError
++from ..parser import extract_labeled_facts, find_money_amounts
++from ..schemas import (
++    ApplicabilityResponse,
++    ClauseClassification,
++    ComplianceResponse,
++    ContractMetadataExtraction,
++    ContractSummary,
++)
+ 
+ 
+ DOMAINS = [
+@@ -46,6 +56,7 @@ CONTRACT_METADATA_KEYS = {
+     "start_date",
+     "end_date",
+     "contract_value",
++    "contract_value_text",
+     "currency",
+     "ip_shared_with_customer",
+     "indemnification_clause_present",
+@@ -636,6 +647,7 @@ def normalize_contract_metadata(result: Dict[str, Any]) -> Dict[str, Any]:
+         "start_date": _clean_optional_date(result.get("start_date")),
+         "end_date": _clean_optional_date(result.get("end_date")),
+         "contract_value": contract_value,
++        "contract_value_text": _clean_optional_str(result.get("contract_value_text")),
+         "currency": _clean_optional_str(result.get("currency")),
+         "ip_shared_with_customer": _clean_optional_bool(
+             result.get("ip_shared_with_customer")
+@@ -649,16 +661,160 @@ def normalize_contract_metadata(result: Dict[str, Any]) -> Dict[str, Any]:
+     }
+ 
+ 
++def _norm_name(value: str) -> str:
++    value = re.sub(r"[^a-z0-9 ]", " ", (value or "").lower())
++    return re.sub(r"\s+", " ", value).strip()
++
++
++def ground_metadata(meta: Dict[str, Any], text: str) -> Dict[str, Any]:
++    """
++    Check extracted metadata against the document itself.
++
++    - A value the document states under an explicit label (e.g.
++      "FINANCED AMOUNT: $45,892.00", "LENDER: ...") always wins over a
++      model's reading of it.
++    - Otherwise a model-read amount must appear in the document as an
++      actual currency amount, and a model-read party name must appear
++      in the text. Anything that can't be found is discarded (set to
++      null) rather than stored, because a wrong amount or party is
++      worse than a missing one in a legal tool.
++
++    Records where each value came from in "field_sources", and anything
++    discarded or overridden in "extraction_warnings", so a reviewer can
++    see why a field is empty or different from what the model said.
++    """
++    meta = dict(meta)
++    facts = extract_labeled_facts(text)
++    norm_text = _norm_name(text)
++    sources: Dict[str, str] = {}
++    warnings: List[str] = []
++    model_method = meta.get("extraction_method", "llm")
++    model_label = "model" if model_method == "llm" else "pattern match"
++
++    # Amount ---------------------------------------------------------
++    model_value = meta.get("contract_value")
++    if isinstance(model_value, str):
++        try:
++            model_value = float(model_value.replace(",", ""))
++        except ValueError:
++            model_value = None
++    if "contract_value" in facts:
++        if model_value is not None and abs(model_value - facts["contract_value"]) > 0.005:
++            warnings.append(
++                f"The {model_label} read the amount as {model_value:,.2f}; the document's "
++                f"'{facts['contract_value_label']}' line says {facts['contract_value_text']}. "
++                "Using the document."
++            )
++        meta["contract_value"] = facts["contract_value"]
++        meta["currency"] = facts["currency"]
++        meta["contract_value_text"] = facts["contract_value_text"]
++        sources["contract_value"] = f"document label '{facts['contract_value_label']}'"
++    elif model_value is not None:
++        matches = [a for a in find_money_amounts(text) if abs(a["value"] - model_value) < 0.005]
++        if matches:
++            meta["contract_value"] = model_value
++            meta["contract_value_text"] = matches[0]["text"]
++            meta["currency"] = meta.get("currency") or matches[0]["currency"]
++            sources["contract_value"] = f"{model_label}, found in text as {matches[0]['text']}"
++        else:
++            warnings.append(
++                f"The {model_label} reported an amount of {model_value:,.2f}, which does not "
++                "appear in the document as a currency amount. Discarded."
++            )
++            meta["contract_value"] = None
++            meta["contract_value_text"] = None
++            meta["currency"] = None
++    else:
++        meta["contract_value"] = None
++
++    # Parties --------------------------------------------------------
++    for key, label in (("customer_name", "customer/borrower"), ("lender_name", "lender")):
++        model_name = meta.get(key)
++        if key in facts:
++            if model_name and _norm_name(model_name) not in _norm_name(facts[key]) \
++                    and _norm_name(facts[key]) not in _norm_name(model_name):
++                warnings.append(
++                    f"The {model_label} read the {label} as '{model_name}'; the document's "
++                    f"label says '{facts[key]}'. Using the document."
++                )
++            meta[key] = facts[key]
++            sources[key] = "document label"
++        elif model_name:
++            if _norm_name(model_name) and _norm_name(model_name) in norm_text:
++                sources[key] = f"{model_label}, found in text"
++            else:
++                warnings.append(
++                    f"The {model_label} named the {label} '{model_name}', which does not "
++                    "appear in the document. Discarded."
++                )
++                meta[key] = None
++
++    # Dates must be ISO so they sort and compare correctly.
++    for key in ("start_date", "end_date"):
++        value = meta.get(key)
++        if value and not _DATE_RE.match(str(value)):
++            warnings.append(f"{key} '{value}' is not a YYYY-MM-DD date. Discarded.")
++            meta[key] = None
++
++    meta["field_sources"] = sources
++    meta["extraction_warnings"] = warnings
++    return meta
++
++
+ class LLMClient:
+     def __init__(self) -> None:
+         self.cfg = MCPConfig()
+ 
+-    def _get_provider(self):
++    def _get_provider(self, task: str = "bulk"):
+         """
+-        Return the currently configured LLM provider.
++        Provider for a task tier: "bulk" (many small per-clause calls)
++        or "quality" (per-contract extraction, summaries, chat).
+         """
+ 
+-        return get_llm_provider()
++        return get_llm_provider(task)
++
++    def structured_call(
++        self,
++        schema: type,
++        prompt: str,
++        system: str,
++        task: str = "bulk",
++    ) -> BaseModel:
++        """
++        One LLM call whose reply must match a Pydantic schema.
++
++        The schema is sent to the model so generation is constrained to
++        it, and the reply is validated. One retry is made, telling the
++        model what was wrong. Raises LLMError if there's still no valid
++        reply - callers decide what the fallback is; nothing half-valid
++        is ever returned.
++        """
++        provider = self._get_provider(task)
++        if not provider.is_available():
++            raise LLMError("The configured LLM provider is not reachable")
++
++        json_schema = schema.model_json_schema()
++        # Only fields without defaults must be present; a constrained
++        # model may legitimately omit optional ones.
++        required = set(json_schema.get("required", [])) or None
++        error_note = ""
++        for attempt in range(2):
++            content = provider.invoke(
++                prompt + error_note,
++                system=system,
++                temperature=0,
++                json_schema=json_schema,
++            )
++            try:
++                data = parse_llm_json(content, required_keys=required)
++                return schema.model_validate(data)
++            except (ValueError, ValidationError) as error:
++                detail = str(error)[:400]
++                error_note = (
++                    "\n\nYour previous reply was rejected: "
++                    f"{detail}\nReturn only one JSON object matching the schema."
++                )
++        raise LLMError(f"{schema.__name__}: no valid reply after retry ({detail})")
+ 
+     def generate_contract_summary(
+         self,
+@@ -669,12 +825,6 @@ class LLMClient:
+         Generate an executive summary of the contract.
+         """
+ 
+-        provider = self._get_provider()
+-
+-        if not provider.is_available():
+-            print("LLM provider not available")
+-            return None
+-
+         try:
+             high_risk = sum(
+                 1
+@@ -750,16 +900,9 @@ Return no Markdown.
+ Return no text outside the JSON object.
+ """.strip()
+ 
+-            content = provider.invoke(
+-                prompt,
+-                system=system,
+-                temperature=0,
+-            )
+-
+-            result = parse_llm_json(
+-                content,
+-                required_keys=SUMMARY_KEYS,
+-            )
++            result = self.structured_call(
++                ContractSummary, prompt, system, task="quality"
++            ).model_dump()
+ 
+             result["executive_summary"] = str(
+                 result.get(
+@@ -830,9 +973,8 @@ Return no text outside the JSON object.
+         directory always has a best-effort entry for every contract.
+         """
+ 
+-        provider = self._get_provider()
+-
+-        if provider.is_available():
++        meta: Optional[Dict[str, Any]] = None
++        if True:
+             try:
+                 contract_preview = contract_text[:12000]
+ 
+@@ -878,8 +1020,10 @@ Requirements:
+    stated or can be computed (e.g. "3 years from execution"). Use null
+    if not determinable. Do not guess a date that is not supported by
+    the text.
+-5. contract_value: the total contract value as a plain number (no
+-   currency symbols, no commas). Use null if not stated.
++5. contract_value: the total contract value / financed amount as a
++   plain number (no currency symbols, no commas). Use null if not
++   stated. contract_value_text: that amount exactly as written in the
++   contract (e.g. "$45,892.00"), or null.
+ 6. currency: the ISO currency code (e.g. INR, USD) if determinable,
+    else null.
+ 7. ip_shared_with_customer: true if the contract assigns, licenses, or
+@@ -895,7 +1039,7 @@ Requirements:
+ 11. Do not invent facts. Use null wherever the text does not support
+     a confident answer.
+ 12. Do not return Markdown.
+-12. Do not return text before or after the JSON.
++13. Do not return text before or after the JSON.
+ """.strip()
+ 
+                 system = """
+@@ -908,18 +1052,10 @@ Return no text outside the JSON object.
+ Only report facts you can support from the given text.
+ """.strip()
+ 
+-                content = provider.invoke(
+-                    prompt,
+-                    system=system,
+-                    temperature=0,
+-                )
+-
+-                result = parse_llm_json(
+-                    content,
+-                    required_keys=CONTRACT_METADATA_KEYS,
++                result = self.structured_call(
++                    ContractMetadataExtraction, prompt, system, task="quality"
+                 )
+-
+-                return normalize_contract_metadata(result)
++                meta = normalize_contract_metadata(result.model_dump())
+ 
+             except Exception as error:
+                 print(
+@@ -927,10 +1063,12 @@ Only report facts you can support from the given text.
+                     f"Using local fallback. Reason: {error}"
+                 )
+ 
+-        return self._local_metadata_fallback(
+-            contract_text,
+-            filename,
+-        )
++        if meta is None:
++            meta = self._local_metadata_fallback(
++                contract_text,
++                filename,
++            )
++        return ground_metadata(meta, contract_text)
+ 
+     def _local_metadata_fallback(
+         self,
+@@ -1145,10 +1283,6 @@ Only report facts you can support from the given text.
+         if not micro_policies:
+             return []
+ 
+-        provider = self._get_provider()
+-        if not provider.is_available():
+-            return None
+-
+         checks_payload = [
+             {
+                 "id": mp.get("id"),
+@@ -1209,34 +1343,13 @@ Return exactly one JSON object. No reasoning outside it. No Markdown.
+ """.strip()
+ 
+         try:
+-            content = provider.invoke(
+-                prompt,
+-                system=system,
+-                temperature=0,
++            response = self.structured_call(
++                ComplianceResponse, prompt, system, task="bulk"
+             )
+-
+-            result = parse_llm_json(content, required_keys={"results"})
+-            raw_results = result.get("results")
+-
+-            if not isinstance(raw_results, list):
+-                raise ValueError("'results' must be a JSON array")
+-
+-            by_id: Dict[str, Dict[str, Any]] = {}
+-            for item in raw_results:
+-                if not isinstance(item, dict):
+-                    continue
+-                check_id = item.get("id")
+-                if check_id is None:
+-                    continue
+-
+-                matched = item.get("matched")
+-                if not isinstance(matched, bool):
+-                    matched = str(matched).strip().lower() in {"true", "yes", "y"}
+-
+-                reason = item.get("reason")
+-                reason = str(reason).strip() if reason else ""
+-
+-                by_id[str(check_id)] = {"matched": matched, "reason": reason}
++            by_id: Dict[str, Dict[str, Any]] = {
++                item.id: {"matched": item.matched, "reason": item.reason.strip()}
++                for item in response.results
++            }
+ 
+             # Align 1:1 with the input order; a missing id becomes None
+             # so the caller can fall back to keyword matching for just
+@@ -1276,10 +1389,6 @@ Return exactly one JSON object. No reasoning outside it. No Markdown.
+         if not micro_policies or not clause_texts:
+             return None
+ 
+-        provider = self._get_provider()
+-        if not provider.is_available():
+-            return None
+-
+         clauses_block = "\n".join(
+             f"{i + 1}. {(t or '').strip()[:300]}"
+             for i, t in enumerate(clause_texts[:40])
+@@ -1334,30 +1443,15 @@ Return exactly one JSON object. No reasoning outside it. No Markdown.
+ """.strip()
+ 
+         try:
+-            content = provider.invoke(prompt, system=system, temperature=0)
+-            result = parse_llm_json(content, required_keys={"results"})
+-            raw = result.get("results")
+-            if not isinstance(raw, list):
+-                raise ValueError("'results' must be a JSON array")
+-
+-            by_id: Dict[str, Dict[str, Any]] = {}
+-            for item in raw:
+-                if not isinstance(item, dict) or item.get("id") is None:
+-                    continue
+-                applicable = item.get("applicable")
+-                if not isinstance(applicable, bool):
+-                    applicable = str(applicable).strip().lower() not in {
+-                        "false", "no", "n",
+-                    }
+-                reason = item.get("reason")
+-                by_id[str(item["id"])] = {
+-                    "applicable": applicable,
+-                    "reason": str(reason).strip() if reason else "",
+-                }
+-
++            response = self.structured_call(
++                ApplicabilityResponse, prompt, system, task="bulk"
++            )
+             return {
+-                "contract_type": str(result.get("contract_type") or "").strip(),
+-                "by_id": by_id,
++                "contract_type": response.contract_type.strip(),
++                "by_id": {
++                    item.id: {"applicable": item.applicable, "reason": item.reason.strip()}
++                    for item in response.results
++                },
+             }
+         except Exception as error:
+             print(f"LLM check-applicability evaluation failed: {error}")
+@@ -1468,37 +1562,17 @@ Requirements:
+ 8. Return no text after the JSON.
+ """.strip()
+ 
+-        provider = self._get_provider()
+-
+-        if provider.is_available():
++        if True:
+             try:
+-                content = provider.invoke(
+-                    prompt,
+-                    system=system,
+-                    temperature=0,
+-                )
+-
+-                response_length = (
+-                    len(content)
+-                    if isinstance(content, str)
+-                    else "non-string"
+-                )
+-
+-                print(
+-                    "LLM classification provider: "
+-                    f"{provider.__class__.__name__}; "
+-                    f"response length: {response_length}"
++                result = self.structured_call(
++                    ClauseClassification, prompt, system, task="bulk"
+                 )
+-
+-                result = parse_llm_json(
+-                    content,
+-                    required_keys=CLASSIFICATION_KEYS,
+-                )
+-
+-                return normalize_classification(
+-                    result,
++                classification = normalize_classification(
++                    result.model_dump(),
+                     metadata,
+                 )
++                classification["method"] = "llm"
++                return classification
+ 
+             except Exception as error:
+                 print(
+@@ -1560,10 +1634,14 @@ Requirements:
+                     f"Reason: {error}"
+                 )
+ 
+-        return self._local_fallback(
++        classification = self._local_fallback(
+             text,
+             metadata,
+         )
++        # Marked so the UI/reviewers can tell a keyword guess from a
++        # model assessment.
++        classification["method"] = "keyword_fallback"
++        return classification
+ 
+     def _build_prompt(
+         self,
+diff --git a/backend/app/parser.py b/backend/app/parser.py
+index 8028e8e..2ae805e 100644
+--- a/backend/app/parser.py
++++ b/backend/app/parser.py
+@@ -1,5 +1,5 @@
+ import re
+-from typing import List, Dict, Any
++from typing import List, Dict, Any, Optional, Tuple
+ from pypdf import PdfReader
+ from io import BytesIO
+ import os
+@@ -237,9 +237,21 @@ _KEYWORD_HEADING = (
+ )
+ 
+ 
+-def split_into_clauses(text: str) -> List[str]:
++def split_document(text: str) -> Tuple[Optional[str], List[str]]:
++    """
++    Split a contract's text into (header, clauses).
++
++    header: everything before the first clause heading - title, parties,
++      lender/borrower, financed amount, recitals - or None when the
++      document starts straight with a clause or has no headings. It is
++      real, citable document text (searchable, and "jump to" can
++      highlight it), but it is not an operative clause: it creates no
++      obligation, so it must never be risk-classified, policy-scored or
++      counted as a clause. Callers keep it separate from the clause list.
++    clauses: the operative clauses, in document order.
++    """
+     if not text:
+-        return []
++        return None, []
+     # Normalize line endings
+     t = re.sub(r"\r\n?", "\n", text).strip()
+     t = re.sub(r"\n{3,}", "\n\n", t)
+@@ -258,24 +270,28 @@ def split_into_clauses(text: str) -> List[str]:
+     # the PDF's extracted text preserves a newline before the heading
+     # (real-world PDF text extraction often doesn't).
+     HEADER_RE = re.compile(
+-        r"(?=\b\d{1,2}[\.\)]\s+[A-Z]{2,}(?:[\s&/\-]+[A-Z]{2,}){0,6}\b)"
++        # (?<![\d.,]) stops "$45,892.00. CLAUSE ONE" being read as a
++        # numbered heading "00. CLAUSE", which cut the cents off amounts.
++        r"(?<![\d.,])(?=\b\d{1,2}[\.\)]\s+[A-Z]{2,}(?:[\s&/\-]+[A-Z]{2,}){0,6}\b)"
+         r"|(?=" + _KEYWORD_HEADING + r")"
+     )
+     parts = HEADER_RE.split(t)
+     parts = [p.strip() for p in parts if p and p.strip()]
+  
+-    # If headings were found, the first chunk is whatever came before
+-    # the very first heading (document title, party names, financed
+-    # amount, recitals, etc.). This is kept as the document's first
+-    # clause rather than discarded: it's frequently where the only
+-    # mention of financial amounts, lender/borrower names, and other
+-    # identifying details live, and dropping it made that information
+-    # permanently unreachable by clause search, chat citations, and
+-    # "jump to clause" highlighting alike - there was nothing for any
+-    # of those to point to. The length/noise filters below still apply
+-    # to it same as any other clause, so a trivial or boilerplate-only
+-    # preamble (e.g. just a document title) is naturally filtered out
+-    # rather than needing special-case handling here.
++    # If headings were found, the first chunk is whatever came before the
++    # very first heading (document title, party names, recitals, etc.)
++    # - unless the document has no preamble and a heading is the first
++    # thing in the text. Drop it in the former case; it isn't a clause.
++    FIRST_HEADING_RE = re.compile(
++        r"^\d{1,2}[\.\)]\s+[A-Z]{2,}"
++        r"|^" + _KEYWORD_HEADING
++    )
++    header: Optional[str] = None
++    if len(parts) > 1 and not FIRST_HEADING_RE.match(parts[0]):
++        header = re.sub(r"\s+", " ", parts[0]).strip()
++        if len(header) < 20:
++            header = None  # just a title - nothing worth citing
++        parts = parts[1:]
+ 
+     # Fallback: if that found hardly any headings (e.g. a document that
+     # doesn't use ALL-CAPS numbered section titles), split on blank-line
+@@ -337,7 +353,120 @@ def split_into_clauses(text: str) -> List[str]:
+         deduped.append(clause)
+     refined = deduped
+ 
+-    return refined
++    return header, refined
++
++
++def split_into_clauses(text: str) -> List[str]:
++    """Operative clauses only (see split_document)."""
++    return split_document(text)[1]
++
++
++_WORD_RE = re.compile(r"[a-z0-9]{3,}")
++
++
++def coverage_report(text: str, header: Optional[str], clauses: List[str]) -> Dict[str, Any]:
++    """
++    Check that splitting didn't silently lose document text.
++
++    Compares the distinct words of the source with the distinct words
++    kept in header + clauses. Distinct words (not character counts)
++    make this robust to PDFs that repeat the same page, which the
++    splitter deliberately de-duplicates. Removed boilerplate (page
++    numbers, signature lines) costs very little. A low ratio means
++    real content was dropped - e.g. an unrecognized heading style made
++    most of a document fall outside the clauses - and the analysis for
++    that document should not be trusted until it's looked at.
++    """
++    source_words = set(_WORD_RE.findall((text or "").lower()))
++    kept = " ".join(([header] if header else []) + list(clauses)).lower()
++    kept_words = set(_WORD_RE.findall(kept))
++    if not source_words:
++        return {"ratio": 1.0, "ok": True, "missing_sample": []}
++    missing = sorted(source_words - kept_words)
++    ratio = 1 - len(missing) / len(source_words)
++    return {
++        "ratio": round(ratio, 3),
++        "ok": ratio >= 0.95,
++        "missing_sample": missing[:20],
++    }
++
++
++# ---------------------------------------------------------------- facts
++#
++# Labeled fields ("FINANCED AMOUNT: $45,892.00", "LENDER: ...") are read
++# straight from the document text. When a document labels a value, the
++# label is the authority - an LLM reading is only used when there is no
++# label, and even then must be found verbatim in the text (see
++# llm_agent.ground_metadata).
++
++_CURRENCY_SYMBOLS = {"$": "USD", "US$": "USD", "\u20b9": "INR", "\u20ac": "EUR", "\u00a3": "GBP", "Rs.": "INR", "Rs": "INR"}
++_MONEY_RE = re.compile(
++    r"(?P<cur>US\$|\$|\u20b9|\u20ac|\u00a3|Rs\.?|INR|USD|EUR|GBP)\s?"
++    r"(?P<num>\d{1,3}(?:,\d{2,3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
++    r"|(?P<num2>\d{1,3}(?:,\d{2,3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s?(?P<cur2>INR|USD|EUR|GBP)\b"
++)
++_AMOUNT_LABELS = (
++    r"FINANCED\s+AMOUNT|LOAN\s+AMOUNT|PRINCIPAL(?:\s+AMOUNT)?|"
++    r"TOTAL\s+CONTRACT\s+VALUE|CONTRACT\s+VALUE|TOTAL\s+VALUE|"
++    r"CONTRACT\s+PRICE|TOTAL\s+(?:FEES?|PRICE|AMOUNT)|PURCHASE\s+PRICE"
++)
++_PARTY_LABELS = {
++    "lender_name": r"LENDER|BANK|CREDITOR",
++    "customer_name": r"BORROWER|CUSTOMER|CLIENT|DEBTOR",
++}
++
++
++def _currency_code(raw: str) -> str:
++    raw = (raw or "").strip()
++    return _CURRENCY_SYMBOLS.get(raw, raw.upper().rstrip("."))
++
++
++def find_money_amounts(text: str) -> List[Dict[str, Any]]:
++    """Every currency amount written in the text."""
++    found = []
++    for m in _MONEY_RE.finditer(text or ""):
++        num = m.group("num") or m.group("num2")
++        cur = m.group("cur") or m.group("cur2")
++        try:
++            value = float(num.replace(",", ""))
++        except (TypeError, ValueError):
++            continue
++        found.append({"value": value, "currency": _currency_code(cur), "text": m.group(0).strip()})
++    return found
++
++
++def extract_labeled_facts(text: str) -> Dict[str, Any]:
++    """
++    Values the document states under an explicit label, e.g.
++    'FINANCED AMOUNT: $45,892.00.', 'LENDER: FINANCIAL BANK OF AMERICA Inc., ...'.
++    Only the first occurrence of each label is used. Keys are absent
++    when the document has no such label.
++    """
++    t = re.sub(r"\s+", " ", text or "")
++    facts: Dict[str, Any] = {}
++
++    m = re.search(r"\b(?P<label>" + _AMOUNT_LABELS + r")\s*[:\-]\s*(?P<rest>.{0,60})", t, re.IGNORECASE)
++    if m:
++        amounts = find_money_amounts(m.group("rest"))
++        if amounts:
++            facts["contract_value"] = amounts[0]["value"]
++            facts["currency"] = amounts[0]["currency"]
++            facts["contract_value_text"] = amounts[0]["text"]
++            facts["contract_value_label"] = re.sub(r"\s+", " ", m.group("label").upper())
++
++    for key, labels in _PARTY_LABELS.items():
++        m = re.search(
++            r"(?:^|[\s.;])(?:" + labels + r")\s*:\s*"
++            r"(?P<name>[A-Za-z0-9][A-Za-z0-9 .&'\-]{1,80}?)"
++            r"(?=\s*(?:,|;|\(|\.\s|\.$|\bresiding\b|\bregistered\b|\bheadquartered\b|\bholder\b|$))",
++            t,
++            re.IGNORECASE,
++        )
++        if m:
++            name = m.group("name").strip().rstrip(".,")
++            if name and name.lower() not in {"the bank", "the lender", "the borrower", "the client"}:
++                facts[key] = name
++    return facts
+ 
+ def assign_clause_pages(clauses: List[str], pages: List[str]) -> List[int]:
+     """
+diff --git a/backend/app/rag.py b/backend/app/rag.py
+index 20d0324..1add240 100644
+--- a/backend/app/rag.py
++++ b/backend/app/rag.py
+@@ -1,4 +1,18 @@
++"""
++Clause search (retrieval) over a local Qdrant store.
++
++Embeddings come from Ollama, configured in settings.json:
++  embedding_model  (default qwen3-embedding:8b)
++  embedding_url    (empty = same server as ollama_url)
++
++Each embedding model gets its own Qdrant collection
++("contracts__<model>"), so changing the model never mixes vectors of
++different sizes or meanings; after a change, POST /admin/reindex fills
++the new collection.
++"""
+ import os
++import re
++import threading
+ import uuid
+ from typing import Any, Dict, List, Optional
+ 
+@@ -6,335 +20,286 @@ import requests
+ from qdrant_client import QdrantClient
+ from qdrant_client.http import models as qmodels
+ 
++from .llm_providers import get_settings, silence_insecure_warning_if_needed
+ 
+-BASE_DIR = os.path.dirname(
+-    os.path.dirname(os.path.abspath(__file__))
+-)
+ 
+-QDRANT_DATA_PATH = os.getenv(
+-    "QDRANT_DATA_PATH",
+-    os.path.join(BASE_DIR, "qdrant_data"),
+-)
++BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++QDRANT_DATA_PATH = os.getenv("QDRANT_DATA_PATH", os.path.join(BASE_DIR, "qdrant_data"))
+ 
+-DEFAULT_COLLECTION = os.getenv(
+-    "QDRANT_COLLECTION",
+-    "contracts",
+-)
++HEADER_ID = "header"
+ 
+-OLLAMA_URL = os.getenv(
+-    "OLLAMA_URL",
+-    "http://127.0.0.1:11434",
+-).rstrip("/")
++# Qdrant's local (on-disk) mode is not safe for concurrent use: two
++# threads writing at once fail or lose points. Uploads, analysis,
++# re-indexing and chat all run on worker threads, so every client call
++# goes through this lock. Embedding (the slow network part) stays
++# outside it.
++_QDRANT_LOCK = threading.RLock()
+ 
+-EMBEDDING_MODEL_NAME = os.getenv(
+-    "EMBEDDING_MODEL",
+-    "nomic-embed-text",
++# How each embedding model expects documents and queries to be framed.
++# Both models were trained with these prefixes; leaving them off makes
++# relevant and irrelevant passages score much closer together.
++_QWEN3_QUERY_TASK = (
++    "Given a question about one or more contracts, retrieve the contract "
++    "passages that answer it"
+ )
+ 
+-MIN_RELEVANCE_SCORE = float(
+-    os.getenv(
+-        "RAG_MIN_RELEVANCE_SCORE",
+-        "0.50",
+-    )
+-)
+ 
++def _doc_text(model: str, text: str) -> str:
++    if "nomic-embed" in model:
++        return f"search_document: {text}"
++    return text
+ 
+-class RAGStore:
+-    def __init__(
+-        self,
+-        collection: str = DEFAULT_COLLECTION,
+-        embedding_model: str = EMBEDDING_MODEL_NAME,
+-    ) -> None:
+-        """
+-        Initialize local Qdrant storage and local Ollama embeddings.
+-        """
+ 
+-        os.makedirs(
+-            QDRANT_DATA_PATH,
+-            exist_ok=True,
+-        )
++def _query_text(model: str, text: str) -> str:
++    if "nomic-embed" in model:
++        return f"search_query: {text}"
++    if "qwen3-embedding" in model:
++        return f"Instruct: {_QWEN3_QUERY_TASK}\nQuery:{text}"
++    if "mxbai-embed" in model:
++        return f"Represent this sentence for searching relevant passages: {text}"
++    return text
+ 
+-        self.client = QdrantClient(
+-            path=QDRANT_DATA_PATH
+-        )
+ 
+-        self.collection = collection
+-        self.embedding_model = embedding_model
+-        self.ollama_url = OLLAMA_URL
+-        
+-        # Generate one test embedding to confirm that Ollama and
+-        # the embedding model are available and determine dimension.
+-        test_vectors = self.embed(
+-            ["Embedding dimension test"]
+-        )
++def _default_min_score(model: str) -> float:
++    # Absolute floor under the relative cut in query(). Scores are only
++    # comparable within one model, so the floor is per model family.
++    if "nomic-embed" in model:
++        return 0.45
++    return 0.30
+ 
+-        if not test_vectors or len(test_vectors[0]) == 0:
+-            raise RuntimeError(
+-                "Ollama returned no embedding vector"
+-            )
+ 
+-        self.dim = len(test_vectors[0])
++def _normalize(text: str) -> str:
++    return re.sub(r"\s+", " ", (text or "")).strip().lower()
+ 
+-        self._ensure_collection()
+ 
+-    def _ensure_collection(self) -> None:
+-        """
+-        Create the local Qdrant collection if it does not exist.
+-        """
++class RAGStore:
++    def __init__(self) -> None:
++        settings = get_settings()
++        self.embedding_model = str(settings.get("embedding_model") or "nomic-embed-text")
++        self.embedding_url = str(
++            settings.get("embedding_url") or settings.get("ollama_url") or "http://127.0.0.1:11434"
++        ).rstrip("/")
++        self.verify = bool(settings.get("ollama_verify_ssl", True))
++        self.min_score = float(
++            settings.get("rag_min_score") or _default_min_score(self.embedding_model)
++        )
++        # Keep results within this distance of the best match; a fixed
++        # threshold alone let unrelated clauses through whenever
++        # nothing scored well.
++        self.relative_margin = float(settings.get("rag_relative_margin", 0.12))
++        silence_insecure_warning_if_needed()
++
++        slug = re.sub(r"[^a-z0-9]+", "_", self.embedding_model.lower()).strip("_")
++        self.collection = f"contracts__{slug}"
++
++        os.makedirs(QDRANT_DATA_PATH, exist_ok=True)
++        with _QDRANT_LOCK:
++            self.client = QdrantClient(path=QDRANT_DATA_PATH)
++
++        test_vectors = self.embed(["dimension test"], kind="document")
++        if not test_vectors or not test_vectors[0]:
++            raise RuntimeError("Ollama returned no embedding vector")
++        self.dim = len(test_vectors[0])
++        self._ensure_collection()
+ 
+-        try:
+-            collection_info = self.client.get_collection(
+-                collection_name=self.collection
+-            )
++    # ------------------------------------------------------------ setup
+ 
+-            existing_size = (
+-                collection_info
+-                .config
+-                .params
+-                .vectors
+-                .size
+-            )
++    def _ensure_collection(self) -> None:
++        with _QDRANT_LOCK:
++            self._ensure_collection_locked()
+ 
+-            if existing_size != self.dim:
++    def _ensure_collection_locked(self) -> None:
++        if self.client.collection_exists(self.collection):
++            size = self.client.get_collection(self.collection).config.params.vectors.size
++            if size != self.dim:
+                 raise RuntimeError(
+-                    "The existing Qdrant collection uses vector "
+-                    f"dimension {existing_size}, but "
+-                    f"{self.embedding_model} produces dimension "
+-                    f"{self.dim}. Delete the qdrant_data directory "
+-                    "and restart the backend."
++                    f"Collection {self.collection} has vectors of size {size}, but "
++                    f"{self.embedding_model} produces {self.dim}. Run POST /admin/reindex "
++                    "with reset_index=true."
+                 )
+-
+             return
+-
+-        except RuntimeError:
+-            raise
+-
+-        except Exception:
+-            pass
+-
+         self.client.create_collection(
+             collection_name=self.collection,
+-            vectors_config=qmodels.VectorParams(
+-                size=self.dim,
+-                distance=qmodels.Distance.COSINE,
+-            ),
++            vectors_config=qmodels.VectorParams(size=self.dim, distance=qmodels.Distance.COSINE),
+         )
+ 
+-    def embed(
+-        self,
+-        texts: List[str],
+-    ) -> List[List[float]]:
+-        """
+-        Generate embeddings through the local Ollama API.
++    def reset(self) -> None:
++        """Drop and recreate this model's collection (used by reindex)."""
++        with _QDRANT_LOCK:
++            if self.client.collection_exists(self.collection):
++                self.client.delete_collection(self.collection)
++            self._ensure_collection_locked()
+ 
+-        Ollama runs entirely on localhost and does not send the
+-        contract text to Hugging Face or another cloud service.
+-        """
++    def count(self) -> int:
++        with _QDRANT_LOCK:
++            return self.client.count(self.collection, exact=True).count
+ 
+-        clean_texts = [
+-            str(text or "").strip()
+-            for text in texts
+-        ]
++    # ------------------------------------------------------------ embed
+ 
+-        clean_texts = [
+-            text
+-            for text in clean_texts
+-            if text
++    def embed(self, texts: List[str], kind: str = "document") -> List[List[float]]:
++        """kind: "document" for stored passages, "query" for questions."""
++        prepared = [
++            (_query_text if kind == "query" else _doc_text)(self.embedding_model, str(t or "").strip())
++            for t in texts
+         ]
+-
+-        if not clean_texts:
+-            return []
+-
+-        try:
+-            response = requests.post(
+-                f"{self.ollama_url}/api/embed",
+-                json={
+-                    "model": self.embedding_model,
+-                    "input": clean_texts,
+-                    "truncate": True,
+-                },
+-                timeout=180,
+-            )
+-
+-            response.raise_for_status()
+-            data = response.json()
+-
+-        except requests.RequestException as error:
+-            raise RuntimeError(
+-                "Could not generate embeddings through Ollama. "
+-                f"Check that Ollama is running and that "
+-                f"{self.embedding_model} is installed. "
+-                f"Details: {error}"
+-            ) from error
+-
+-        embeddings = data.get(
+-            "embeddings",
+-            [],
++        vectors: List[List[float]] = []
++        for start in range(0, len(prepared), 16):
++            batch = prepared[start:start + 16]
++            try:
++                response = requests.post(
++                    f"{self.embedding_url}/api/embed",
++                    json={"model": self.embedding_model, "input": batch, "truncate": True},
++                    timeout=180,
++                    verify=self.verify,
++                )
++                response.raise_for_status()
++                data = response.json()
++            except requests.RequestException as error:
++                raise RuntimeError(
++                    f"Could not get embeddings from {self.embedding_url} with "
++                    f"{self.embedding_model}: {error}"
++                ) from error
++            embeddings = data.get("embeddings")
++            if not isinstance(embeddings, list) or len(embeddings) != len(batch):
++                raise RuntimeError("Ollama returned an unexpected embeddings response")
++            vectors.extend([[float(v) for v in e] for e in embeddings])
++        return vectors
++
++    # ------------------------------------------------------------ write
++
++    def delete_analysis(self, analysis_id: str) -> None:
++        with _QDRANT_LOCK:
++            self._delete_locked(analysis_id)
++
++    def _delete_locked(self, analysis_id: str) -> None:
++        self.client.delete(
++            collection_name=self.collection,
++            points_selector=qmodels.FilterSelector(
++                filter=qmodels.Filter(
++                    must=[qmodels.FieldCondition(key="analysis_id", match=qmodels.MatchValue(value=analysis_id))]
++                )
++            ),
++            wait=True,
+         )
+ 
+-        if not isinstance(embeddings, list):
+-            raise RuntimeError(
+-                "Ollama returned an invalid embeddings response"
+-            )
+-
+-        if len(embeddings) != len(clean_texts):
+-            raise RuntimeError(
+-                "Ollama returned an unexpected number of "
+-                "embedding vectors"
+-            )
+-
+-        return [
+-            [
+-                float(value)
+-                for value in embedding
+-            ]
+-            for embedding in embeddings
+-        ]
+-
+-    def upsert_clauses(
++    def index_analysis(
+         self,
+         analysis_id: str,
+         clauses: List[Dict[str, Any]],
+-    ) -> None:
++        header: Optional[Dict[str, Any]] = None,
++    ) -> int:
+         """
+-        Add or update contract clauses in local Qdrant storage.
++        Replace everything indexed for this analysis with its current
++        header and clauses. Replacing (not adding) is what keeps old
++        splits of the same document from lingering in search results.
+         """
+-        if not clauses: 
+-            return
+-
+-        searchable_clauses = [
+-            clause
+-            for clause in clauses
+-            if str(
+-                clause.get("text", "")
+-            ).strip()
+-        ]
+-
+-        if not searchable_clauses:
+-            return
+-
+-        texts = [
+-            str(
+-                clause.get("text", "")
+-            ).strip()
+-            for clause in searchable_clauses
+-        ]
+-
+-        vectors = self.embed(texts)
+-
+-        points = []
+-
+-        for clause, vector in zip(
+-            searchable_clauses,
+-            vectors,
+-        ):
+-            clause_id = clause.get("id")
+-
+-            point_id = str(
+-                uuid.uuid5(
+-                    uuid.NAMESPACE_URL,
+-                    f"{analysis_id}:{clause_id}",
+-                )
++        entries: List[Dict[str, Any]] = []
++        if header and str(header.get("text", "")).strip():
++            entries.append({"id": HEADER_ID, "text": header["text"], "kind": "header", "metadata": {}})
++        for clause in clauses or []:
++            if str(clause.get("text", "")).strip():
++                entries.append({
++                    "id": clause.get("id"),
++                    "text": clause["text"],
++                    "kind": "clause",
++                    "metadata": clause.get("metadata", {}),
++                })
++
++        if not entries:
++            self.delete_analysis(analysis_id)
++            return 0
++
++        vectors = self.embed([e["text"].strip() for e in entries], kind="document")
++        points = [
++            qmodels.PointStruct(
++                id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{analysis_id}:{e['id']}")),
++                vector=vector,
++                payload={
++                    "analysis_id": analysis_id,
++                    "clause_id": e["id"],
++                    "kind": e["kind"],
++                    "text": e["text"].strip(),
++                    "metadata": e["metadata"],
++                },
+             )
++            for e, vector in zip(entries, vectors)
++        ]
++        # Delete-then-insert under one lock, so a search never sees this
++        # contract half-indexed.
++        with _QDRANT_LOCK:
++            self._delete_locked(analysis_id)
++            self.client.upsert(collection_name=self.collection, points=points, wait=True)
++        return len(points)
+ 
+-            payload = {
+-                "analysis_id": analysis_id,
+-                "clause_id": clause_id,
+-                "text": str(
+-                    clause.get("text", "")
+-                ).strip(),
+-                "metadata": clause.get(
+-                    "metadata",
+-                    {},
+-                ),
+-            }
+-
+-            points.append(
+-                qmodels.PointStruct(
+-                    id=point_id,
+-                    vector=vector,
+-                    payload=payload,
+-                )
+-            )
++    # Old name, kept so nothing else breaks.
++    def upsert_clauses(self, analysis_id: str, clauses: List[Dict[str, Any]]) -> None:
++        self.index_analysis(analysis_id, clauses)
+ 
+-        self.client.upsert(
+-            collection_name=self.collection,
+-            points=points,
+-            wait=True,
+-        )
++    # ------------------------------------------------------------ read
+ 
+     def query(
+         self,
+         text: str,
+         top_k: int = 5,
+         filter_by_analysis: Optional[str] = None,
++        exclude_analysis_ids: Optional[List[str]] = None,
+     ) -> List[Dict[str, Any]]:
+         """
+-        Find clauses semantically related to a question.
++        Passages related to a question: best match first, near-identical
++        text returned once, and anything scoring far below the best
++        match (or below the model's floor) dropped.
+         """
+-
+         query_text = str(text or "").strip()
+-
+         if not query_text:
+             return []
++        vector = self.embed([query_text], kind="query")[0]
+ 
+-        query_vector = self.embed(
+-            [query_text]
+-        )[0]
+-
+-        query_filter = None
+-
++        must = []
+         if filter_by_analysis:
+-            query_filter = qmodels.Filter(
+-                must=[
+-                    qmodels.FieldCondition(
+-                        key="analysis_id",
+-                        match=qmodels.MatchValue(
+-                            value=filter_by_analysis
+-                        ),
+-                    )
+-                ]
+-            )
+-
+-        limit = max(
+-            1,
+-            min(int(top_k), 20),
+-        )
+-
+-        query_result = self.client.query_points(
+-            collection_name=self.collection,
+-            query=query_vector,
+-            query_filter=query_filter,
+-            limit=limit,
+-            with_payload=True,
+-        )
++            must.append(qmodels.FieldCondition(key="analysis_id", match=qmodels.MatchValue(value=filter_by_analysis)))
++        must_not = []
++        if exclude_analysis_ids:
++            must_not.append(qmodels.FieldCondition(key="analysis_id", match=qmodels.MatchAny(any=list(exclude_analysis_ids))))
++        query_filter = qmodels.Filter(must=must or None, must_not=must_not or None) if (must or must_not) else None
++
++        limit = max(1, min(int(top_k), 20))
++        with _QDRANT_LOCK:
++            hits = self.client.query_points(
++                collection_name=self.collection,
++                query=vector,
++                query_filter=query_filter,
++                limit=limit * 4,
++                with_payload=True,
++            ).points
++        if not hits:
++            return []
+ 
++        best = float(hits[0].score)
++        cutoff = max(self.min_score, best - self.relative_margin)
++        seen = set()
+         output: List[Dict[str, Any]] = []
+-
+-        for result in query_result.points:
+-            if float(result.score) < 0.50:
++        for hit in hits:
++            score = float(hit.score)
++            if score < cutoff:
++                break
++            payload = hit.payload or {}
++            # Same wording repeated inside one contract (e.g. a page
++            # printed twice) is returned once. Identical wording in two
++            # different contracts stays as two sources: each is a real,
++            # separate place the answer can point to.
++            text_key = _normalize(payload.get("text", ""))
++            key = (payload.get("analysis_id"), text_key)
++            if not text_key or key in seen:
+                 continue
+-
+-            payload = result.payload or {}
+-
+-            output.append(
+-                {
+-                    "text": payload.get(
+-                        "text",
+-                        "",
+-                    ),
+-                    "analysis_id": payload.get(
+-                        "analysis_id"
+-                    ),
+-                    "clause_id": payload.get(
+-                        "clause_id"
+-                    ),
+-                    "metadata": payload.get(
+-                        "metadata",
+-                        {},
+-                    ),
+-                    "score": float(result.score),
+-                }
+-            )
+-
++            seen.add(key)
++            output.append({
++                "text": payload.get("text", ""),
++                "analysis_id": payload.get("analysis_id"),
++                "clause_id": payload.get("clause_id"),
++                "kind": payload.get("kind", "clause"),
++                "metadata": payload.get("metadata", {}),
++                "score": score,
++            })
++            if len(output) >= limit:
++                break
+         return output
+diff --git a/backend/app/schemas.py b/backend/app/schemas.py
+new file mode 100644
+index 0000000..3d69c3d
+--- /dev/null
++++ b/backend/app/schemas.py
+@@ -0,0 +1,253 @@
++"""
++Schemas for every structured (JSON) LLM call.
++
++Each schema is used twice:
++1. Its JSON schema is sent to Ollama as the "format" parameter, which
++   constrains generation so the model can only produce JSON of this
++   shape (no prose around it, no missing keys, no invented enum values).
++2. The reply is validated against it with Pydantic. Anything that
++   still doesn't fit is rejected rather than half-used.
++
++The "before" validators only normalize harmless formatting differences
++(capitalization, "$45,892.00" -> 45892.0) for servers or providers that
++can't constrain output. They never invent a value.
++"""
++import re
++from typing import Any, Dict, List, Literal, Optional
++
++from pydantic import BaseModel, Field, field_validator
++
++
++DOMAINS = (
++    "Legal",
++    "Financial",
++    "Compliance",
++    "HR",
++    "Security",
++    "Vendor",
++    "Operational",
++    "Environmental",
++    "Intellectual Property",
++    "Privacy",
++    "Data Protection",
++    "Other",
++)
++
++_NULL_STRINGS = {"", "null", "none", "n/a", "na", "unknown", "not stated", "not specified"}
++
++
++def _none_if_blank(value: Any) -> Any:
++    if isinstance(value, str) and value.strip().lower() in _NULL_STRINGS:
++        return None
++    return value
++
++
++def _pick_case_insensitive(value: Any, allowed, default=None):
++    if value is None:
++        return default
++    lookup = {a.lower(): a for a in allowed}
++    return lookup.get(str(value).strip().lower(), default if default is not None else value)
++
++
++def parse_money(value: Any) -> Optional[float]:
++    """'$1,203,432.00' / '1203432' / 1203432 -> 1203432.0; else None."""
++    value = _none_if_blank(value)
++    if value is None or isinstance(value, bool):
++        return None
++    if isinstance(value, (int, float)):
++        return float(value)
++    cleaned = re.sub(r"[^\d.\-]", "", str(value))
++    if not cleaned or cleaned in {".", "-"}:
++        return None
++    try:
++        return float(cleaned)
++    except ValueError:
++        return None
++
++
++# ---------------------------------------------------------------- clauses
++
++class ClauseClassification(BaseModel):
++    domain: Literal[DOMAINS]  # type: ignore[valid-type]
++    risk_level: Literal["Low", "Medium", "High"]
++    reasons: List[str] = Field(
++        min_length=1,
++        max_length=5,
++        description="Short, specific risk factors taken from what the clause says.",
++    )
++    key_metadata: Dict[str, str] = Field(default_factory=dict)
++
++    @field_validator("domain", mode="before")
++    @classmethod
++    def _domain(cls, v):
++        return _pick_case_insensitive(v, DOMAINS, default="Other")
++
++    @field_validator("risk_level", mode="before")
++    @classmethod
++    def _risk(cls, v):
++        return _pick_case_insensitive(v, ("Low", "Medium", "High"))
++
++    @field_validator("reasons", mode="before")
++    @classmethod
++    def _reasons(cls, v):
++        if isinstance(v, str):
++            v = [v]
++        return [str(r).strip() for r in (v or []) if str(r).strip()]
++
++    @field_validator("key_metadata", mode="before")
++    @classmethod
++    def _meta(cls, v):
++        if not isinstance(v, dict):
++            return {}
++        return {str(k): str(val) for k, val in v.items() if val is not None}
++
++
++# ---------------------------------------------------------------- policy
++
++class CheckResult(BaseModel):
++    id: str
++    matched: bool
++    reason: str
++
++    @field_validator("id", mode="before")
++    @classmethod
++    def _id(cls, v):
++        return str(v)
++
++
++class ComplianceResponse(BaseModel):
++    results: List[CheckResult]
++
++
++class ApplicabilityItem(BaseModel):
++    id: str
++    applicable: bool
++    reason: str
++
++    @field_validator("id", mode="before")
++    @classmethod
++    def _id(cls, v):
++        return str(v)
++
++
++class ApplicabilityResponse(BaseModel):
++    contract_type: str
++    results: List[ApplicabilityItem]
++
++
++# ---------------------------------------------------------------- contract
++
++class ContractSummary(BaseModel):
++    executive_summary: str
++    key_obligations: List[str]
++    major_risks: List[str]
++    recommendations: List[str]
++    overall_sentiment: Literal["Favorable", "Balanced", "Unfavorable"]
++
++    @field_validator("overall_sentiment", mode="before")
++    @classmethod
++    def _sentiment(cls, v):
++        return _pick_case_insensitive(v, ("Favorable", "Balanced", "Unfavorable"), default="Balanced")
++
++
++class ContractMetadataExtraction(BaseModel):
++    """Every key is required (null allowed), so a constrained model has
++    to consider each field instead of silently skipping one."""
++
++    customer_name: Optional[str] = Field(
++        description="Counterparty / customer / borrower name exactly as written, or null."
++    )
++    lender_name: Optional[str] = Field(
++        description="Lender / bank named in the contract exactly as written, or null."
++    )
++    contract_about: Optional[str] = Field(description="3-8 word description.")
++    start_date: Optional[str] = Field(description="YYYY-MM-DD or null.")
++    end_date: Optional[str] = Field(description="YYYY-MM-DD or null.")
++    contract_value: Optional[float] = Field(
++        description="Total contract / financed amount as a plain number, or null."
++    )
++    contract_value_text: Optional[str] = Field(
++        description="The amount exactly as written in the contract, e.g. '$45,892.00', or null."
++    )
++    currency: Optional[str] = Field(description="ISO code such as USD or INR, or null.")
++    ip_shared_with_customer: Optional[bool]
++    indemnification_clause_present: Optional[bool]
++    indemnification_strength: Optional[Literal["Weak", "Standard", "Strong"]]
++    governing_law: Optional[str]
++
++    @field_validator(
++        "customer_name", "lender_name", "contract_about", "start_date",
++        "end_date", "contract_value_text", "currency", "governing_law",
++        mode="before",
++    )
++    @classmethod
++    def _blank(cls, v):
++        v = _none_if_blank(v)
++        return str(v).strip() if v is not None else None
++
++    @field_validator("contract_value", mode="before")
++    @classmethod
++    def _money(cls, v):
++        return parse_money(v)
++
++    @field_validator("indemnification_strength", mode="before")
++    @classmethod
++    def _strength(cls, v):
++        v = _none_if_blank(v)
++        picked = _pick_case_insensitive(v, ("Weak", "Standard", "Strong"))
++        return picked if picked in ("Weak", "Standard", "Strong") else None
++
++    @field_validator(
++        "ip_shared_with_customer", "indemnification_clause_present", mode="before"
++    )
++    @classmethod
++    def _bool(cls, v):
++        v = _none_if_blank(v)
++        if isinstance(v, str):
++            low = v.strip().lower()
++            if low in {"true", "yes", "y"}:
++                return True
++            if low in {"false", "no", "n"}:
++                return False
++            return None
++        return v
++
++
++# ---------------------------------------------------------------- chat
++
++StructuredField = Literal[
++    "filename",
++    "customer_name",
++    "lender_name",
++    "contract_about",
++    "governing_law",
++    "currency",
++    "contract_value",
++    "start_date",
++    "end_date",
++    "indemnification_clause_present",
++    "ip_shared_with_customer",
++]
++
++
++class QueryFilter(BaseModel):
++    field: StructuredField
++    op: Literal["contains", "equals", "greater_than", "less_than", "before", "after", "is_true", "is_false"]
++    value: Optional[str] = None
++
++
++class ChatQuerySpec(BaseModel):
++    """How to answer a chat question.
++
++    kind="structured": the question can be answered entirely from the
++    contract directory fields (amounts, dates, parties, counts, totals,
++    rankings, filters). The app answers it in code, exactly.
++    kind="semantic": it needs the wording of clauses (what a clause
++    says, whether terms are risky, drafting, comparisons of terms)."""
++
++    kind: Literal["structured", "semantic"]
++    operation: Literal["list", "count", "sum", "average"] = "list"
++    sort_by: Optional[Literal["contract_value", "start_date", "end_date", "customer_name"]] = None
++    order: Literal["asc", "desc"] = "desc"
++    limit: Optional[int] = Field(default=None, ge=1, le=100)
++    filters: List[QueryFilter] = Field(default_factory=list)
+diff --git a/backend/app/settings.json b/backend/app/settings.json
+index b0532c0..dbffd24 100644
+--- a/backend/app/settings.json
++++ b/backend/app/settings.json
+@@ -2,7 +2,11 @@
+   "provider": "ollama",
+   "ollama_url": "https://librechat.eplpg.com/ollama",
+   "ollama_model": "qwen3:8b",
++  "ollama_quality_model": "qwen3:32b",
+   "ollama_verify_ssl": false,
+   "llm_concurrency": 4,
+-  "ollama_num_ctx": 16384
+-}
+\ No newline at end of file
++  "ollama_num_ctx": 16384,
++  "llm_timeout_sec": 240,
++  "embedding_url": "",
++  "embedding_model": "qwen3-embedding:8b"
++}
+diff --git a/backend/app/store.py b/backend/app/store.py
+index 65d6710..54af1f0 100644
+--- a/backend/app/store.py
++++ b/backend/app/store.py
+@@ -1,5 +1,6 @@
+ import json
+ import os
++import tempfile
+ from typing import Dict, Any, List, Optional
+ from uuid import uuid4
+ from threading import RLock
+@@ -9,48 +10,82 @@ from datetime import datetime
+ DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+ DATA_FILE = os.path.join(DATA_DIR, "analyses.json")
+ 
++# One lock shared by every Store instance in the process. Each write
++# rewrites the whole JSON file, so a read-modify-write that isn't held
++# under a single lock from start to finish lets two concurrent updates
++# each read the old file and the second write silently erase the
++# first. That happened in practice once uploads, analysis and the
++# metadata backfill started running on worker threads.
++_LOCK = RLock()
++
+ 
+ class Store:
+     def __init__(self) -> None:
+         os.makedirs(DATA_DIR, exist_ok=True)
+-        if not os.path.exists(DATA_FILE):
+-            with open(DATA_FILE, "w", encoding="utf-8") as f:
+-                json.dump({}, f)
+-        self._lock = RLock()
++        with _LOCK:
++            if not os.path.exists(DATA_FILE):
++                self._write({})
+ 
+     def _read(self) -> Dict[str, Any]:
+-        with self._lock:
++        with _LOCK:
+             with open(DATA_FILE, "r", encoding="utf-8") as f:
+                 return json.load(f)
+ 
+     def _write(self, data: Dict[str, Any]) -> None:
+-        with self._lock:
+-            with open(DATA_FILE, "w", encoding="utf-8") as f:
+-                json.dump(data, f, ensure_ascii=False, indent=2)
++        """Write atomically: a crash or kill mid-write leaves the old
++        file intact instead of a truncated, unreadable one."""
++        with _LOCK:
++            fd, tmp_path = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
++            try:
++                with os.fdopen(fd, "w", encoding="utf-8") as f:
++                    json.dump(data, f, ensure_ascii=False, indent=2)
++                os.replace(tmp_path, DATA_FILE)
++            except Exception:
++                if os.path.exists(tmp_path):
++                    os.remove(tmp_path)
++                raise
+ 
+     def save_analysis(self, payload: Dict[str, Any]) -> str:
+-        data = self._read()
+-        analysis_id = payload.get("analysis_id") or uuid4().hex
+-        payload["analysis_id"] = analysis_id
+-        data[analysis_id] = payload
+-        self._write(data)
+-        return analysis_id
++        with _LOCK:
++            data = self._read()
++            analysis_id = payload.get("analysis_id") or uuid4().hex
++            payload["analysis_id"] = analysis_id
++            data[analysis_id] = payload
++            self._write(data)
++            return analysis_id
+ 
+     def update_analysis(self, analysis_id: str, updates: Dict[str, Any]) -> None:
+-        data = self._read()
+-        if analysis_id not in data:
+-            return
+-        current = data[analysis_id]
+-        current.update(updates)
+-        # Add updated_at timestamp
+-        current["updated_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+-        data[analysis_id] = current
+-        self._write(data)
++        with _LOCK:
++            data = self._read()
++            if analysis_id not in data:
++                return
++            current = data[analysis_id]
++            current.update(updates)
++            current["updated_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
++            data[analysis_id] = current
++            self._write(data)
++
++    def delete_analysis(self, analysis_id: str) -> bool:
++        with _LOCK:
++            data = self._read()
++            if analysis_id not in data:
++                return False
++            del data[analysis_id]
++            self._write(data)
++            return True
+ 
+     def get_analysis(self, analysis_id: str) -> Optional[Dict[str, Any]]:
+         data = self._read()
+         return data.get(analysis_id)
+ 
++    def find_by_content_hash(self, content_hash: str) -> Optional[Dict[str, Any]]:
++        if not content_hash:
++            return None
++        for a in self._read().values():
++            if a.get("content_hash") == content_hash:
++                return a
++        return None
++
+     def list_analyses(self) -> List[Dict[str, Any]]:
+         data = self._read()
+         analyses = list(data.values())
+diff --git a/backend/requirements-dev.txt b/backend/requirements-dev.txt
+new file mode 100644
+index 0000000..9c86f03
+--- /dev/null
++++ b/backend/requirements-dev.txt
+@@ -0,0 +1,2 @@
++pytest>=8
++httpx>=0.27
+diff --git a/backend/scripts/eval_chat.py b/backend/scripts/eval_chat.py
+new file mode 100644
+index 0000000..24d3de6
+--- /dev/null
++++ b/backend/scripts/eval_chat.py
+@@ -0,0 +1,59 @@
++"""
++Ask the running backend real questions and check the answers.
++
++1. Start the backend (python run_server.py).
++2. Edit eval_questions.json: every expect_contains value must be a fact
++   you checked yourself in the documents. Entries still marked TODO are
++   skipped.
++3. From the backend folder:  python scripts/eval_chat.py
++
++Run it after any change to models, prompts, parsing or settings. A
++question that passed before and fails now is a regression.
++"""
++import json
++import os
++import sys
++
++import requests
++
++BASE = os.environ.get("PACT_API", "http://127.0.0.1:8001")
++HERE = os.path.dirname(os.path.abspath(__file__))
++
++
++def main() -> int:
++    with open(os.path.join(HERE, "eval_questions.json"), encoding="utf-8") as f:
++        cases = json.load(f)
++
++    passed = failed = skipped = 0
++    for case in cases:
++        expected = case.get("expect_contains", [])
++        if any("TODO" in e for e in expected):
++            skipped += 1
++            print(f"SKIP  {case['question']}  (expected answer not filled in yet)")
++            continue
++        try:
++            r = requests.post(f"{BASE}/chat", json={"message": case["question"]}, timeout=600)
++            data = r.json()
++        except Exception as error:
++            failed += 1
++            print(f"FAIL  {case['question']}\n      request failed: {error}")
++            continue
++        reply = data.get("reply", "")
++        problems = [f"missing '{e}'" for e in expected if e.lower() not in reply.lower()]
++        route = data.get("route")
++        if case.get("expect_route") and route != case["expect_route"]:
++            problems.append(f"route was {route}, expected {case['expect_route']}")
++        if problems:
++            failed += 1
++            print(f"FAIL  {case['question']}\n      " + "; ".join(problems))
++            print("      reply: " + reply.replace("\n", " ")[:300])
++        else:
++            passed += 1
++            print(f"PASS  {case['question']}")
++
++    print(f"\n{passed} passed, {failed} failed, {skipped} skipped")
++    return 1 if failed else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/backend/scripts/eval_questions.json b/backend/scripts/eval_questions.json
+new file mode 100644
+index 0000000..d2c1145
+--- /dev/null
++++ b/backend/scripts/eval_questions.json
+@@ -0,0 +1,58 @@
++[
++  {
++    "question": "Which contract has the highest financed amount?",
++    "expect_route": "structured",
++    "expect_contains": [
++      "TODO: highest amount you verified, e.g. $1,203,432.00"
++    ]
++  },
++  {
++    "question": "Which contract has the lowest financed amount?",
++    "expect_route": "structured",
++    "expect_contains": [
++      "TODO: lowest amount, e.g. $36,160.00"
++    ]
++  },
++  {
++    "question": "What is the financed amount of Contract_1.pdf?",
++    "expect_route": "structured",
++    "expect_contains": [
++      "$82,437.00"
++    ]
++  },
++  {
++    "question": "Who is the lender in Contract_1.pdf?",
++    "expect_route": "structured",
++    "expect_contains": [
++      "FINANCIAL BANK OF AMERICA"
++    ]
++  },
++  {
++    "question": "How many contracts are with FINANCIAL BANK OF AMERICA?",
++    "expect_route": "structured",
++    "expect_contains": [
++      "TODO: e.g. **12** contracts match"
++    ]
++  },
++  {
++    "question": "What is the monthly interest rate in Contract_1.pdf?",
++    "expect_route": "semantic",
++    "expect_contains": [
++      "1.2%"
++    ]
++  },
++  {
++    "question": "What penalty applies to late payment in Contract_1.pdf?",
++    "expect_route": "semantic",
++    "expect_contains": [
++      "2%"
++    ]
++  },
++  {
++    "question": "Which courts have jurisdiction in Contract_1.pdf?",
++    "expect_route": "semantic",
++    "expect_contains": [
++      "New York"
++    ]
++  }
++]
+diff --git a/backend/tests/conftest.py b/backend/tests/conftest.py
+new file mode 100644
+index 0000000..c5cbbfd
+--- /dev/null
++++ b/backend/tests/conftest.py
+@@ -0,0 +1,139 @@
++"""
++Test setup: the real app, with the LLM and the embedding model replaced
++by deterministic fakes so tests run offline, fast and identically every
++time. Data goes to a temporary folder, never to backend/data.
++
++Run from the backend folder:  python -m pytest -q
++"""
++import hashlib
++import json
++import math
++import os
++import re
++import sys
++import tempfile
++
++import pytest
++
++BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, BACKEND_DIR)
++FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
++
++_TMP = tempfile.mkdtemp(prefix="pact_tests_")
++os.environ["QDRANT_DATA_PATH"] = os.path.join(_TMP, "qdrant")
++
++import app.store as store_module  # noqa: E402
++
++store_module.DATA_DIR = _TMP
++store_module.DATA_FILE = os.path.join(_TMP, "analyses.json")
++
++import app.rag as rag_module  # noqa: E402
++
++
++def fake_embed(self, texts, kind="document"):
++    """Bag-of-words vectors: similar wording -> similar vectors."""
++    vectors = []
++    for text in texts:
++        text = text.split("Query:")[-1].lower()
++        v = [0.0] * 256
++        for word in re.findall(r"[a-z]{3,}", text):
++            v[int(hashlib.md5(word.encode()).hexdigest(), 16) % 256] += 1.0
++        norm = math.sqrt(sum(x * x for x in v)) or 1.0
++        vectors.append([x / norm for x in v])
++    return vectors
++
++
++rag_module.RAGStore.embed = fake_embed
++
++import app.mcp.llm_agent as llm_agent  # noqa: E402
++
++
++class FakeLLM:
++    """
++    Answers by schema: each structured call is identified by the JSON
++    schema's title. Tests override behavior through `handlers`:
++    handlers["ChatQuerySpec"] = lambda prompt: '{"kind": "semantic"}'
++    Every call is recorded in `calls` as (title or "text", prompt).
++    """
++
++    def __init__(self):
++        self.handlers = {}
++        self.calls = []
++        self.model = "fake"
++
++    def is_available(self):
++        return True
++
++    def invoke(self, prompt, system=None, temperature=0, json_schema=None):
++        title = (json_schema or {}).get("title") or "text"
++        self.calls.append((title, prompt))
++        if title in self.handlers:
++            return self.handlers[title](prompt)
++        if title == "ChatQuerySpec":
++            return json.dumps({"kind": "semantic"})
++        if title == "ContractMetadataExtraction":
++            return json.dumps({k: None for k in llm_agent.ContractMetadataExtraction.model_fields})
++        if title == "ClauseClassification":
++            return json.dumps({"domain": "Financial", "risk_level": "Medium", "reasons": ["test"], "key_metadata": {}})
++        if title == "ComplianceResponse":
++            ids = re.findall(r'"id": "([^"]+)"', prompt)
++            return json.dumps({"results": [{"id": i, "matched": False, "reason": "test"} for i in ids]})
++        if title == "ApplicabilityResponse":
++            return json.dumps({"contract_type": "asset financing agreement", "results": []})
++        if title == "ContractSummary":
++            return json.dumps({
++                "executive_summary": "summary", "key_obligations": [], "major_risks": [],
++                "recommendations": [], "overall_sentiment": "Balanced",
++            })
++        return "Answer from the sources [Source 1](#source-1)."
++
++
++FAKE = FakeLLM()
++llm_agent.get_llm_provider = lambda task="bulk": FAKE
++
++import app.main as main  # noqa: E402
++
++
++def fixture_text(name: str) -> str:
++    with open(os.path.join(FIXTURES, name), encoding="utf-8") as f:
++        return f.read()
++
++
++@pytest.fixture
++def fake_llm():
++    FAKE.handlers = {}
++    FAKE.calls = []
++    return FAKE
++
++
++@pytest.fixture
++def client(fake_llm):
++    """A clean app: empty store, empty search index, fake models."""
++    from fastapi.testclient import TestClient
++
++    if os.path.exists(store_module.DATA_FILE):
++        os.remove(store_module.DATA_FILE)
++    main.store = store_module.Store()
++    if main.rag is not None:
++        main.rag.reset()
++    return TestClient(main.app)
++
++
++TEST_POLICY = {
++    "policy_id": "test_policy",
++    "risk_threshold": 15,
++    "domains": [
++        {
++            "domain_name": "Financial",
++            "micro_policies": [
++                {"id": "1", "name": "Payment terms", "check": "payment terms stated", "risk_weight": 3}
++            ],
++        }
++    ],
++}
++
++
++def upload(client, filename: str, text: str) -> dict:
++    response = client.post("/upload", files={"file": (filename, text.encode("utf-8"), "text/plain")})
++    assert response.status_code == 200, response.text
++    return response.json()
+diff --git a/backend/tests/fixtures/carlos_brown_real_estate.txt b/backend/tests/fixtures/carlos_brown_real_estate.txt
+new file mode 100644
+index 0000000..922931c
+--- /dev/null
++++ b/backend/tests/fixtures/carlos_brown_real_estate.txt
+@@ -0,0 +1,16 @@
++REAL ESTATE FINANCING AGREEMENT BORROWER: Carlos Brown, residing at 456 Central Avenue - Los Angeles, CA, holder of SSN nº 867542169. LENDER: FINANCIAL BANK OF AMERICA Inc., registered under EIN nº 00-0000000, headquartered at 1000 Main Avenue, New York, NY. FINANCED AMOUNT: $1,203,432. CLAUSE ONE – PURPOSE: This agreement aims to grant financing to the BORROWER for the
++acquisition of the asset described in the preamble.
++CLAUSE TWO – TERM: The financing period shall be up to 60 months, unless otherwise agreed
++upon by the parties.
++CLAUSE THREE – PAYMENT: The BORROWER shall pay monthly installments, increased by
++interest of 1.2% per month and corrected annually by the Consumer Price Index (CPI).
++CLAUSE FOUR – GUARANTEES: The financed asset will remain under fiduciary lien in favor of
++the BANK until full settlement.
++CLAUSE FIVE – INSURANCE: The BORROWER must contract mandatory insurance for the
++financed asset, with minimum coverage as required by current legislation.
++CLAUSE SIX – DEFAULT: Payment delay will result in a penalty of 2% on the installment, late
++interest of 1% per month, and possible execution of the guarantee.
++CLAUSE SEVEN – TERMINATION: Breach of obligations will result in termination of the
++agreement and enforcement of the guarantees, regardless of notification.
++CLAUSE EIGHT – JURISDICTION: The parties elect the Courts of New York, NY, to settle any
++disputes arising from this agreement.
+diff --git a/backend/tests/fixtures/contract_1.txt b/backend/tests/fixtures/contract_1.txt
+new file mode 100644
+index 0000000..7c647f0
+--- /dev/null
++++ b/backend/tests/fixtures/contract_1.txt
+@@ -0,0 +1 @@
++CAR FINANCING AGREEMENT BORROWER: Carlos Brown, residing at 1500 Brazil Avenue - Boston, MA, holder of SSN nº 360132173. LENDER: FINANCIAL BANK OF AMERICA Inc., registered under EIN nº 00-0000000, headquartered at 1000 Main Avenue, New York, NY. FINANCED AMOUNT: $82,437.00. CLAUSE ONE – PURPOSE: This agreement aims to grant financing to the BORROWER for the acquisition of the asset described in the preamble. CLAUSE TWO – TERM: The financing period shall be up to 60 months, unless otherwise agreed upon by the parties. CLAUSE THREE – PAYMENT: The BORROWER shall pay monthly installments, increased by interest of 1.2% per month and corrected annually by the Consumer Price Index (CPI). CLAUSE FOUR – GUARANTEES: The financed asset will remain under fiduciary lien in favor of the BANK until full settlement. CLAUSE FIVE – INSURANCE: The BORROWER must contract mandatory insurance for the financed asset, with minimum coverage as required by current legislation. CLAUSE SIX – DEFAULT: Payment delay will result in a penalty of 2% on the installment, late interest of 1% per month, and possible execution of the guarantee. CLAUSE SEVEN – TERMINATION: Breach of obligations will result in termination of the agreement and enforcement of the guarantees, regardless of notification. CLAUSE EIGHT – JURISDICTION: The parties elect the Courts of New York, NY, to settle any disputes arising from this agreement.
+diff --git a/backend/tests/fixtures/julia_miller.txt b/backend/tests/fixtures/julia_miller.txt
+new file mode 100644
+index 0000000..dd06eb5
+--- /dev/null
++++ b/backend/tests/fixtures/julia_miller.txt
+@@ -0,0 +1,22 @@
++HEALTH FINANCING AGREEMENT
++BORROWER: Julia Miller, residing at 1000 Main Avenue - Chicago, IL, holder of SSN nº
++913053758.
++LENDER: FINANCIAL BANK OF AMERICA Inc., registered under EIN nº 00-0000000,
++headquartered at 1000 Main Avenue, New York, NY.
++FINANCED AMOUNT: $45,892.00.
++CLAUSE ONE – PURPOSE: This agreement aims to grant financing to the BORROWER for the
++acquisition of the asset described in the preamble.
++CLAUSE TWO – TERM: The financing period shall be up to 60 months, unless otherwise agreed
++upon by the parties.
++CLAUSE THREE – PAYMENT: The BORROWER shall pay monthly installments, increased by
++interest of 1.2% per month and corrected annually by the Consumer Price Index (CPI).
++CLAUSE FOUR – GUARANTEES: The financed asset will remain under fiduciary lien in favor of
++the BANK until full settlement.
++CLAUSE FIVE – INSURANCE: The BORROWER must contract mandatory insurance for the
++financed asset, with minimum coverage as required by current legislation.
++CLAUSE SIX – DEFAULT: Payment delay will result in a penalty of 2% on the installment, late
++interest of 1% per month, and possible execution of the guarantee.
++CLAUSE SEVEN – TERMINATION: Breach of obligations will result in termination of the
++agreement and enforcement of the guarantees, regardless of notification.
++CLAUSE EIGHT – JURISDICTION: The parties elect the Courts of New York, NY, to settle any
++disputes arising from this agreement.
+diff --git a/backend/tests/fixtures/no_preamble.txt b/backend/tests/fixtures/no_preamble.txt
+new file mode 100644
+index 0000000..5b83def
+--- /dev/null
++++ b/backend/tests/fixtures/no_preamble.txt
+@@ -0,0 +1,16 @@
++CLAUSE ONE – PURPOSE: This agreement aims to grant financing to the BORROWER for the
++acquisition of the asset described in the preamble.
++CLAUSE TWO – TERM: The financing period shall be up to 60 months, unless otherwise agreed
++upon by the parties.
++CLAUSE THREE – PAYMENT: The BORROWER shall pay monthly installments, increased by
++interest of 1.2% per month and corrected annually by the Consumer Price Index (CPI).
++CLAUSE FOUR – GUARANTEES: The financed asset will remain under fiduciary lien in favor of
++the BANK until full settlement.
++CLAUSE FIVE – INSURANCE: The BORROWER must contract mandatory insurance for the
++financed asset, with minimum coverage as required by current legislation.
++CLAUSE SIX – DEFAULT: Payment delay will result in a penalty of 2% on the installment, late
++interest of 1% per month, and possible execution of the guarantee.
++CLAUSE SEVEN – TERMINATION: Breach of obligations will result in termination of the
++agreement and enforcement of the guarantees, regardless of notification.
++CLAUSE EIGHT – JURISDICTION: The parties elect the Courts of New York, NY, to settle any
++disputes arising from this agreement.
+diff --git a/backend/tests/test_api.py b/backend/tests/test_api.py
+new file mode 100644
+index 0000000..3fb1719
+--- /dev/null
++++ b/backend/tests/test_api.py
+@@ -0,0 +1,149 @@
++"""End-to-end through the HTTP API, with fake models."""
++import json
++import os
++import time
++from concurrent.futures import ThreadPoolExecutor
++
++from conftest import TEST_POLICY, fixture_text, upload
++
++import app.main as main
++import app.store as store_module
++
++
++def spec(**kw):
++    return json.dumps({"kind": "structured", "operation": "list", "sort_by": None,
++                       "order": "desc", "limit": None, "filters": []} | kw)
++
++
++def load_three(client):
++    ids = {}
++    for name in ("contract_1.txt", "julia_miller.txt", "carlos_brown_real_estate.txt"):
++        ids[name] = upload(client, name, fixture_text(name))["analysis_id"]
++    return ids
++
++
++def test_upload_stores_header_and_grounded_metadata(client):
++    info = upload(client, "julia_miller.txt", fixture_text("julia_miller.txt"))
++    assert info["total_clauses"] == 8
++    assert info["parse_quality"]["ok"]
++    record = main.store.get_analysis(info["analysis_id"])
++    assert record["header"]["text"].endswith("FINANCED AMOUNT: $45,892.00.")
++    assert record["contract_metadata"]["contract_value"] == 45892.0
++    assert record["contract_metadata"]["lender_name"] == "FINANCIAL BANK OF AMERICA Inc"
++    assert main.rag.count() == 9  # header + 8 clauses
++
++
++def test_header_is_never_risk_scored(client):
++    aid = upload(client, "julia_miller.txt", fixture_text("julia_miller.txt"))["analysis_id"]
++    result = client.post("/analyze", json={"analysis_id": aid, "policy": TEST_POLICY}).json()
++    assert result["total_clauses"] == 8
++    assert all("FINANCED AMOUNT" not in c["text"] for c in result["results"])
++    assert main.store.get_analysis(aid)["policy_used"]["policy_id"] == "test_policy"
++
++
++def test_same_file_uploaded_twice_is_one_record(client):
++    first = upload(client, "julia_miller.txt", fixture_text("julia_miller.txt"))
++    second = upload(client, "julia_miller (1).txt", fixture_text("julia_miller.txt"))
++    assert second["analysis_id"] == first["analysis_id"]
++    assert second["reprocessed"] and not second["clauses_changed"]
++    assert len(main.store.list_analyses()) == 1
++    assert main.rag.count() == 9
++
++
++def test_structured_question_is_answered_exactly(client, fake_llm):
++    load_three(client)
++    fake_llm.handlers["ChatQuerySpec"] = lambda p: spec(sort_by="contract_value", order="desc", limit=1)
++    r = client.post("/chat", json={"message": "which contract has the highest financed amount"}).json()
++    assert r["route"] == "structured"
++    assert "**carlos_brown_real_estate.txt** has the highest amount: **$1,203,432.00**" in r["reply"]
++    assert r["sources"][0]["clause_id"] == "header"
++    assert "FINANCED AMOUNT: $1,203,432" in r["sources"][0]["text"]
++    # no free-text LLM call was needed to produce the answer
++    assert [c[0] for c in fake_llm.calls if c[0] == "text"] == []
++
++
++def test_follow_up_sees_the_conversation(client, fake_llm):
++    load_three(client)
++    fake_llm.handlers["ChatQuerySpec"] = lambda p: (
++        spec(sort_by="contract_value", order="asc", limit=1) if "highest" in p else json.dumps({"kind": "semantic"})
++    )
++    history = [
++        {"role": "user", "content": "which contract has the highest financed amount"},
++        {"role": "assistant", "content": "carlos_brown_real_estate.txt"},
++    ]
++    r = client.post("/chat", json={"message": "and the lowest?", "history": history}).json()
++    assert "**julia_miller.txt** has the lowest amount: **$45,892.00**" in r["reply"]
++
++
++def test_semantic_question_on_one_contract_uses_whole_contract(client, fake_llm):
++    ids = load_three(client)
++    r = client.post("/chat", json={
++        "message": "what interest applies on late payment?",
++        "analysis_id": ids["julia_miller.txt"],
++        "history": [{"role": "user", "content": "earlier question"}],
++    }).json()
++    assert r["route"] == "semantic"
++    prompt = [c[1] for c in fake_llm.calls if c[0] == "text"][-1]
++    assert "CLAUSE SIX" in prompt and "CLAUSE EIGHT" in prompt and "FINANCED AMOUNT" in prompt
++    assert "Conversation so far" in prompt and "earlier question" in prompt
++    assert r["sources"][0]["clause_id"] == "header"
++
++
++def test_router_failure_falls_back_to_search(client, fake_llm):
++    load_three(client)
++    fake_llm.handlers["ChatQuerySpec"] = lambda p: "not json at all"
++    r = client.post("/chat", json={"message": "what does the insurance clause require?"}).json()
++    assert r["route"] == "semantic"
++    assert r["sources"]
++
++
++def test_reasoning_text_is_stripped_from_answers(client, fake_llm):
++    load_three(client)
++    fake_llm.handlers["text"] = lambda p: "<think>let me think</think>The penalty is 2% [Source 1](#source-1)."
++    r = client.post("/chat", json={"message": "what is the default penalty?"}).json()
++    assert r["reply"] == "The penalty is 2% [Source 1](#source-1)."
++
++
++def test_reindex_rebuilds_and_reanalyzes_changed_contracts(client, fake_llm):
++    ids = load_three(client)
++    aid = ids["contract_1.txt"]
++    client.post("/analyze", json={"analysis_id": aid, "policy": TEST_POLICY})
++    # Simulate a record made by the old parser: one giant clause.
++    main.store.update_analysis(aid, {"clauses": [{"id": 1, "text": fixture_text("contract_1.txt"), "metadata": {}}]})
++
++    assert client.post("/admin/reindex").json()["started"]
++    for _ in range(200):
++        status = client.get("/admin/reindex/status").json()
++        if not status["running"]:
++            break
++        time.sleep(0.05)
++    assert status["phase"] == "finished", status
++    assert all(r["ok"] for r in status["results"])
++    assert status["reanalyzed"] == ["contract_1.txt"]
++    record = main.store.get_analysis(aid)
++    assert len(record["clauses"]) == 8 and record["status"] == "analyzed"
++    assert main.rag.count() == 27
++
++
++def test_duplicates_are_reported_and_optionally_removed(client):
++    ids = load_three(client)
++    # An old duplicate record (made before uploads were de-duplicated).
++    dup_id = main.store.save_analysis(dict(main.store.get_analysis(ids["julia_miller.txt"]), analysis_id=None,
++                                           created_at="2020-01-01T00:00:00Z", updated_at="2020-01-01T00:00:00Z"))
++    client.post("/admin/reindex?remove_duplicates=true&reanalyze=none")
++    for _ in range(200):
++        status = client.get("/admin/reindex/status").json()
++        if not status["running"]:
++            break
++        time.sleep(0.05)
++    assert status["removed_duplicates"] == [dup_id]
++    assert main.store.get_analysis(dup_id) is None
++    assert len(main.store.list_analyses()) == 3
++
++
++def test_concurrent_store_updates_are_not_lost(tmp_path):
++    store = store_module.Store()
++    ids = [store.save_analysis({"filename": f"c{i}"}) for i in range(40)]
++    with ThreadPoolExecutor(8) as ex:
++        list(ex.map(lambda i: store.update_analysis(i, {"contract_metadata": {"v": 1}}), ids))
++    assert all(store.get_analysis(i).get("contract_metadata") for i in ids)
+diff --git a/backend/tests/test_chat_router.py b/backend/tests/test_chat_router.py
+new file mode 100644
+index 0000000..8c111d0
+--- /dev/null
++++ b/backend/tests/test_chat_router.py
+@@ -0,0 +1,93 @@
++from app.chat_router import execute_spec, sources_for_rows
++from app.schemas import ChatQuerySpec
++
++
++def record(i, filename, value, currency="USD", lender="FINANCIAL BANK OF AMERICA Inc", customer="X", end=None):
++    return {
++        "analysis_id": f"id{i}",
++        "filename": filename,
++        "header": {"text": f"header of {filename}", "page": 1},
++        "contract_metadata": {
++            "contract_value": value, "currency": currency, "lender_name": lender,
++            "customer_name": customer, "end_date": end,
++        },
++    }
++
++
++# Values seen in the real chat transcripts.
++DATA = [
++    record(1, "Contract_1.pdf", 82437),
++    record(2, "Contract_12.pdf", 1203432, customer="Carlos Brown", end="2027-03-01"),
++    record(3, "Contract_3.pdf", 75546, end="2026-01-10"),
++    record(4, "Contract_31.pdf", 76877),
++    record(5, "Contract_5.pdf", 45892, customer="Julia Miller"),
++    record(6, "test.txt", None, lender=None),
++]
++
++
++def run(**spec):
++    return execute_spec(ChatQuerySpec(kind="structured", **spec), DATA)
++
++
++def test_highest_amount():
++    r = run(sort_by="contract_value", order="desc", limit=1)
++    assert [a["filename"] for a in r["rows"]] == ["Contract_12.pdf"]
++    assert "**Contract_12.pdf** has the highest amount: **$1,203,432.00**" in r["answer"]
++
++
++def test_lowest_amount():
++    r = run(sort_by="contract_value", order="asc", limit=1)
++    assert [a["filename"] for a in r["rows"]] == ["Contract_5.pdf"]
++
++
++def test_full_ranking_is_strictly_ordered():
++    # The chatbot once listed 76,877 below 75,546 in a "descending" table.
++    r = run(sort_by="contract_value", order="desc")
++    values = [a["contract_metadata"]["contract_value"] for a in r["rows"]]
++    assert values == sorted(values, reverse=True)
++    assert "test.txt" in r["answer"]  # named as having no amount, not silently dropped
++
++
++def test_ties_at_the_cut_off_are_all_shown():
++    data = DATA + [record(7, "Contract_9.pdf", 45892)]
++    r = execute_spec(ChatQuerySpec(kind="structured", sort_by="contract_value", order="asc", limit=1), data)
++    assert {a["filename"] for a in r["rows"]} == {"Contract_5.pdf", "Contract_9.pdf"}
++    assert "tied" in r["answer"]
++
++
++def test_currencies_are_never_compared():
++    data = DATA + [record(8, "India_loan.pdf", 5000000, currency="INR")]
++    r = execute_spec(ChatQuerySpec(kind="structured", sort_by="contract_value", order="desc", limit=1), data)
++    assert {a["filename"] for a in r["rows"]} == {"Contract_12.pdf", "India_loan.pdf"}
++    assert "aren't compared" in r["answer"]
++    r = execute_spec(ChatQuerySpec(kind="structured", operation="sum"), data)
++    assert "$1,484,184.00" in r["answer"] and "₹5,000,000.00" in r["answer"]
++
++
++def test_named_contract_lookup_does_not_match_similar_names():
++    r = run(filters=[{"field": "filename", "op": "contains", "value": "Contract_3"}])
++    assert [a["filename"] for a in r["rows"]] == ["Contract_3.pdf"]
++
++
++def test_count_with_filter_reports_unknowns():
++    r = run(operation="count", filters=[{"field": "lender_name", "op": "contains", "value": "financial bank of america"}])
++    assert "**5** contracts match" in r["answer"]
++    assert "test.txt" in r["answer"]
++
++
++def test_date_filter():
++    r = run(sort_by="end_date", order="asc", filters=[{"field": "end_date", "op": "before", "value": "2027"}])
++    assert [a["filename"] for a in r["rows"]] == ["Contract_3.pdf"]
++
++
++def test_amount_filter():
++    r = run(sort_by="contract_value", filters=[{"field": "contract_value", "op": "greater_than", "value": "$80,000"}])
++    assert [a["filename"] for a in r["rows"]] == ["Contract_12.pdf", "Contract_1.pdf"]
++
++
++def test_sources_point_to_headers_in_answer_order():
++    r = run(sort_by="contract_value", order="desc", limit=2)
++    sources = sources_for_rows(r["rows"])
++    assert [(s["source_number"], s["filename"], s["clause_id"]) for s in sources] == [
++        (1, "Contract_12.pdf", "header"), (2, "Contract_1.pdf", "header"),
++    ]
+diff --git a/backend/tests/test_extraction.py b/backend/tests/test_extraction.py
+new file mode 100644
+index 0000000..f462935
+--- /dev/null
++++ b/backend/tests/test_extraction.py
+@@ -0,0 +1,78 @@
++import json
++
++from conftest import fixture_text
++
++from app.mcp.llm_agent import LLMClient, ground_metadata
++from app.schemas import ClauseClassification, ContractMetadataExtraction
++
++NULLS = {k: None for k in ContractMetadataExtraction.model_fields}
++
++
++def extract(fake_llm, text, reply):
++    fake_llm.handlers["ContractMetadataExtraction"] = lambda prompt: reply
++    return LLMClient().extract_contract_metadata(text, "c.pdf")
++
++
++def test_document_label_overrides_wrong_model_amount(fake_llm):
++    meta = extract(fake_llm, fixture_text("julia_miller.txt"),
++                   json.dumps(NULLS | {"contract_value": 1201349, "lender_name": "Chase Bank"}))
++    assert meta["contract_value"] == 45892.0
++    assert meta["lender_name"] == "FINANCIAL BANK OF AMERICA Inc"
++    assert meta["field_sources"]["contract_value"] == "document label 'FINANCED AMOUNT'"
++    assert any("1,201,349" in w for w in meta["extraction_warnings"])
++
++
++def test_invented_amount_and_name_are_discarded(fake_llm):
++    doc = "Service agreement between Acme Ltd and Beta LLC. Fees total USD 12,500 per year. CLAUSE ONE - SCOPE: services."
++    meta = extract(fake_llm, doc, json.dumps(NULLS | {"contract_value": 99999, "customer_name": "Gamma Inc"}))
++    assert meta["contract_value"] is None
++    assert meta["customer_name"] is None
++    assert len(meta["extraction_warnings"]) == 2
++
++
++def test_model_amount_found_in_text_is_kept(fake_llm):
++    doc = "Service agreement between Acme Ltd and Beta LLC. Fees total USD 12,500 per year. CLAUSE ONE - SCOPE: services."
++    meta = extract(fake_llm, doc, json.dumps(NULLS | {"contract_value": "12,500", "customer_name": "Beta LLC"}))
++    assert meta["contract_value"] == 12500.0
++    assert meta["currency"] == "USD"
++    assert meta["customer_name"] == "Beta LLC"
++
++
++def test_invalid_reply_is_retried_once(fake_llm):
++    replies = iter(["<think>...</think> not json", json.dumps(NULLS | {"customer_name": "Julia Miller"})])
++    fake_llm.handlers["ContractMetadataExtraction"] = lambda prompt: next(replies)
++    meta = LLMClient().extract_contract_metadata(fixture_text("julia_miller.txt"))
++    calls = [c for c in fake_llm.calls if c[0] == "ContractMetadataExtraction"]
++    assert len(calls) == 2
++    assert "rejected" in calls[1][1]
++    assert meta["extraction_method"] == "llm"
++
++
++def test_model_failure_falls_back_and_is_still_grounded(fake_llm):
++    meta = extract(fake_llm, fixture_text("julia_miller.txt"), "garbage")
++    assert meta["extraction_method"] == "local_fallback"
++    assert meta["contract_value"] == 45892.0
++    assert meta["lender_name"] == "FINANCIAL BANK OF AMERICA Inc"
++
++
++def test_non_iso_dates_are_discarded():
++    meta = ground_metadata({"start_date": "Sept 2024", "end_date": "2027-01-31"}, "no labels here")
++    assert meta["start_date"] is None
++    assert meta["end_date"] == "2027-01-31"
++
++
++def test_classification_is_marked_llm_or_fallback(fake_llm):
++    result = LLMClient().classify_clause("CLAUSE SIX - DEFAULT: penalty of 2%", {})
++    assert result["method"] == "llm"
++    fake_llm.handlers["ClauseClassification"] = lambda prompt: "nonsense"
++    result = LLMClient().classify_clause("CLAUSE SIX - DEFAULT: penalty of 2%", {})
++    assert result["method"] == "keyword_fallback"
++
++
++def test_schema_normalizes_harmless_formatting():
++    c = ClauseClassification.model_validate(
++        {"domain": "financial", "risk_level": "high", "reasons": "one reason", "key_metadata": {"rate": 1.2}}
++    )
++    assert (c.domain, c.risk_level, c.reasons, c.key_metadata) == ("Financial", "High", ["one reason"], {"rate": "1.2"})
++    m = ContractMetadataExtraction.model_validate(NULLS | {"contract_value": "$1,203,432.00", "customer_name": "unknown"})
++    assert m.contract_value == 1203432.0 and m.customer_name is None
+diff --git a/backend/tests/test_parsing.py b/backend/tests/test_parsing.py
+new file mode 100644
+index 0000000..9ee9f8f
+--- /dev/null
++++ b/backend/tests/test_parsing.py
+@@ -0,0 +1,85 @@
++from conftest import fixture_text
++
++from app.parser import (
++    coverage_report,
++    extract_labeled_facts,
++    find_money_amounts,
++    split_document,
++)
++
++
++def test_header_is_separated_from_clauses():
++    header, clauses = split_document(fixture_text("julia_miller.txt"))
++    assert header.startswith("HEALTH FINANCING AGREEMENT BORROWER: Julia Miller")
++    assert header.endswith("FINANCED AMOUNT: $45,892.00.")
++    assert len(clauses) == 8
++    assert clauses[0].startswith("CLAUSE ONE")
++    assert clauses[-1].startswith("CLAUSE EIGHT")
++    assert all("FINANCED AMOUNT" not in c for c in clauses)
++
++
++def test_single_line_pdf_text_is_split(  # Contract_1 was once stored as one giant clause
++):
++    header, clauses = split_document(fixture_text("contract_1.txt"))
++    assert "FINANCED AMOUNT: $82,437.00." in header
++    assert len(clauses) == 8
++    assert all(len(c) < 300 for c in clauses)
++
++
++def test_cents_are_not_cut_off_before_a_heading():
++    header, _ = split_document("FINANCED AMOUNT: $45,892.00.\nCLAUSE ONE – PURPOSE: Financing for the asset described.")
++    assert header == "FINANCED AMOUNT: $45,892.00."
++
++
++def test_document_without_preamble_has_no_header():
++    header, clauses = split_document(fixture_text("no_preamble.txt"))
++    assert header is None
++    assert len(clauses) == 8
++
++
++def test_title_only_preamble_is_not_a_header():
++    header, clauses = split_document(
++        "AGREEMENT\nCLAUSE ONE – PURPOSE: This agreement aims to grant financing to the BORROWER.\n"
++        "CLAUSE TWO – TERM: The financing period shall be up to 60 months."
++    )
++    assert header is None
++    assert len(clauses) == 2
++
++
++def test_coverage_is_complete_for_real_template():
++    text = fixture_text("julia_miller.txt")
++    header, clauses = split_document(text)
++    assert coverage_report(text, header, clauses)["ok"]
++
++
++def test_coverage_flags_dropped_content():
++    text = fixture_text("julia_miller.txt")
++    header, clauses = split_document(text)
++    report = coverage_report(text, header, clauses[:3])
++    assert not report["ok"]
++    assert "jurisdiction" in report["missing_sample"] or report["ratio"] < 0.95
++
++
++def test_labeled_facts_from_template():
++    facts = extract_labeled_facts(fixture_text("julia_miller.txt"))
++    assert facts["contract_value"] == 45892.0
++    assert facts["currency"] == "USD"
++    assert facts["contract_value_text"] == "$45,892.00"
++    assert facts["lender_name"] == "FINANCIAL BANK OF AMERICA Inc"
++    assert facts["customer_name"] == "Julia Miller"
++
++
++def test_labeled_amount_without_cents():
++    facts = extract_labeled_facts(fixture_text("carlos_brown_real_estate.txt"))
++    assert facts["contract_value"] == 1203432.0
++    assert facts["customer_name"] == "Carlos Brown"
++
++
++def test_generic_party_labels_are_not_names():
++    facts = extract_labeled_facts("Agreement between the BANK and the BORROWER. LENDER: the Bank, as defined.")
++    assert "lender_name" not in facts
++
++
++def test_money_amounts_in_several_formats():
++    found = {(a["value"], a["currency"]) for a in find_money_amounts("INR 5,00,000 and 1200 USD and ₹1,20,000.50 and $9.99")}
++    assert found == {(500000.0, "INR"), (1200.0, "USD"), (120000.5, "INR"), (9.99, "USD")}
+diff --git a/src/components/DocumentViewer.tsx b/src/components/DocumentViewer.tsx
+index 49840ee..8a97fad 100644
+--- a/src/components/DocumentViewer.tsx
++++ b/src/components/DocumentViewer.tsx
+@@ -74,8 +74,14 @@ export default function DocumentViewer({
+     );
+   }
+ 
+-  const clauses: Array<{ id: string | number; text: string; page?: number }> =
+-    data.results ?? data.clauses ?? [];
++  // The contract header (parties, lender, financed amount) is shown and
++  // can be highlighted like a clause, but it is not one of the clauses.
++  const header: { id: string; text: string; page?: number } | null =
++    data.header?.text ? { id: "header", text: data.header.text, page: data.header.page } : null;
++  const clauses: Array<{ id: string | number; text: string; page?: number }> = [
++    ...(header ? [header] : []),
++    ...(data.results ?? data.clauses ?? []),
++  ];
+ 
+   const filename: string = data.filename ?? "Contract";
+ 
+@@ -120,7 +126,7 @@ export default function DocumentViewer({
+           <span className="truncate text-sm font-semibold">{filename}</span>
+         </div>
+         <p className="mt-0.5 text-xs text-muted-foreground">
+-          {clauses.length} clause{clauses.length !== 1 ? "s" : ""} · original file unavailable
++          {clauses.length - (header ? 1 : 0)} clause{clauses.length - (header ? 1 : 0) !== 1 ? "s" : ""} · original file unavailable
+         </p>
+       </div>
+ 
+@@ -135,7 +141,7 @@ export default function DocumentViewer({
+             className="group relative rounded-md border border-border/40 bg-background p-4 text-sm leading-relaxed transition-colors hover:border-border"
+           >
+             <span className="mb-2 inline-block rounded bg-muted px-1.5 py-0.5 text-[10px] font-bold text-muted-foreground">
+-              §{clause.id}
++              {clause.id === "header" ? "Header" : `§${clause.id}`}
+             </span>
+             <p className="whitespace-pre-wrap text-foreground/90">{clause.text}</p>
+           </div>
+diff --git a/src/pages/Chat.tsx b/src/pages/Chat.tsx
+index 5676e1b..ad7bf77 100644
+--- a/src/pages/Chat.tsx
++++ b/src/pages/Chat.tsx
+@@ -36,7 +36,8 @@ interface Source {
+   filename?: string;
+   clause_id?: string | number;
+   text: string;
+-  score?: number;
++  score?: number | null;
++  kind?: "header" | "clause";
+ }
+ 
+ interface Message {
+@@ -177,7 +178,10 @@ export default function Chat() {
+         setSelectedAnalysisId(source.analysis_id);
+       }
+       if (source.clause_id != null) {
+-        // Slight delay to allow the doc viewer to load after analysis switch
++        // Clear first so clicking the same reference again (or the same
++        // clause number in another contract) still re-triggers the
++        // highlight; the delay lets the viewer load a switched contract.
++        setHighlightedClauseId(null);
+         setTimeout(() => setHighlightedClauseId(source.clause_id!), 150);
+       }
+     },
+@@ -193,11 +197,19 @@ export default function Chat() {
+     setIsLoading(true);
+ 
+     try {
++      // Recent turns (before this question) so the assistant can follow
++      // up on and correct its own earlier answers.
++      const history = messages
++        .filter((m) => m.content && m.content.trim())
++        .slice(-8)
++        .map((m) => ({ role: m.role, content: m.content.slice(0, 2000) }));
++
+       const requestBody: {
+         message: string;
+         top_k: number;
+         analysis_id?: string;
+-      } = { message: question, top_k: 5 };
++        history: { role: string; content: string }[];
++      } = { message: question, top_k: 5, history };
+ 
+       if (selectedAnalysisId !== "all") {
+         requestBody.analysis_id = selectedAnalysisId;
+@@ -413,7 +425,11 @@ export default function Chat() {
+                                   </p>
+                                   <div className="mt-1 flex flex-wrap gap-x-3 text-[10px] text-muted-foreground">
+                                     {source.clause_id != null && (
+-                                      <span>Clause {source.clause_id}</span>
++                                      <span>
++                                        {source.clause_id === "header"
++                                          ? "Contract header"
++                                          : `Clause ${source.clause_id}`}
++                                      </span>
+                                     )}
+                                     {typeof source.score === "number" && (
+                                       <span>
+@@ -421,7 +437,9 @@ export default function Chat() {
+                                       </span>
+                                     )}
+                                     <span className="font-medium text-primary group-hover:underline">
+-                                      Jump to clause →
++                                      {source.clause_id === "header"
++                                        ? "Jump to source →"
++                                        : "Jump to clause →"}
+                                     </span>
+                                   </div>
+                                 </div>

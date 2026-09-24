@@ -2,8 +2,18 @@ from typing import Any, Dict, List, Optional
 import json
 import re
 
+from pydantic import BaseModel, ValidationError
+
 from .utils import MCPConfig, mcp_post
-from ..llm_providers import get_llm_provider
+from ..llm_providers import get_llm_provider, LLMError
+from ..parser import extract_labeled_facts, find_money_amounts
+from ..schemas import (
+    ApplicabilityResponse,
+    ClauseClassification,
+    ComplianceResponse,
+    ContractMetadataExtraction,
+    ContractSummary,
+)
 
 
 DOMAINS = [
@@ -46,6 +56,7 @@ CONTRACT_METADATA_KEYS = {
     "start_date",
     "end_date",
     "contract_value",
+    "contract_value_text",
     "currency",
     "ip_shared_with_customer",
     "indemnification_clause_present",
@@ -636,6 +647,7 @@ def normalize_contract_metadata(result: Dict[str, Any]) -> Dict[str, Any]:
         "start_date": _clean_optional_date(result.get("start_date")),
         "end_date": _clean_optional_date(result.get("end_date")),
         "contract_value": contract_value,
+        "contract_value_text": _clean_optional_str(result.get("contract_value_text")),
         "currency": _clean_optional_str(result.get("currency")),
         "ip_shared_with_customer": _clean_optional_bool(
             result.get("ip_shared_with_customer")
@@ -649,16 +661,160 @@ def normalize_contract_metadata(result: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _norm_name(value: str) -> str:
+    value = re.sub(r"[^a-z0-9 ]", " ", (value or "").lower())
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def ground_metadata(meta: Dict[str, Any], text: str) -> Dict[str, Any]:
+    """
+    Check extracted metadata against the document itself.
+
+    - A value the document states under an explicit label (e.g.
+      "FINANCED AMOUNT: $45,892.00", "LENDER: ...") always wins over a
+      model's reading of it.
+    - Otherwise a model-read amount must appear in the document as an
+      actual currency amount, and a model-read party name must appear
+      in the text. Anything that can't be found is discarded (set to
+      null) rather than stored, because a wrong amount or party is
+      worse than a missing one in a legal tool.
+
+    Records where each value came from in "field_sources", and anything
+    discarded or overridden in "extraction_warnings", so a reviewer can
+    see why a field is empty or different from what the model said.
+    """
+    meta = dict(meta)
+    facts = extract_labeled_facts(text)
+    norm_text = _norm_name(text)
+    sources: Dict[str, str] = {}
+    warnings: List[str] = []
+    model_method = meta.get("extraction_method", "llm")
+    model_label = "model" if model_method == "llm" else "pattern match"
+
+    # Amount ---------------------------------------------------------
+    model_value = meta.get("contract_value")
+    if isinstance(model_value, str):
+        try:
+            model_value = float(model_value.replace(",", ""))
+        except ValueError:
+            model_value = None
+    if "contract_value" in facts:
+        if model_value is not None and abs(model_value - facts["contract_value"]) > 0.005:
+            warnings.append(
+                f"The {model_label} read the amount as {model_value:,.2f}; the document's "
+                f"'{facts['contract_value_label']}' line says {facts['contract_value_text']}. "
+                "Using the document."
+            )
+        meta["contract_value"] = facts["contract_value"]
+        meta["currency"] = facts["currency"]
+        meta["contract_value_text"] = facts["contract_value_text"]
+        sources["contract_value"] = f"document label '{facts['contract_value_label']}'"
+    elif model_value is not None:
+        matches = [a for a in find_money_amounts(text) if abs(a["value"] - model_value) < 0.005]
+        if matches:
+            meta["contract_value"] = model_value
+            meta["contract_value_text"] = matches[0]["text"]
+            meta["currency"] = meta.get("currency") or matches[0]["currency"]
+            sources["contract_value"] = f"{model_label}, found in text as {matches[0]['text']}"
+        else:
+            warnings.append(
+                f"The {model_label} reported an amount of {model_value:,.2f}, which does not "
+                "appear in the document as a currency amount. Discarded."
+            )
+            meta["contract_value"] = None
+            meta["contract_value_text"] = None
+            meta["currency"] = None
+    else:
+        meta["contract_value"] = None
+
+    # Parties --------------------------------------------------------
+    for key, label in (("customer_name", "customer/borrower"), ("lender_name", "lender")):
+        model_name = meta.get(key)
+        if key in facts:
+            if model_name and _norm_name(model_name) not in _norm_name(facts[key]) \
+                    and _norm_name(facts[key]) not in _norm_name(model_name):
+                warnings.append(
+                    f"The {model_label} read the {label} as '{model_name}'; the document's "
+                    f"label says '{facts[key]}'. Using the document."
+                )
+            meta[key] = facts[key]
+            sources[key] = "document label"
+        elif model_name:
+            if _norm_name(model_name) and _norm_name(model_name) in norm_text:
+                sources[key] = f"{model_label}, found in text"
+            else:
+                warnings.append(
+                    f"The {model_label} named the {label} '{model_name}', which does not "
+                    "appear in the document. Discarded."
+                )
+                meta[key] = None
+
+    # Dates must be ISO so they sort and compare correctly.
+    for key in ("start_date", "end_date"):
+        value = meta.get(key)
+        if value and not _DATE_RE.match(str(value)):
+            warnings.append(f"{key} '{value}' is not a YYYY-MM-DD date. Discarded.")
+            meta[key] = None
+
+    meta["field_sources"] = sources
+    meta["extraction_warnings"] = warnings
+    return meta
+
+
 class LLMClient:
     def __init__(self) -> None:
         self.cfg = MCPConfig()
 
-    def _get_provider(self):
+    def _get_provider(self, task: str = "bulk"):
         """
-        Return the currently configured LLM provider.
+        Provider for a task tier: "bulk" (many small per-clause calls)
+        or "quality" (per-contract extraction, summaries, chat).
         """
 
-        return get_llm_provider()
+        return get_llm_provider(task)
+
+    def structured_call(
+        self,
+        schema: type,
+        prompt: str,
+        system: str,
+        task: str = "bulk",
+    ) -> BaseModel:
+        """
+        One LLM call whose reply must match a Pydantic schema.
+
+        The schema is sent to the model so generation is constrained to
+        it, and the reply is validated. One retry is made, telling the
+        model what was wrong. Raises LLMError if there's still no valid
+        reply - callers decide what the fallback is; nothing half-valid
+        is ever returned.
+        """
+        provider = self._get_provider(task)
+        if not provider.is_available():
+            raise LLMError("The configured LLM provider is not reachable")
+
+        json_schema = schema.model_json_schema()
+        # Only fields without defaults must be present; a constrained
+        # model may legitimately omit optional ones.
+        required = set(json_schema.get("required", [])) or None
+        error_note = ""
+        for attempt in range(2):
+            content = provider.invoke(
+                prompt + error_note,
+                system=system,
+                temperature=0,
+                json_schema=json_schema,
+            )
+            try:
+                data = parse_llm_json(content, required_keys=required)
+                return schema.model_validate(data)
+            except (ValueError, ValidationError) as error:
+                detail = str(error)[:400]
+                error_note = (
+                    "\n\nYour previous reply was rejected: "
+                    f"{detail}\nReturn only one JSON object matching the schema."
+                )
+        raise LLMError(f"{schema.__name__}: no valid reply after retry ({detail})")
 
     def generate_contract_summary(
         self,
@@ -668,12 +824,6 @@ class LLMClient:
         """
         Generate an executive summary of the contract.
         """
-
-        provider = self._get_provider()
-
-        if not provider.is_available():
-            print("LLM provider not available")
-            return None
 
         try:
             high_risk = sum(
@@ -750,16 +900,9 @@ Return no Markdown.
 Return no text outside the JSON object.
 """.strip()
 
-            content = provider.invoke(
-                prompt,
-                system=system,
-                temperature=0,
-            )
-
-            result = parse_llm_json(
-                content,
-                required_keys=SUMMARY_KEYS,
-            )
+            result = self.structured_call(
+                ContractSummary, prompt, system, task="quality"
+            ).model_dump()
 
             result["executive_summary"] = str(
                 result.get(
@@ -830,9 +973,8 @@ Return no text outside the JSON object.
         directory always has a best-effort entry for every contract.
         """
 
-        provider = self._get_provider()
-
-        if provider.is_available():
+        meta: Optional[Dict[str, Any]] = None
+        if True:
             try:
                 contract_preview = contract_text[:12000]
 
@@ -878,8 +1020,10 @@ Requirements:
    stated or can be computed (e.g. "3 years from execution"). Use null
    if not determinable. Do not guess a date that is not supported by
    the text.
-5. contract_value: the total contract value as a plain number (no
-   currency symbols, no commas). Use null if not stated.
+5. contract_value: the total contract value / financed amount as a
+   plain number (no currency symbols, no commas). Use null if not
+   stated. contract_value_text: that amount exactly as written in the
+   contract (e.g. "$45,892.00"), or null.
 6. currency: the ISO currency code (e.g. INR, USD) if determinable,
    else null.
 7. ip_shared_with_customer: true if the contract assigns, licenses, or
@@ -895,7 +1039,7 @@ Requirements:
 11. Do not invent facts. Use null wherever the text does not support
     a confident answer.
 12. Do not return Markdown.
-12. Do not return text before or after the JSON.
+13. Do not return text before or after the JSON.
 """.strip()
 
                 system = """
@@ -908,18 +1052,10 @@ Return no text outside the JSON object.
 Only report facts you can support from the given text.
 """.strip()
 
-                content = provider.invoke(
-                    prompt,
-                    system=system,
-                    temperature=0,
+                result = self.structured_call(
+                    ContractMetadataExtraction, prompt, system, task="quality"
                 )
-
-                result = parse_llm_json(
-                    content,
-                    required_keys=CONTRACT_METADATA_KEYS,
-                )
-
-                return normalize_contract_metadata(result)
+                meta = normalize_contract_metadata(result.model_dump())
 
             except Exception as error:
                 print(
@@ -927,10 +1063,12 @@ Only report facts you can support from the given text.
                     f"Using local fallback. Reason: {error}"
                 )
 
-        return self._local_metadata_fallback(
-            contract_text,
-            filename,
-        )
+        if meta is None:
+            meta = self._local_metadata_fallback(
+                contract_text,
+                filename,
+            )
+        return ground_metadata(meta, contract_text)
 
     def _local_metadata_fallback(
         self,
@@ -1145,10 +1283,6 @@ Only report facts you can support from the given text.
         if not micro_policies:
             return []
 
-        provider = self._get_provider()
-        if not provider.is_available():
-            return None
-
         checks_payload = [
             {
                 "id": mp.get("id"),
@@ -1209,34 +1343,13 @@ Return exactly one JSON object. No reasoning outside it. No Markdown.
 """.strip()
 
         try:
-            content = provider.invoke(
-                prompt,
-                system=system,
-                temperature=0,
+            response = self.structured_call(
+                ComplianceResponse, prompt, system, task="bulk"
             )
-
-            result = parse_llm_json(content, required_keys={"results"})
-            raw_results = result.get("results")
-
-            if not isinstance(raw_results, list):
-                raise ValueError("'results' must be a JSON array")
-
-            by_id: Dict[str, Dict[str, Any]] = {}
-            for item in raw_results:
-                if not isinstance(item, dict):
-                    continue
-                check_id = item.get("id")
-                if check_id is None:
-                    continue
-
-                matched = item.get("matched")
-                if not isinstance(matched, bool):
-                    matched = str(matched).strip().lower() in {"true", "yes", "y"}
-
-                reason = item.get("reason")
-                reason = str(reason).strip() if reason else ""
-
-                by_id[str(check_id)] = {"matched": matched, "reason": reason}
+            by_id: Dict[str, Dict[str, Any]] = {
+                item.id: {"matched": item.matched, "reason": item.reason.strip()}
+                for item in response.results
+            }
 
             # Align 1:1 with the input order; a missing id becomes None
             # so the caller can fall back to keyword matching for just
@@ -1274,10 +1387,6 @@ Return exactly one JSON object. No reasoning outside it. No Markdown.
         """
 
         if not micro_policies or not clause_texts:
-            return None
-
-        provider = self._get_provider()
-        if not provider.is_available():
             return None
 
         clauses_block = "\n".join(
@@ -1334,30 +1443,15 @@ Return exactly one JSON object. No reasoning outside it. No Markdown.
 """.strip()
 
         try:
-            content = provider.invoke(prompt, system=system, temperature=0)
-            result = parse_llm_json(content, required_keys={"results"})
-            raw = result.get("results")
-            if not isinstance(raw, list):
-                raise ValueError("'results' must be a JSON array")
-
-            by_id: Dict[str, Dict[str, Any]] = {}
-            for item in raw:
-                if not isinstance(item, dict) or item.get("id") is None:
-                    continue
-                applicable = item.get("applicable")
-                if not isinstance(applicable, bool):
-                    applicable = str(applicable).strip().lower() not in {
-                        "false", "no", "n",
-                    }
-                reason = item.get("reason")
-                by_id[str(item["id"])] = {
-                    "applicable": applicable,
-                    "reason": str(reason).strip() if reason else "",
-                }
-
+            response = self.structured_call(
+                ApplicabilityResponse, prompt, system, task="bulk"
+            )
             return {
-                "contract_type": str(result.get("contract_type") or "").strip(),
-                "by_id": by_id,
+                "contract_type": response.contract_type.strip(),
+                "by_id": {
+                    item.id: {"applicable": item.applicable, "reason": item.reason.strip()}
+                    for item in response.results
+                },
             }
         except Exception as error:
             print(f"LLM check-applicability evaluation failed: {error}")
@@ -1468,37 +1562,17 @@ Requirements:
 8. Return no text after the JSON.
 """.strip()
 
-        provider = self._get_provider()
-
-        if provider.is_available():
+        if True:
             try:
-                content = provider.invoke(
-                    prompt,
-                    system=system,
-                    temperature=0,
+                result = self.structured_call(
+                    ClauseClassification, prompt, system, task="bulk"
                 )
-
-                response_length = (
-                    len(content)
-                    if isinstance(content, str)
-                    else "non-string"
-                )
-
-                print(
-                    "LLM classification provider: "
-                    f"{provider.__class__.__name__}; "
-                    f"response length: {response_length}"
-                )
-
-                result = parse_llm_json(
-                    content,
-                    required_keys=CLASSIFICATION_KEYS,
-                )
-
-                return normalize_classification(
-                    result,
+                classification = normalize_classification(
+                    result.model_dump(),
                     metadata,
                 )
+                classification["method"] = "llm"
+                return classification
 
             except Exception as error:
                 print(
@@ -1560,10 +1634,14 @@ Requirements:
                     f"Reason: {error}"
                 )
 
-        return self._local_fallback(
+        classification = self._local_fallback(
             text,
             metadata,
         )
+        # Marked so the UI/reviewers can tell a keyword guess from a
+        # model assessment.
+        classification["method"] = "keyword_fallback"
+        return classification
 
     def _build_prompt(
         self,

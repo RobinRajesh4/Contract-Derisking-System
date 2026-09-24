@@ -36,7 +36,8 @@ interface Source {
   filename?: string;
   clause_id?: string | number;
   text: string;
-  score?: number;
+  score?: number | null;
+  kind?: "header" | "clause";
 }
 
 interface Message {
@@ -177,7 +178,10 @@ export default function Chat() {
         setSelectedAnalysisId(source.analysis_id);
       }
       if (source.clause_id != null) {
-        // Slight delay to allow the doc viewer to load after analysis switch
+        // Clear first so clicking the same reference again (or the same
+        // clause number in another contract) still re-triggers the
+        // highlight; the delay lets the viewer load a switched contract.
+        setHighlightedClauseId(null);
         setTimeout(() => setHighlightedClauseId(source.clause_id!), 150);
       }
     },
@@ -193,11 +197,19 @@ export default function Chat() {
     setIsLoading(true);
 
     try {
+      // Recent turns (before this question) so the assistant can follow
+      // up on and correct its own earlier answers.
+      const history = messages
+        .filter((m) => m.content && m.content.trim())
+        .slice(-8)
+        .map((m) => ({ role: m.role, content: m.content.slice(0, 2000) }));
+
       const requestBody: {
         message: string;
         top_k: number;
         analysis_id?: string;
-      } = { message: question, top_k: 5 };
+        history: { role: string; content: string }[];
+      } = { message: question, top_k: 5, history };
 
       if (selectedAnalysisId !== "all") {
         requestBody.analysis_id = selectedAnalysisId;
@@ -413,7 +425,11 @@ export default function Chat() {
                                   </p>
                                   <div className="mt-1 flex flex-wrap gap-x-3 text-[10px] text-muted-foreground">
                                     {source.clause_id != null && (
-                                      <span>Clause {source.clause_id}</span>
+                                      <span>
+                                        {source.clause_id === "header"
+                                          ? "Contract header"
+                                          : `Clause ${source.clause_id}`}
+                                      </span>
                                     )}
                                     {typeof source.score === "number" && (
                                       <span>
@@ -421,7 +437,9 @@ export default function Chat() {
                                       </span>
                                     )}
                                     <span className="font-medium text-primary group-hover:underline">
-                                      Jump to clause →
+                                      {source.clause_id === "header"
+                                        ? "Jump to source →"
+                                        : "Jump to clause →"}
                                     </span>
                                   </div>
                                 </div>
