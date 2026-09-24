@@ -2,7 +2,11 @@
   "provider": "ollama",
   "ollama_url": "https://librechat.eplpg.com/ollama",
   "ollama_model": "qwen3:8b",
+  "ollama_quality_model": "qwen3:32b",
   "ollama_verify_ssl": false,
   "llm_concurrency": 4,
-  "ollama_num_ctx": 16384
+  "ollama_num_ctx": 16384,
+  "llm_timeout_sec": 240,
+  "embedding_url": "",
+  "embedding_model": "qwen3-embedding:8b"
 }

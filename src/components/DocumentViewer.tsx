@@ -74,8 +74,14 @@ export default function DocumentViewer({
     );
   }
 
-  const clauses: Array<{ id: string | number; text: string; page?: number }> =
-    data.results ?? data.clauses ?? [];
+  // The contract header (parties, lender, financed amount) is shown and
+  // can be highlighted like a clause, but it is not one of the clauses.
+  const header: { id: string; text: string; page?: number } | null =
+    data.header?.text ? { id: "header", text: data.header.text, page: data.header.page } : null;
+  const clauses: Array<{ id: string | number; text: string; page?: number }> = [
+    ...(header ? [header] : []),
+    ...(data.results ?? data.clauses ?? []),
+  ];
 
   const filename: string = data.filename ?? "Contract";
 
@@ -120,7 +126,7 @@ export default function DocumentViewer({
           <span className="truncate text-sm font-semibold">{filename}</span>
         </div>
         <p className="mt-0.5 text-xs text-muted-foreground">
-          {clauses.length} clause{clauses.length !== 1 ? "s" : ""} · original file unavailable
+          {clauses.length - (header ? 1 : 0)} clause{clauses.length - (header ? 1 : 0) !== 1 ? "s" : ""} · original file unavailable
         </p>
       </div>
 
@@ -135,7 +141,7 @@ export default function DocumentViewer({
             className="group relative rounded-md border border-border/40 bg-background p-4 text-sm leading-relaxed transition-colors hover:border-border"
           >
             <span className="mb-2 inline-block rounded bg-muted px-1.5 py-0.5 text-[10px] font-bold text-muted-foreground">
-              §{clause.id}
+              {clause.id === "header" ? "Header" : `§${clause.id}`}
             </span>
             <p className="whitespace-pre-wrap text-foreground/90">{clause.text}</p>
           </div>

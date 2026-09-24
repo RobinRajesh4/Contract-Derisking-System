@@ -1,0 +1,58 @@
+[
+  {
+    "question": "Which contract has the highest financed amount?",
+    "expect_route": "structured",
+    "expect_contains": [
+      "TODO: highest amount you verified, e.g. $1,203,432.00"
+    ]
+  },
+  {
+    "question": "Which contract has the lowest financed amount?",
+    "expect_route": "structured",
+    "expect_contains": [
+      "TODO: lowest amount, e.g. $36,160.00"
+    ]
+  },
+  {
+    "question": "What is the financed amount of Contract_1.pdf?",
+    "expect_route": "structured",
+    "expect_contains": [
+      "$82,437.00"
+    ]
+  },
+  {
+    "question": "Who is the lender in Contract_1.pdf?",
+    "expect_route": "structured",
+    "expect_contains": [
+      "FINANCIAL BANK OF AMERICA"
+    ]
+  },
+  {
+    "question": "How many contracts are with FINANCIAL BANK OF AMERICA?",
+    "expect_route": "structured",
+    "expect_contains": [
+      "TODO: e.g. **12** contracts match"
+    ]
+  },
+  {
+    "question": "What is the monthly interest rate in Contract_1.pdf?",
+    "expect_route": "semantic",
+    "expect_contains": [
+      "1.2%"
+    ]
+  },
+  {
+    "question": "What penalty applies to late payment in Contract_1.pdf?",
+    "expect_route": "semantic",
+    "expect_contains": [
+      "2%"
+    ]
+  },
+  {
+    "question": "Which courts have jurisdiction in Contract_1.pdf?",
+    "expect_route": "semantic",
+    "expect_contains": [
+      "New York"
+    ]
+  }
+]

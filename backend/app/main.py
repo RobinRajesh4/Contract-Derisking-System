@@ -10,16 +10,30 @@ import orjson
 import os
 from dotenv import load_dotenv
 import re
+import hashlib
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 # Load env from .env (GROQ_API_KEY, QDRANT_URL, etc.)
 load_dotenv()
 
-from .parser import extract_text_from_file, split_into_clauses, extract_metadata, assign_clause_pages
+from .parser import (
+    extract_text_from_file,
+    split_document,
+    extract_metadata,
+    assign_clause_pages,
+    coverage_report,
+)
 from .store import Store
 from .mcp.llm_agent import LLMClient
 from .policy import save_policy, get_policy, list_policies, apply_policy
-from .llm_providers import get_settings, save_settings, get_provider_status, load_settings
+from .llm_providers import (
+    EDITABLE_SETTINGS,
+    get_settings,
+    save_settings,
+    get_provider_status,
+    load_settings,
+)
 try:
     from .rag import RAGStore
 except Exception as error:
@@ -125,42 +139,67 @@ else:
 
 
 
-def _process_upload(
+def build_document(text: str, pages: List[str]) -> Dict[str, Any]:
+    """
+    Split extracted text into the contract header and its clauses, with
+    page numbers, plus a check that nothing was silently dropped.
+    """
+    header_text, clause_texts = split_document(text)
+    page_numbers = assign_clause_pages(
+        ([header_text] if header_text else []) + clause_texts, pages or [text]
+    )
+    header = None
+    if header_text:
+        header = {"id": "header", "text": header_text, "page": page_numbers[0]}
+        page_numbers = page_numbers[1:]
+
+    clauses = [
+        {
+            "id": idx,
+            "text": clause_text,
+            "metadata": extract_metadata(clause_text),
+            "page": page_numbers[idx - 1],
+        }
+        for idx, clause_text in enumerate(clause_texts, start=1)
+    ]
+    coverage = coverage_report(text, header_text, clause_texts)
+    if not coverage["ok"]:
+        print(
+            f"[parse] only {coverage['ratio']:.0%} of the document's words ended up "
+            f"in the header/clauses; e.g. missing: {coverage['missing_sample'][:8]}"
+        )
+    return {"header": header, "clauses": clauses, "parse_quality": coverage}
+
+
+_ingest_lock = threading.Lock()
+
+
+def ingest_document(
     filename: str,
     content: bytes,
     content_type: Optional[str],
+    analysis_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Does all the actual (blocking) work for one uploaded file: text/OCR
-    extraction, clause splitting, per-clause metadata, contract-level
-    LLM metadata extraction, persisting to the store, saving the
-    original file, and RAG indexing.
+    Parse, extract and index one document.
 
-    Deliberately synchronous - this is meant to be run via
-    run_in_threadpool from the async route handlers below, so a slow
-    upload (OCR, or a slow LLM call) occupies a worker thread instead
-    of blocking the single asyncio event loop that every other
-    request - to any endpoint, from any user - also depends on.
+    - New file: creates a record.
+    - The same file uploaded again (same bytes), or a re-index: updates
+      the existing record in place, so one document never becomes
+      several records that all show up in search and chat.
+    - If re-parsing changed the clauses, the old risk analysis no
+      longer matches them and is cleared; the record goes back to
+      "uploaded" and needs /analyze again.
 
-    Raises ValueError if no text could be extracted (caller decides
-    how to surface that - as a 400 for a single upload, or as a
-    per-file error entry for a batch upload).
+    Blocking; routes call it through run_in_threadpool.
+    Raises ValueError if no text could be extracted.
     """
     text, ocr_info, pages = extract_text_from_file(filename, content)
     if not text or not text.strip():
         raise ValueError("No text could be extracted from the file")
 
-    clauses = split_into_clauses(text)
-    clause_pages = assign_clause_pages(clauses, pages)
-    items = []
-    for idx, clause_text in enumerate(clauses, start=1):
-        meta = extract_metadata(clause_text)
-        items.append({
-            "id": idx,
-            "text": clause_text,
-            "metadata": meta,
-            "page": clause_pages[idx - 1],
-        })
+    content_hash = hashlib.sha256(content).hexdigest()
+    doc = build_document(text, pages)
 
     try:
         contract_metadata = llm.extract_contract_metadata(text, filename)
@@ -168,30 +207,66 @@ def _process_upload(
         print(f"Contract metadata extraction failed for {filename}: {error}")
         contract_metadata = None
 
-    analysis_id = store.save_analysis({
+    fields = {
         "filename": filename,
-        "clauses": items,
-        "status": "uploaded",
-        "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "header": doc["header"],
+        "clauses": doc["clauses"],
+        "parse_quality": doc["parse_quality"],
         "file_size": len(content),
         "ocr_info": ocr_info,
         "contract_metadata": contract_metadata,
-    })
+        "content_hash": content_hash,
+    }
+
+    with _ingest_lock:
+        existing = store.get_analysis(analysis_id) if analysis_id else None
+        if existing is None:
+            existing = store.find_by_content_hash(content_hash)
+        reprocessed = existing is not None
+
+        clauses_changed = True
+        if reprocessed:
+            analysis_id = existing["analysis_id"]
+            old_texts = [c.get("text") for c in existing.get("clauses", [])]
+            clauses_changed = old_texts != [c["text"] for c in doc["clauses"]]
+            if clauses_changed:
+                fields.update({
+                    "status": "uploaded",
+                    "results": None,
+                    "policy_summary": None,
+                    "summary": None,
+                })
+            store.update_analysis(analysis_id, fields)
+        else:
+            analysis_id = store.save_analysis({
+                **fields,
+                "status": "uploaded",
+                "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            })
 
     _persist_original_file(analysis_id, filename, content, content_type)
 
+    indexed = 0
     if rag is not None:
         try:
-            rag.upsert_clauses(analysis_id, items)
-            print(f"Indexed {len(items)} clauses for analysis {analysis_id}")
+            indexed = rag.index_analysis(analysis_id, doc["clauses"], doc["header"])
+            print(f"Indexed {indexed} passages for analysis {analysis_id}")
         except Exception as error:
             print(f"RAG indexing failed for {analysis_id}: {error}")
 
     return {
         "analysis_id": analysis_id,
-        "total_clauses": len(items),
+        "total_clauses": len(doc["clauses"]),
         "ocr_info": ocr_info,
+        "reprocessed": reprocessed,
+        "clauses_changed": clauses_changed,
+        "parse_quality": doc["parse_quality"],
     }
+
+
+# Old name, kept for anything that still imports it.
+def _process_upload(filename, content, content_type):
+    return ingest_document(filename, content, content_type)
 
 
 @app.post("/upload")
@@ -249,11 +324,14 @@ def analyze(payload: AnalyzeRequest):
             raise HTTPException(status_code=404, detail="analysis_id not found")
         clauses = record.get("clauses", [])
     elif payload.text:
-        clauses_text = split_into_clauses(payload.text)
-        clauses = [{"id": i+1, "text": t, "metadata": extract_metadata(t)} for i, t in enumerate(clauses_text)]
+        doc = build_document(payload.text, [payload.text])
+        clauses = doc["clauses"]
+        record = {"header": doc["header"]}
         # persist a transient analysis
         analysis_id = store.save_analysis({
             "filename": None,
+            "header": doc["header"],
+            "parse_quality": doc["parse_quality"],
             "clauses": clauses,
             "status": "uploaded",
             "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -377,6 +455,10 @@ def analyze(payload: AnalyzeRequest):
     update_payload: Dict[str, Any] = {
         "status": "analyzed",
         "results": results,
+        # Stored so a later re-index can re-run the exact same policy
+        # (the app builds its policy in the browser; the backend can't
+        # reconstruct it).
+        "policy_used": policy_obj,
     }
     if policy_summary:
         update_payload["policy_summary"] = policy_summary
@@ -386,7 +468,12 @@ def analyze(payload: AnalyzeRequest):
     # (generate_contract_summary counts high/medium/low risk clauses -
     # doing this at /upload instead would always report 0 high-risk
     # clauses, since classification hasn't run yet at that point).
-    contract_text = " ".join(c.get("text", "") for c in results)
+    # The header (parties, amounts) gives the summary its context;
+    # it's included as text only, never as a scored clause.
+    header_text = ((record or {}).get("header") or {}).get("text", "")
+    contract_text = " ".join(
+        ([header_text] if header_text else []) + [c.get("text", "") for c in results]
+    )
     try:
         executive_summary = llm.generate_contract_summary(contract_text, results)
     except Exception as error:
@@ -653,281 +740,367 @@ def backfill_contract_metadata(force: bool = False):
     }
 
 
+# --- One-time / on-demand re-index ------------------------------------
+
+_reindex_state: Dict[str, Any] = {"running": False}
+_reindex_lock = threading.Lock()
+
+
+def _file_bytes(record: Dict[str, Any]) -> Optional[bytes]:
+    path = record.get("file_path")
+    if path and os.path.exists(path):
+        with open(path, "rb") as f:
+            return f.read()
+    return None
+
+
+def _run_reindex(reanalyze: str, remove_duplicates: bool, reset_index: bool) -> None:
+    state = _reindex_state
+    try:
+        analyses = store.list_analyses()  # newest first
+        state.update({"total": len(analyses), "done": 0, "phase": "checking duplicates"})
+
+        # Duplicates: same file bytes stored more than once.
+        by_hash: Dict[str, List[Dict[str, Any]]] = {}
+        for a in analyses:
+            content = _file_bytes(a)
+            h = a.get("content_hash") or (hashlib.sha256(content).hexdigest() if content else None)
+            if h:
+                by_hash.setdefault(h, []).append(a)
+        duplicate_groups = [g for g in by_hash.values() if len(g) > 1]
+        removed = []
+        for group in duplicate_groups:
+            keep, extras = group[0], group[1:]
+            state["duplicates"].append({
+                "kept": {"analysis_id": keep["analysis_id"], "filename": keep.get("filename")},
+                "extra_copies": [{"analysis_id": e["analysis_id"], "filename": e.get("filename")} for e in extras],
+            })
+            if remove_duplicates:
+                for e in extras:
+                    store.delete_analysis(e["analysis_id"])
+                    if rag is not None:
+                        rag.delete_analysis(e["analysis_id"])
+                    removed.append(e["analysis_id"])
+        state["removed_duplicates"] = removed
+        analyses = [a for a in analyses if a["analysis_id"] not in set(removed)]
+        state["total"] = len(analyses)
+
+        if reset_index and rag is not None:
+            state["phase"] = "resetting search index"
+            rag.reset()
+
+        state["phase"] = "re-parsing, extracting and indexing"
+
+        def _one(a: Dict[str, Any]) -> Dict[str, Any]:
+            aid = a["analysis_id"]
+            try:
+                content = _file_bytes(a)
+                if content is not None:
+                    info = ingest_document(a.get("filename") or aid, content, a.get("content_type"), analysis_id=aid)
+                    changed = info["clauses_changed"]
+                else:
+                    # No original file (text submissions): keep clauses,
+                    # re-index what's stored.
+                    if rag is not None:
+                        rag.index_analysis(aid, a.get("clauses", []), a.get("header"))
+                    changed = False
+                return {"analysis_id": aid, "filename": a.get("filename"), "ok": True, "clauses_changed": changed}
+            except Exception as error:
+                return {"analysis_id": aid, "filename": a.get("filename"), "ok": False, "error": str(error)}
+            finally:
+                state["done"] = state.get("done", 0) + 1
+
+        concurrency = max(1, int(get_settings().get("llm_concurrency", 4)))
+        with ThreadPoolExecutor(max_workers=concurrency) as ex:
+            outcomes = list(ex.map(_one, analyses))
+        state["results"] = outcomes
+
+        # Re-run risk analysis where needed, with the policy each
+        # contract was originally analyzed with.
+        state["phase"] = "re-analyzing"
+        to_analyze = []
+        for o in outcomes:
+            if not o["ok"]:
+                continue
+            record = store.get_analysis(o["analysis_id"]) or {}
+            needs = (
+                reanalyze == "all"
+                or (reanalyze == "changed" and (o["clauses_changed"] or record.get("status") != "analyzed"))
+            )
+            if not needs:
+                continue
+            if record.get("policy_used"):
+                to_analyze.append(record)
+            # Analyzed before policies were stored (or never analyzed):
+            # the app's policy isn't known here. Re-uploading the same
+            # file in the app refreshes this record and analyzes it.
+            else:
+                state["needs_analysis"].append({"analysis_id": record.get("analysis_id"), "filename": record.get("filename")})
+
+        state.update({"total": len(to_analyze), "done": 0})
+        for record in to_analyze:
+            try:
+                analyze(AnalyzeRequest(analysis_id=record["analysis_id"], policy=record["policy_used"]))
+                state["reanalyzed"].append(record.get("filename"))
+            except Exception as error:
+                state["errors"].append({"filename": record.get("filename"), "error": str(error)})
+            state["done"] += 1
+
+        state["phase"] = "finished"
+    except Exception as error:
+        state["phase"] = "failed"
+        state["errors"].append({"error": str(error)})
+    finally:
+        state["running"] = False
+        state["finished_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+@app.post("/admin/reindex")
+def start_reindex(
+    reanalyze: str = "changed",
+    remove_duplicates: bool = False,
+    reset_index: bool = True,
+):
+    """
+    Rebuild every stored contract with the current parser, metadata
+    extraction and search index. Runs in the background; poll
+    GET /admin/reindex/status.
+
+    reanalyze: "changed" (default) re-runs risk analysis only where the
+      clauses came out different; "all"; or "none".
+    remove_duplicates: delete extra copies of files uploaded more than
+      once (keeps the newest). Default false: only reported.
+    reset_index: rebuild the search index from scratch (default true).
+    """
+    if reanalyze not in {"changed", "all", "none"}:
+        raise HTTPException(status_code=400, detail="reanalyze must be changed, all or none")
+    with _reindex_lock:
+        if _reindex_state.get("running"):
+            return {"started": False, "message": "A re-index is already running", "status": _reindex_state}
+        _reindex_state.clear()
+        _reindex_state.update({
+            "running": True,
+            "started_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "phase": "starting",
+            "done": 0,
+            "total": 0,
+            "duplicates": [],
+            "removed_duplicates": [],
+            "results": [],
+            "reanalyzed": [],
+            "needs_analysis": [],
+            "errors": [],
+        })
+        threading.Thread(
+            target=_run_reindex, args=(reanalyze, remove_duplicates, reset_index), daemon=True
+        ).start()
+    return {"started": True, "message": "Re-index started. Poll GET /admin/reindex/status."}
+
+
+@app.get("/admin/reindex/status")
+def reindex_status():
+    return _reindex_state
+
+
+class ChatTurn(BaseModel):
+    role: str
+    content: str
+
+
 class ChatRequest(BaseModel):
     message: str
     analysis_id: Optional[str] = None
     top_k: int = 5
+    # Recent turns of this conversation, oldest first, so follow-ups
+    # ("and the lowest?", "that's wrong, check again") make sense.
+    history: List[ChatTurn] = []
 
+
+def _directory_line(a: Dict[str, Any]) -> str:
+    from .chat_router import format_money
+
+    cm = a.get("contract_metadata") or {}
+
+    def _fmt(value):
+        if isinstance(value, bool):
+            return "yes" if value else "no"
+        return value if value not in (None, "") else "not found"
+
+    value = cm.get("contract_value")
+    value_display = (
+        format_money(float(value), cm.get("currency"))
+        if isinstance(value, (int, float)) else "not found"
+    )
+    fields = [
+        f"ID: {a.get('analysis_id')}",
+        f"Name: {a.get('filename') or 'Contract ' + str(a.get('analysis_id'))}",
+        f"Borrower/customer: {_fmt(cm.get('customer_name'))}",
+        f"Lender: {_fmt(cm.get('lender_name'))}",
+        f"About: {_fmt(cm.get('contract_about'))}",
+        f"Start: {_fmt(cm.get('start_date'))}",
+        f"End: {_fmt(cm.get('end_date'))}",
+        f"Amount: {value_display}",
+        f"Governing law: {_fmt(cm.get('governing_law'))}",
+        f"Indemnification clause: {_fmt(cm.get('indemnification_clause_present'))}",
+    ]
+    return "- " + " | ".join(fields)
+
+
+# Whole-contract context is used when chatting about one contract and it
+# fits; retrieval only picks a few passages, the whole text can't miss one.
+_SINGLE_CONTRACT_CHAR_BUDGET = 16000
+
+CHAT_SYSTEM_PROMPT = """
+You are a contract analysis assistant for legal review. You answer questions
+about the contracts provided, compare terms, assess risk and draft wording.
+
+You have no tools and cannot call any. Answer only from the directory and the
+numbered sources in the prompt.
+
+Rules:
+1. Every fact you state (name, amount, date, rate, term) must come from the
+   sources or the directory. Cite the source it came from as [Source N](#source-N).
+   If something isn't in them, say it isn't in the provided documents. Never
+   guess or fill in a value.
+2. Do not compute rankings, totals or comparisons of amounts in your head; if
+   asked, describe what the sources say and note that exact ranking is
+   available by asking directly (e.g. "which contract has the highest amount").
+3. If the conversation shows an earlier answer was wrong or inconsistent, say so
+   plainly and give the correct answer from the sources.
+4. For yes/no questions, start with Yes / No / Partially / It depends, then one
+   or two sentences of reasoning.
+5. When listing contracts, use a Markdown table and a link column with
+   [View](#contract-<ID>) using the directory ID.
+6. When drafting clause wording, put the draft in a blockquote, separate from
+   your explanation.
+7. Be concise. Don't repeat caveats.
+""".strip()
+
+
+def _history_block(history: List[Dict[str, str]]) -> str:
+    if not history:
+        return ""
+    lines = []
+    for turn in history[-6:]:
+        role = "User" if turn.get("role") == "user" else "Assistant"
+        lines.append(f"{role}: {str(turn.get('content', ''))[:1500]}")
+    return "Conversation so far:\n" + "\n".join(lines) + "\n\n"
 
 
 @app.post("/chat")
-def chat_endpoint(
-    request: ChatRequest,
-):
+def chat_endpoint(request: ChatRequest):
     """
-    Chat with indexed contracts using local Qdrant retrieval.
+    Answer a question about the stored contracts.
 
-    If analysis_id is provided, retrieval is restricted to
-    that particular contract. Otherwise, all indexed
-    contracts are searched.
+    1. Questions answerable from contract fields (highest/lowest amount,
+       totals, counts, lookups, filters by lender/date/amount) are
+       answered in code, exactly, with each contract's header as the
+       reference (see chat_router).
+    2. Everything else gets the relevant passages (or the whole contract,
+       when one contract is selected) and an LLM answer that must cite them.
     """
-
-    if rag is None:
-        raise HTTPException(
-            status_code=503,
-            detail="RAG system is not initialized",
-        )
+    from .chat_router import execute_spec, route_question, sources_for_rows
+    from .mcp.llm_agent import remove_reasoning_traces
 
     query = request.message.strip()
-
     if not query:
-        raise HTTPException(
-            status_code=400,
-            detail="message is required",
-        )
+        raise HTTPException(status_code=400, detail="message is required")
 
-    top_k = max(
-        1,
-        min(request.top_k, 10),
-    )
+    history = [
+        {"role": t.role, "content": t.content}
+        for t in (request.history or [])
+        if t.content and t.content.strip()
+    ][-8:]
 
-    try:
-        results = rag.query(
-            query,
-            top_k=top_k,
-            filter_by_analysis=request.analysis_id,
-        )
+    single = request.analysis_id if request.analysis_id not in (None, "", "all") else None
+    all_analyses = store.list_analyses()
+    scope = [a for a in all_analyses if a.get("analysis_id") == single] if single else all_analyses
+    if single and not scope:
+        raise HTTPException(status_code=404, detail="analysis_id not found")
 
-    except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Contract retrieval failed: "
-                f"{error}"
-            ),
-        )
-
-    if not results:
+    # 1) Structured questions: exact answer from the directory.
+    spec = route_question(llm, query, history)
+    if spec is not None and spec.kind == "structured":
+        result = execute_spec(spec, scope)
         return {
-            "reply": (
-                "I could not find any relevant contract "
-                "clauses to answer that question."
-            ),
-            "sources": [],
+            "reply": result["answer"],
+            "sources": sources_for_rows(result["rows"]),
+            "route": "structured",
+            "query_spec": spec.model_dump(),
         }
 
-    context_parts = []
-    sources = []
-    filename_cache: Dict[str, str] = {}
-
-    for index, result in enumerate(
-        results,
-        start=1,
-    ):
-        clause_text = str(
-            result.get("text", "")
-        ).strip()
-
-        if not clause_text:
-            continue
-
-        result_analysis_id = result.get("analysis_id")
-
-        if result_analysis_id not in filename_cache:
-            source_analysis = store.get_analysis(result_analysis_id) or {}
-            filename_cache[result_analysis_id] = (
-                source_analysis.get("filename") or f"Contract {result_analysis_id}"
+    # 2) Semantic questions: passages + LLM.
+    passages: List[Dict[str, Any]] = []
+    if single:
+        record = scope[0]
+        header = record.get("header")
+        clauses = record.get("clauses") or []
+        total_chars = len((header or {}).get("text", "")) + sum(len(c.get("text", "")) for c in clauses)
+        if total_chars <= _SINGLE_CONTRACT_CHAR_BUDGET:
+            if header and header.get("text"):
+                passages.append({"analysis_id": single, "clause_id": "header", "kind": "header", "text": header["text"], "score": None})
+            passages.extend(
+                {"analysis_id": single, "clause_id": c.get("id"), "kind": "clause", "text": c.get("text", ""), "score": None}
+                for c in clauses
             )
 
-        contract_label = filename_cache[result_analysis_id]
+    if not passages:
+        if rag is None:
+            raise HTTPException(status_code=503, detail="Contract search is not available (RAG failed to start; see the server log).")
+        top_k = max(1, min(request.top_k, 10))
+        try:
+            passages = rag.query(query, top_k=top_k, filter_by_analysis=single)
+        except Exception as error:
+            raise HTTPException(status_code=500, detail=f"Contract search failed: {error}")
 
-        context_parts.append(
-            f"[Contract: {contract_label} | Source {index}]\n{clause_text}"
-        )
+    names = {a.get("analysis_id"): (a.get("filename") or f"Contract {a.get('analysis_id')}") for a in all_analyses}
+    context_parts, sources = [], []
+    for index, p in enumerate(passages, start=1):
+        text = str(p.get("text", "")).strip()
+        if not text:
+            continue
+        label = names.get(p.get("analysis_id"), f"Contract {p.get('analysis_id')}")
+        where = "contract header (parties, amounts)" if p.get("kind") == "header" else f"clause {p.get('clause_id')}"
+        context_parts.append(f"[Source {index} | {label} | {where}]\n{text}")
+        sources.append({
+            "source_number": index,
+            "analysis_id": p.get("analysis_id"),
+            "filename": label,
+            "clause_id": p.get("clause_id"),
+            "text": text,
+            "score": p.get("score"),
+            "kind": p.get("kind", "clause"),
+        })
 
-        sources.append(
-            {
-                "source_number": index,
-                "analysis_id": result_analysis_id,
-                "filename": contract_label,
-                "clause_id": result.get(
-                    "clause_id"
-                ),
-                "text": clause_text,
-                "score": result.get("score"),
-            }
-        )
-
-    if not context_parts:
-        return {
-            "reply": (
-                "Relevant records were found, but no "
-                "readable clause text was available."
-            ),
-            "sources": [],
-        }
-
-    global_context = ""
-    if not request.analysis_id or request.analysis_id == "all":
-        all_analyses = store.list_analyses()
-        if all_analyses:
-            def _numeric_value(a: Dict[str, Any]) -> float:
-                cm = a.get("contract_metadata") or {}
-                raw_value = cm.get("contract_value")
-                if isinstance(raw_value, (int, float)):
-                    return float(raw_value)
-                return float("-inf")
-
-            # Small local models are unreliable at correctly sorting a
-            # list of numbers themselves when asked to "list highest
-            # first" - the LLM was observed producing tables that
-            # claimed to be descending but weren't. Pre-sorting here,
-            # in code, turns the model's job from "compute a sort
-            # order" (error-prone) into "transcribe rows in the order
-            # given" (much more reliable), and removes the numeric
-            # reasoning failure mode entirely rather than trying to
-            # prompt it away.
-            all_analyses = sorted(all_analyses, key=_numeric_value, reverse=True)
-
-            dir_lines = [
-                "\nAvailable Contracts Directory (authoritative structured data - "
-                "use this, not guesswork from excerpts, to answer listing/filtering/"
-                "date/value/customer/IP questions; a field being 'unknown' means it "
-                "genuinely could not be determined from the contract, don't invent one).\n"
-                "This list is ALREADY SORTED by contract value, highest first "
-                "(entries with an unknown value are listed last). If asked to rank, "
-                "list, or compare by value, preserve this order exactly - do not "
-                "re-sort or re-compute the order yourself:"
-            ]
-            for a in all_analyses:
-                file_name = a.get("filename") or f"Contract {a.get('analysis_id')}"
-                cm = a.get("contract_metadata") or {}
-
-                def _fmt(value):
-                    return value if value not in (None, "") else "unknown"
-
-                raw_value = cm.get("contract_value")
-                if isinstance(raw_value, (int, float)):
-                    value_str = (
-                        str(int(raw_value))
-                        if float(raw_value).is_integer()
-                        else str(raw_value)
-                    )
-                    currency_str = _fmt(cm.get("currency"))
-                    value_display = f"{value_str} {currency_str}".strip()
-                else:
-                    value_display = "unknown"
-
-                fields = [
-                    f"ID: {a.get('analysis_id')}",
-                    f"Name: {file_name}",
-                    f"Customer: {_fmt(cm.get('customer_name'))}",
-                    f"Lender/Bank: {_fmt(cm.get('lender_name'))}",
-                    f"About: {_fmt(cm.get('contract_about'))}",
-                    f"Start: {_fmt(cm.get('start_date'))}",
-                    f"End: {_fmt(cm.get('end_date'))}",
-                    f"Value: {value_display}",
-                    f"IP shared with customer: {_fmt(cm.get('ip_shared_with_customer'))}",
-                    f"Indemnification present: {_fmt(cm.get('indemnification_clause_present'))}",
-                    f"Indemnification strength: {_fmt(cm.get('indemnification_strength'))}",
-                    f"Governing law: {_fmt(cm.get('governing_law'))}",
-                ]
-                dir_lines.append("- " + " | ".join(fields))
-            global_context = "\n".join(dir_lines) + "\n\n"
-
-    context = "\n\n".join(
-        context_parts
+    # Directory rows only for the contracts being discussed, so the
+    # prompt doesn't grow with every contract ever uploaded.
+    cited = {src["analysis_id"] for src in sources}
+    directory = "\n".join(
+        _directory_line(a) for a in scope if single or a.get("analysis_id") in cited
+    )
+    prompt = (
+        _history_block(history)
+        + "Contracts directory (fields extracted from each document; 'not found' means the document doesn't state it):\n"
+        + (directory or "(none)")
+        + "\n\nSources:\n"
+        + ("\n\n".join(context_parts) if context_parts else "(no passages matched this question)")
+        + f"\n\nQuestion: {query}"
     )
 
-    prompt = f"""
-Use the context provided below to answer the question.
-If the question asks to list contracts based on specific criteria (e.g. by customer, end date, value, a clause type, IP terms), use the Available Contracts Directory in combination with the excerpts to form your answer.
-
-When listing contracts, respond as a Markdown table. Choose ONLY the columns that are relevant to what was asked - don't always use the same fixed columns:
-- Listing by end date / expiry -> # | customer name | date of contract ending | contract about | link, sorted soonest-ending first
-- Listing by customer name -> # | customer name | date of contract ending | contract about | link, sorted active contracts first
-- Listing by a clause topic (e.g. "which contracts share IP with customer") -> # | customer name | contract about | link (omit date/value columns that weren't asked for)
-- Listing by contract value -> # | contract date | contract value | link
-Always include a 'link' column using the exact format: [View](#contract-<ID>) where <ID> is the contract's ID from the Available Contracts Directory.
-Pick the sort order and columns that best fit the specific question asked, rather than a single fixed template.
-
-If the question is a yes/no clause-quality check (e.g. "is the indemnification clause weaker in these contracts", "does X contract have Y protection"), lead with a short, direct answer: Yes / No / Partially / It depends, followed by one or two sentences of the specific reasoning. Don't write a long essay for a yes/no question.
-
-If the question asks to compare, rank, or pick the "best"/"worst"/"safest" contract:
-- Group the excerpts by contract.
-- Weigh them against each other on the risk indicators, obligations,
-  and terms present in the excerpts (e.g. termination rights, liability,
-  payment terms, one-sided clauses, ambiguity/contradictions).
-- State which contract you'd recommend and why, referencing contract
-  names and source numbers.
-- If two or more contracts are genuinely tied or the excerpts don't cover
-  enough ground to compare them, say so explicitly and explain what's
-  missing, rather than refusing outright.
-- If every retrieved excerpt is from the same single contract, say so
-  plainly (name that contract) instead of implying there's nothing to compare.
-
-Only fall back to "I do not know based on the provided contract documents."
-if the excerpts contain no information at all relevant to the question.
-
-Do not invent contract terms that aren't in the excerpts.
-Be specific, precise, and correct - double check names, dates, and numbers
-against the excerpts before answering.
-Keep answers concise; don't pad with repeated caveats.
-
-{global_context}
-Contract excerpts:
-{context}
-
-Question:
-{query}
-""".strip()
-
-    system_prompt = """
-You are a highly capable contract analysis assistant. You answer factual questions, make comparative risk judgments, draft new clauses, and filter/list contracts.
-
-You have no tools or functions available and cannot call any. Answer directly from the excerpts and directory given to you in this prompt - never emit a tool call, function call, or code block claiming to search/browse/fetch anything.
-
-Guidelines:
-1. Always be specific, precise, and correct. Double-check every fact, name, date, and number against the excerpts before answering.
-2. If asked to list contracts, ALWAYS respond as a Markdown table, but pick columns and sort order to match what was actually asked (see examples in the prompt) rather than one fixed template for every listing question. Use [View](#contract-<ID>) for links, where <ID> is the contract's ID from the Available Contracts Directory.
-3. If asked a yes/no clause-quality question, answer with Yes / No / Partially / It depends up front, then briefly justify it. Don't over-explain a simple question.
-4. Be proactive: end with a relevant, specific follow-up question tied to what was just asked (e.g. "do you want me to list expired contracts too?", "would you like me to draft an amended clause for this?") - not a generic closing line every time.
-5. When you reference a specific excerpt, you MUST cite it using a Markdown link in the exact format: [Source N](#source-N). This citation is required on every claim you make based on an excerpt.
-6. If drafting a new contract or clause, provide the drafted text clearly in a Markdown blockquote or code block, clearly separated from your explanation.
-7. Use standard Markdown formatting (bold, italic, lists, tables) freely to make your response readable.
-""".strip()
-
-    provider = llm._get_provider()
-
+    provider = llm._get_provider("quality")
     if not provider.is_available():
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "The configured AI provider is unavailable. "
-                "Check the Ollama or Groq settings."
-            ),
-        )
-
+        raise HTTPException(status_code=503, detail="The configured AI provider is unavailable. Check the Ollama or Groq settings.")
     try:
-        reply = provider.invoke(
-            prompt,
-            system=system_prompt,
-            temperature=0,
-        )
-
+        reply = provider.invoke(prompt, system=CHAT_SYSTEM_PROMPT, temperature=0)
     except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "AI response generation failed: "
-                f"{error}"
-            ),
-        )
+        raise HTTPException(status_code=500, detail=f"AI response generation failed: {error}")
 
     return {
-        "reply": str(reply).strip(),
+        "reply": remove_reasoning_traces(str(reply)).strip(),
         "sources": sources,
+        "route": "semantic",
     }
+
 
 term_labels = {
     "effective_date": "Effective Date",
@@ -1599,8 +1772,7 @@ def get_llm_settings():
 @app.post("/settings")
 def update_llm_settings(settings: Dict[str, Any] = Body(...)):
     """Update LLM settings (provider, model, url)."""
-    allowed_keys = ["provider", "ollama_url", "ollama_model", "groq_model"]
-    filtered = {k: v for k, v in settings.items() if k in allowed_keys}
+    filtered = {k: v for k, v in settings.items() if k in EDITABLE_SETTINGS}
 
     if "provider" in filtered and filtered["provider"] not in ["groq", "ollama"]:
         raise HTTPException(status_code=400, detail="Invalid provider. Must be 'groq' or 'ollama'")
