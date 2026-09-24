@@ -18,6 +18,25 @@ DATA_FILE = os.path.join(DATA_DIR, "analyses.json")
 # metadata backfill started running on worker threads.
 _LOCK = RLock()
 
+def _replace_with_retry(src: str, dst: str, attempts: int = 6, delay: float = 0.05) -> None:
+    """
+    os.replace() atomically swaps src into dst everywhere, but on
+    Windows it can transiently fail with "Access is denied" (WinError
+    5) when something else - antivirus real-time scanning, the search
+    indexer - briefly holds a handle on one of the two files right as
+    we try to replace it. The lock clears within milliseconds, so a
+    short retry loop rides it out instead of failing the write.
+    """
+    last_error: Optional[OSError] = None
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as error:
+            last_error = error
+            if attempt < attempts - 1:
+                time.sleep(delay * (attempt + 1))
+    raise last_error
 
 class Store:
     def __init__(self) -> None:
@@ -39,7 +58,7 @@ class Store:
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
-                os.replace(tmp_path, DATA_FILE)
+                _replace_with_retry(tmp_path, DATA_FILE)
             except Exception:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
