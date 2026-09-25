@@ -1,7 +1,7 @@
 import json
-import time
 import os
 import tempfile
+import time
 from typing import Dict, Any, List, Optional
 from uuid import uuid4
 from threading import RLock
@@ -18,6 +18,7 @@ DATA_FILE = os.path.join(DATA_DIR, "analyses.json")
 # first. That happened in practice once uploads, analysis and the
 # metadata backfill started running on worker threads.
 _LOCK = RLock()
+
 
 def _replace_with_retry(src: str, dst: str, attempts: int = 6, delay: float = 0.05) -> None:
     """
@@ -38,6 +39,7 @@ def _replace_with_retry(src: str, dst: str, attempts: int = 6, delay: float = 0.
             if attempt < attempts - 1:
                 time.sleep(delay * (attempt + 1))
     raise last_error
+
 
 class Store:
     def __init__(self) -> None:
