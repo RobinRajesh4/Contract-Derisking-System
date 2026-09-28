@@ -192,3 +192,18 @@ def test_windows_encoded_text_file_is_read_correctly(client):
     record = main.store.get_analysis(r.json()["analysis_id"])
     assert record["contract_metadata"]["contract_value"] == 45892.0
     assert record["contract_metadata"]["currency"] == "GBP"
+
+
+def test_same_file_under_another_name_keeps_the_original_name(client):
+    first = upload(client, "julia_miller.txt", fixture_text("julia_miller.txt"))
+    second = upload(client, "copy_of_julia.txt", fixture_text("julia_miller.txt"))
+    assert second["analysis_id"] == first["analysis_id"]
+    assert second["duplicate_of"] == "julia_miller.txt"
+    assert main.store.get_analysis(first["analysis_id"])["filename"] == "julia_miller.txt"
+
+
+def test_folder_path_is_not_part_of_the_contract_name(client):
+    info = upload(client, "Contracts 2026/sub/julia_miller.txt", fixture_text("julia_miller.txt"))
+    assert main.store.get_analysis(info["analysis_id"])["filename"] == "julia_miller.txt"
+    info = upload(client, "C:\\\\Users\\\\x\\\\carlos.txt", fixture_text("carlos_brown_real_estate.txt"))
+    assert main.store.get_analysis(info["analysis_id"])["filename"] == "carlos.txt"

@@ -91,3 +91,57 @@ def test_sources_point_to_headers_in_answer_order():
     assert [(s["source_number"], s["filename"], s["clause_id"]) for s in sources] == [
         (1, "Contract_12.pdf", "header"), (2, "Contract_1.pdf", "header"),
     ]
+
+
+# ------------------------------------------- risk, second-highest, grouping
+# From a real session: "highest risks" was answered by amount, "second
+# highest" repeated the highest, "top lender" listed contracts.
+
+def analyzed(i, filename, value, levels, lender="FINANCIAL BANK OF AMERICA Inc", score=None):
+    r = record(i, filename, value, lender=lender)
+    r["status"] = "analyzed"
+    r["results"] = [{"id": n, "classification": {"risk_level": lvl}} for n, lvl in enumerate(levels, 1)]
+    r["policy_summary"] = {"total_policy_score": score} if score is not None else {}
+    return r
+
+
+RISKY = [
+    analyzed(1, "Contract_1.pdf", 82437, ["High", "Medium", "Low", "Low"]),
+    analyzed(2, "Contract_2.pdf", 38384, ["High", "High", "Medium", "Low"]),        # riskiest
+    analyzed(3, "Contract_3.pdf", 45892, ["High", "Medium", "Medium", "Medium"]),   # ties C1 on high, more medium
+    analyzed(4, "Contract_11.pdf", 1201349, ["Low", "Low", "Low"], lender="Other Bank"),
+    record(5, "Contract_12.pdf", 83400),                                           # not analyzed
+]
+
+
+def run_risky(**spec):
+    return execute_spec(ChatQuerySpec(kind="structured", **spec), RISKY)
+
+
+def test_riskiest_contracts_are_ranked_by_risk_not_amount():
+    r = run_risky(sort_by="high_risk_clauses", order="desc")
+    assert [a["filename"] for a in r["rows"]] == ["Contract_2.pdf", "Contract_3.pdf", "Contract_1.pdf", "Contract_11.pdf"]
+    assert "Not risk-analyzed yet, so left out: Contract_12.pdf" in r["answer"]
+    assert "| High-risk clauses |" in r["answer"] and "| Medium-risk clauses |" in r["answer"]
+
+
+def test_most_medium_risks():
+    r = run_risky(sort_by="medium_risk_clauses", order="desc", limit=1)
+    assert "**Contract_3.pdf** has the most medium-risk clauses: **3**" in r["answer"]
+
+
+def test_second_highest_amount():
+    r = run_risky(sort_by="contract_value", order="desc", limit=1, offset=1)
+    assert "**Contract_12.pdf** has the second highest amount: **$83,400.00**" in r["answer"]
+
+
+def test_lender_with_most_contracts():
+    r = run_risky(operation="group", group_by="lender_name")
+    assert "**FINANCIAL BANK OF AMERICA Inc** is the lender with the most contracts: **4** of 5" in r["answer"]
+    assert "| Other Bank | 1 |" in r["answer"]
+    assert {a["filename"] for a in r["rows"]} == {"Contract_1.pdf", "Contract_2.pdf", "Contract_3.pdf", "Contract_12.pdf"}
+
+
+def test_unanalyzed_contract_has_unknown_not_zero_risk():
+    r = run_risky(sort_by="high_risk_clauses", order="asc", limit=1)
+    assert "Contract_11.pdf" in r["answer"] and "Contract_12.pdf** has" not in r["answer"]

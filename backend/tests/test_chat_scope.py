@@ -395,3 +395,32 @@ def test_long_single_sentence_is_shortened_around_the_match():
               "agreed between the parties and any amendments thereto " * 5 + "with interest at 1.4% per month")
     short = main_module._focus_passage(clause, "monthly interest rate above 1.4%", 200)
     assert "1.4%" in short and len(short) <= 210
+
+
+# ---------------------------------------------- real-session regressions
+
+def test_structured_answer_says_how_many_contracts_it_covers(client, fake_llm):
+    load_portfolio(client)
+    fake_llm.handlers["ChatQuerySpec"] = lambda p: spec(sort_by="contract_value", order="desc", limit=1)
+    r = chat(client, "which contract has the highest financial amounts")
+    assert "Based on the 6 contracts currently stored" in r["reply"]
+
+
+def test_semantic_prompt_carries_risk_counts_and_the_no_inference_rule(client, fake_llm):
+    load_portfolio(client)
+    fake_llm.handlers["ChatQuerySpec"] = lambda p: json.dumps({"kind": "semantic", "contracts": ["Julia Miller"]})
+    chat(client, "why is Julia Miller's contract risky?")
+    prompt = last_answer_prompt(fake_llm)
+    assert "Risk analysis: not analyzed yet" in prompt
+    assert "Never\n   infer risk from the amount" in main_module.CHAT_SYSTEM_PROMPT
+
+
+@pytest.mark.parametrize("question, sort_by, offset, limit", [
+    ("which contracts have the highest risks", "high_risk_clauses", 0, None),
+    ("which contract is the riskiest", "high_risk_clauses", 0, 1),
+    ("what is the second highest amount", "contract_value", 1, 1),
+    ("third lowest loan amount", "contract_value", 2, 1),
+])
+def test_fallback_understands_risk_and_ordinals(question, sort_by, offset, limit):
+    s = heuristic_spec(question)
+    assert s is not None and (s.sort_by, s.offset, s.limit) == (sort_by, offset, limit)

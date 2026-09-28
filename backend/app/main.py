@@ -195,6 +195,9 @@ def ingest_document(
     Blocking; routes call it through run_in_threadpool.
     Raises ValueError if no text could be extracted.
     """
+    # Folder uploads can send "Folder/sub/file.pdf"; the contract's name
+    # is the file name.
+    filename = os.path.basename(str(filename or "").replace("\\", "/")) or "contract"
     text, ocr_info, pages = extract_text_from_file(filename, content)
     if not text or not text.strip():
         raise ValueError("No text could be extracted from the file")
@@ -219,10 +222,16 @@ def ingest_document(
         "content_hash": content_hash,
     }
 
+    duplicate_of: Optional[str] = None
     with _ingest_lock:
         existing = store.get_analysis(analysis_id) if analysis_id else None
         if existing is None:
             existing = store.find_by_content_hash(content_hash)
+            if existing is not None and existing.get("filename") and existing.get("filename") != filename:
+                # The same file under another name (e.g. a copy in another
+                # folder): keep the original record and its name.
+                duplicate_of = existing.get("filename")
+                fields["filename"] = duplicate_of
         reprocessed = existing is not None
 
         clauses_changed = True
@@ -283,6 +292,7 @@ def ingest_document(
         "clauses_changed": clauses_changed,
         "parse_quality": doc["parse_quality"],
         "search_index": search_index,
+        "duplicate_of": duplicate_of,
     }
 
 
@@ -1033,6 +1043,15 @@ def _directory_line(a: Dict[str, Any]) -> str:
         f"Governing law: {_fmt(cm.get('governing_law'))}",
         f"Indemnification clause: {_fmt(cm.get('indemnification_clause_present'))}",
     ]
+    results = a.get("results") or []
+    if a.get("status") == "analyzed" and results:
+        levels = [str((r.get("classification") or {}).get("risk_level", "")).lower() for r in results]
+        fields.append(
+            f"Risk analysis: {levels.count('high')} high / {levels.count('medium')} medium / "
+            f"{levels.count('low')} low-risk clauses of {len(results)}"
+        )
+    else:
+        fields.append("Risk analysis: not analyzed yet")
     return "- " + " | ".join(fields)
 
 
@@ -1064,6 +1083,10 @@ Rules:
 6. When drafting clause wording, put the draft in a blockquote, separate from
    your explanation.
 7. Be concise. Don't repeat caveats.
+8. A contract's risk comes only from its risk analysis (the directory's
+   high / medium / low-risk clause counts and the clause wording). Never
+   infer risk from the amount, the lender or anything else, and never state
+   a general rule (e.g. "larger loans are riskier") that isn't in the sources.
 """.strip()
 
 
@@ -1266,6 +1289,10 @@ def chat_endpoint(request: ChatRequest):
         answer = result["answer"]
         if note:
             answer = f"_{note}_\n\n{answer}"
+        if len(scope) > 1:
+            # So a user checking the answer knows what it covered (e.g. a
+            # folder upload still in progress).
+            answer += f"\n\n_Based on the {len(scope)} contracts currently stored._"
         return {
             "reply": answer,
             "sources": sources_for_rows(result["rows"]),

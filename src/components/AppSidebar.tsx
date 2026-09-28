@@ -33,7 +33,7 @@ const navItems = [
     icon: Home,
   },
   {
-    title: "Upload Contract",
+    title: "Upload Contracts",
     url: "/upload",
     icon: Upload,
   },

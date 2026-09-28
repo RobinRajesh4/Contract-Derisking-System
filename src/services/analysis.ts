@@ -39,11 +39,15 @@ export interface UploadResult {
   clauses_changed?: boolean;
   parse_quality?: { ok: boolean; ratio: number; missing_sample?: string[] };
   search_index?: { ok: boolean; passages: number; error?: string | null };
+  /** Set when the same file was already stored under another name. */
+  duplicate_of?: string | null;
 }
 
 export async function uploadContract(file: File): Promise<UploadResult> {
   const fd = new FormData();
-  fd.append("file", file);
+  // Just the file name: in a folder upload the browser would otherwise
+  // send "Folder/sub/file.pdf".
+  fd.append("file", file, file.name);
 
   const resp = await fetch(`${getBaseUrl()}/upload`, {
     method: "POST",
@@ -253,7 +257,9 @@ export function runAnalysis(analysis_id: string): Promise<AnalyzeResponse> {
 /** Warnings worth telling the user about after an upload. */
 export function uploadWarnings(u: UploadResult): string[] {
   const notes: string[] = [];
-  if (u.reprocessed) {
+  if (u.duplicate_of) {
+    notes.push(`Same file as "${u.duplicate_of}", which is already stored; no duplicate was created.`);
+  } else if (u.reprocessed) {
     notes.push(
       u.clauses_changed
         ? "This file was already uploaded; its record was re-processed and updated."

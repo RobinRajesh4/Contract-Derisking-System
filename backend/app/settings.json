@@ -8,5 +8,7 @@
   "ollama_num_ctx": 16384,
   "llm_timeout_sec": 240,
   "embedding_url": "",
-  "embedding_model": "qwen3-embedding:8b"
+  "embedding_model": "qwen3-embedding:8b",
+  "ollama_chat_model": "qwen3:32b",
+  "ollama_chat_fallback_models": ["gpt-oss:20b", "qwen3:8b"]
 }

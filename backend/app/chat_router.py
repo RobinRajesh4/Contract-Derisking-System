@@ -31,7 +31,34 @@ FIELD_LABELS = {
     "end_date": "End date",
     "indemnification_clause_present": "Indemnification clause",
     "ip_shared_with_customer": "IP shared with customer",
+    "high_risk_clauses": "High-risk clauses",
+    "medium_risk_clauses": "Medium-risk clauses",
+    "low_risk_clauses": "Low-risk clauses",
+    "total_clauses": "Clauses",
+    "policy_risk_score": "Policy risk score",
 }
+
+RISK_FIELDS = {"high_risk_clauses", "medium_risk_clauses", "low_risk_clauses", "total_clauses", "policy_risk_score"}
+_RISK_LEVEL = {"high_risk_clauses": "high", "medium_risk_clauses": "medium", "low_risk_clauses": "low"}
+
+
+def _is_analyzed(a: Dict[str, Any]) -> bool:
+    return a.get("status") == "analyzed" and bool(a.get("results"))
+
+
+def _risk_value(a: Dict[str, Any], field: str) -> Optional[float]:
+    """Risk figures from the stored analysis; None (unknown) when the
+    contract hasn't been risk-analyzed - never 0."""
+    if not _is_analyzed(a):
+        return None
+    results = a.get("results") or []
+    if field == "total_clauses":
+        return len(results)
+    if field == "policy_risk_score":
+        score = (a.get("policy_summary") or {}).get("total_policy_score")
+        return float(score) if isinstance(score, (int, float)) else None
+    level = _RISK_LEVEL[field]
+    return sum(1 for r in results if str((r.get("classification") or {}).get("risk_level", "")).lower() == level)
 
 _CURRENCY_SYMBOL = {"USD": "$", "INR": "₹", "EUR": "€", "GBP": "£"}
 
@@ -59,12 +86,22 @@ Each contract has these directory fields:
 filename, customer_name (borrower / customer), lender_name, contract_about
 (type of contract), governing_law, currency, contract_value (financed amount /
 total contract value), start_date, end_date (YYYY-MM-DD),
-indemnification_clause_present, ip_shared_with_customer.
+indemnification_clause_present, ip_shared_with_customer,
+and from its risk analysis: high_risk_clauses, medium_risk_clauses,
+low_risk_clauses (number of clauses rated at that level), total_clauses,
+policy_risk_score.
 
 kind = "structured" ONLY when the answer can be computed from those fields
-alone: ranking (highest, lowest, largest, smallest, top N, newest, oldest,
-earliest, latest), counting, totals, averages, or listing / filtering by
-those fields, or looking up one of those fields for a named contract.
+alone: ranking (highest, lowest, largest, smallest, top N, second/third,
+newest, oldest, earliest, latest, riskiest), counting, totals, averages,
+grouping (which lender / borrower / type has the most contracts), or
+listing / filtering by those fields, or looking up one of those fields for
+a named contract.
+
+Use the field the question is about. "Risk" / "risky" / "riskiest" means the
+risk fields (sort_by high_risk_clauses unless it names medium, low or the
+policy score) - never contract_value. If no field fits the question, use
+kind = "semantic".
 
 kind = "semantic" when the answer needs the wording of clauses: what a clause
 says, obligations, interest rates, penalties, fees, termination terms, risks,
@@ -74,6 +111,9 @@ Rules for structured specs:
 - "the highest / the lowest / the largest" (singular) -> limit 1.
 - plural without a number ("the lowest amounts") -> limit null (list all, sorted).
 - "top 3" -> limit 3.
+- "second highest" -> offset 1, limit 1; "third lowest" -> offset 2, limit 1.
+- "which lender / borrower / type has the most contracts", "contracts per
+  lender" -> operation "group" with group_by that field.
 - highest / largest / latest / newest -> order "desc"; lowest / smallest /
   earliest / oldest -> order "asc".
 - filters use op "contains" for names, "greater_than"/"less_than" for amounts,
@@ -103,6 +143,14 @@ Q: What is the total of the 3 largest loans?
 A: {{"kind":"structured","operation":"sum","sort_by":"contract_value","order":"desc","limit":3,"filters":[],"fields":[],"contracts":[],"across_contracts":false,"standalone_question":"What is the total of the 3 largest loans?"}}
 Q: Loans above 50k ending before 2027
 A: {{"kind":"structured","operation":"list","sort_by":"contract_value","order":"desc","limit":null,"filters":[{{"field":"contract_value","op":"greater_than","value":"50k"}},{{"field":"end_date","op":"before","value":"2027"}}],"fields":[],"contracts":[],"across_contracts":false,"standalone_question":"Which loans are above 50k and end before 2027?"}}
+Q: What's the second highest amount?
+A: {{"kind":"structured","operation":"list","sort_by":"contract_value","order":"desc","limit":1,"offset":1,"filters":[],"fields":[],"contracts":[],"across_contracts":false,"standalone_question":"Which contract has the second highest financed amount?"}}
+Q: Which contracts have the highest risks?
+A: {{"kind":"structured","operation":"list","sort_by":"high_risk_clauses","order":"desc","limit":null,"filters":[],"fields":[],"contracts":[],"across_contracts":false,"standalone_question":"Which contracts have the most high-risk clauses?"}}
+Q: Which contract has the most medium risks?
+A: {{"kind":"structured","operation":"list","sort_by":"medium_risk_clauses","order":"desc","limit":1,"filters":[],"fields":[],"contracts":[],"across_contracts":false,"standalone_question":"Which contract has the most medium-risk clauses?"}}
+Q: Who is the top lender for most contracts?
+A: {{"kind":"structured","operation":"group","group_by":"lender_name","sort_by":null,"order":"desc","limit":null,"filters":[],"fields":[],"contracts":[],"across_contracts":false,"standalone_question":"Which lender has the most contracts?"}}
 Q: When does Contract_3 end?
 A: {{"kind":"structured","operation":"list","sort_by":null,"order":"desc","limit":null,"filters":[],"fields":["end_date"],"contracts":["Contract_3"],"across_contracts":false,"standalone_question":"When does Contract_3 end?"}}
 Q: Who is the lender for Julia Miller?
@@ -163,6 +211,15 @@ def heuristic_spec(question: str) -> Optional[ChatQuerySpec]:
     q = question.strip()
     if _PLAIN_COUNT.match(q):
         return ChatQuerySpec(kind="structured", operation="count")
+    ql0 = q.lower()
+    ordinal = re.search(r"\b(second|2nd|third|3rd|fourth|4th|fifth|5th)\b", ql0)
+    offset = {"second": 1, "2nd": 1, "third": 2, "3rd": 2, "fourth": 3, "4th": 3, "fifth": 4, "5th": 4}[
+        ordinal.group(1)] if ordinal else 0
+    if re.search(r"\b(riskiest|most risky|highest risks?|most (?:high[- ])?risks?|high[- ]risk)\b", ql0) \
+            and re.search(r"\bcontracts?\b", ql0) and not re.search(r"\b(clause|say|mention)", ql0):
+        plural = bool(re.search(r"\bcontracts\b", ql0))
+        return ChatQuerySpec(kind="structured", sort_by="high_risk_clauses", order="desc",
+                             limit=None if plural and not offset else 1, offset=offset)
     if _NOT_ABOUT_AMOUNT.search(q) or not _AMOUNT_WORDS.search(q):
         return None
     ql = q.lower()
@@ -175,10 +232,12 @@ def heuristic_spec(question: str) -> Optional[ChatQuerySpec]:
     plural = bool(re.search(r"\bcontracts\b|\bloans\b|\bamounts\b", ql))
     top = re.search(r"\btop\s+(\d{1,2})\b|\b(\d{1,2})\s+(?:largest|biggest|highest|smallest|lowest)\b", ql)
     limit = int(top.group(1) or top.group(2)) if top else (None if plural else 1)
+    if offset:
+        limit = 1
     if re.search(r"\b(highest|largest|biggest|maximum|max|most valuable)\b|\bworth the most\b|\bmost (?:money|expensive)\b", ql):
-        return ChatQuerySpec(kind="structured", sort_by="contract_value", order="desc", limit=limit)
+        return ChatQuerySpec(kind="structured", sort_by="contract_value", order="desc", limit=limit, offset=offset)
     if re.search(r"\b(lowest|smallest|minimum|min)\b|(?<!\bat )\bleast\b", ql):
-        return ChatQuerySpec(kind="structured", sort_by="contract_value", order="asc", limit=limit)
+        return ChatQuerySpec(kind="structured", sort_by="contract_value", order="asc", limit=limit, offset=offset)
     if top:
         # "Top 5 contracts by value"
         return ChatQuerySpec(kind="structured", sort_by="contract_value", order="desc", limit=limit)
@@ -353,6 +412,8 @@ def structured_scope(
 def _field(a: Dict[str, Any], field: str) -> Any:
     if field == "filename":
         return a.get("filename")
+    if field in RISK_FIELDS:
+        return _risk_value(a, field)
     value = (a.get("contract_metadata") or {}).get(field)
     if field == "contract_value":
         return parse_money(value)
@@ -423,9 +484,11 @@ def _display(a: Dict[str, Any], field: str) -> str:
         return format_money(_field(a, "contract_value"), _field(a, "currency"))
     value = _field(a, field)
     if value is None:
-        return "not found"
+        return "not analyzed" if field in RISK_FIELDS else "not found"
     if isinstance(value, bool):
         return "Yes" if value else "No"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
     return str(value)
 
 
@@ -474,6 +537,10 @@ def execute_spec(spec: ChatQuerySpec, analyses: List[Dict[str, Any]]) -> Dict[st
         if notes:
             answer += "\n\n" + "\n".join(f"- {n}" for n in notes)
         return {"answer": answer, "rows": [], "notes": notes}
+
+    # Group ("which lender has the most contracts") ----------------------
+    if spec.operation == "group" or spec.group_by:
+        return _grouped(spec, selected, notes)
 
     # Aggregates --------------------------------------------------------
     if spec.operation in ("sum", "average"):
@@ -526,9 +593,12 @@ def execute_spec(spec: ChatQuerySpec, analyses: List[Dict[str, Any]]) -> Dict[st
         have = [a for a in selected if _field(a, spec.sort_by) is not None]
         missing = [a for a in selected if _field(a, spec.sort_by) is None]
         if missing:
-            notes.append(
-                f"No {FIELD_LABELS[spec.sort_by].lower()} found in: {_names(missing)} (left out of the ranking)."
-            )
+            if spec.sort_by in RISK_FIELDS:
+                notes.append(f"Not risk-analyzed yet, so left out: {_names(missing)}.")
+            else:
+                notes.append(
+                    f"No {FIELD_LABELS[spec.sort_by].lower()} found in: {_names(missing)} (left out of the ranking)."
+                )
         reverse = spec.order == "desc"
         if spec.sort_by == "contract_value":
             # Never rank a USD amount against an INR amount by number.
@@ -541,8 +611,24 @@ def execute_spec(spec: ChatQuerySpec, analyses: List[Dict[str, Any]]) -> Dict[st
                 (code, sorted(items, key=lambda a: _field(a, "contract_value"), reverse=reverse))
                 for code, items in sorted(by_currency.items())
             ]
+        elif spec.sort_by in RISK_FIELDS:
+            # Ties broken by the next most severe level, then the policy
+            # score: of two contracts with 2 high-risk clauses, the one
+            # with more medium-risk clauses ranks as riskier.
+            tie = {
+                "high_risk_clauses": ["high_risk_clauses", "medium_risk_clauses", "policy_risk_score"],
+                "medium_risk_clauses": ["medium_risk_clauses", "high_risk_clauses"],
+                "low_risk_clauses": ["low_risk_clauses"],
+                "total_clauses": ["total_clauses"],
+                "policy_risk_score": ["policy_risk_score", "high_risk_clauses"],
+            }[spec.sort_by]
+            groups = [(None, sorted(have, key=lambda a: tuple(_field(a, f) or 0 for f in tie), reverse=reverse))]
         else:
             groups = [(None, sorted(have, key=lambda a: str(_field(a, spec.sort_by)).lower(), reverse=reverse))]
+
+    # Offset ("second highest") ---------------------------------------------
+    if spec.offset and spec.sort_by:
+        groups = [(code, items[spec.offset:]) for code, items in groups]
 
     # Limit, keeping ties at the cut-off ------------------------------------
     if spec.limit:
@@ -574,6 +660,10 @@ def execute_spec(spec: ChatQuerySpec, analyses: List[Dict[str, Any]]) -> Dict[st
             columns.append(f.field)
     if spec.sort_by and spec.sort_by not in columns:
         columns.append(spec.sort_by)
+    if spec.sort_by in RISK_FIELDS:
+        for extra in ("high_risk_clauses", "medium_risk_clauses", "low_risk_clauses"):
+            if extra not in columns:
+                columns.append(extra)
     if not columns:
         # Lookup of a named contract, or a plain filter: show the parties
         # and the amount.
@@ -591,7 +681,19 @@ def execute_spec(spec: ChatQuerySpec, analyses: List[Dict[str, Any]]) -> Dict[st
             ("end_date", "desc"): "latest end date",
             ("start_date", "asc"): "earliest start date",
             ("start_date", "desc"): "latest start date",
+            ("high_risk_clauses", "desc"): "most high-risk clauses",
+            ("high_risk_clauses", "asc"): "fewest high-risk clauses",
+            ("medium_risk_clauses", "desc"): "most medium-risk clauses",
+            ("medium_risk_clauses", "asc"): "fewest medium-risk clauses",
+            ("low_risk_clauses", "desc"): "most low-risk clauses",
+            ("low_risk_clauses", "asc"): "fewest low-risk clauses",
+            ("policy_risk_score", "desc"): "highest policy risk score",
+            ("policy_risk_score", "asc"): "lowest policy risk score",
+            ("total_clauses", "desc"): "most clauses",
+            ("total_clauses", "asc"): "fewest clauses",
         }.get((spec.sort_by, spec.order), f"{spec.order} {FIELD_LABELS.get(spec.sort_by, spec.sort_by)}")
+        if spec.offset:
+            word = _ordinal(spec.offset + 1) + " " + word  # "second highest amount"
         lead = f"**{_name(a)}** has the {word}: **{_display(a, spec.sort_by)}**."
     elif spec.limit == 1 and spec.sort_by and len(rows) > 1 and len(groups) == 1:
         lead = f"{len(rows)} contracts are tied:"
@@ -616,6 +718,69 @@ def execute_spec(spec: ChatQuerySpec, analyses: List[Dict[str, Any]]) -> Dict[st
     if notes:
         parts.append("\n".join(f"- {n}" for n in notes))
     return {"answer": "\n\n".join(parts), "rows": rows, "notes": notes}
+
+
+def _grouped(spec: ChatQuerySpec, selected: List[Dict[str, Any]], notes: List[str]) -> Dict[str, Any]:
+    """Contracts counted (and amounts totalled, per currency) for each
+    value of spec.group_by, most contracts first."""
+    field = spec.group_by or "lender_name"
+    label = FIELD_LABELS.get(field, field)
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    shown: Dict[str, str] = {}
+    unknown: List[Dict[str, Any]] = []
+    for a in selected:
+        value = _field(a, field)
+        if value is None or not str(value).strip():
+            unknown.append(a)
+            continue
+        key = _norm(value)
+        groups.setdefault(key, []).append(a)
+        shown.setdefault(key, str(value))
+    if not groups:
+        return {"answer": f"No {label.lower()} is recorded for these contracts.", "rows": [], "notes": notes}
+
+    ordered = sorted(groups.items(), key=lambda kv: (-len(kv[1]), shown[kv[0]].lower()))
+    if spec.order == "asc":
+        ordered = sorted(groups.items(), key=lambda kv: (len(kv[1]), shown[kv[0]].lower()))
+    if spec.limit:
+        edge = len(ordered[min(spec.limit, len(ordered)) - 1][1])
+        ordered = [kv for i, kv in enumerate(ordered) if i < spec.limit or len(kv[1]) == edge]
+
+    def totals(items: List[Dict[str, Any]]) -> str:
+        by_cur: Dict[str, float] = {}
+        for a in items:
+            v = _field(a, "contract_value")
+            if v is not None:
+                code = (_field(a, "currency") or "").upper()
+                by_cur[code] = by_cur.get(code, 0.0) + v
+        return ", ".join(format_money(v, c) for c, v in sorted(by_cur.items())) or "not found"
+
+    top_key, top_items = ordered[0]
+    tied = [kv for kv in ordered if len(kv[1]) == len(top_items)]
+    most = "most" if spec.order != "asc" else "fewest"
+    if len(tied) == 1:
+        lead = (f"**{shown[top_key]}** is the {label.lower()} with the {most} contracts: "
+                f"**{len(top_items)}** of {len(selected)}.")
+    else:
+        lead = (f"{len(tied)} {label.lower()}s are tied with {len(top_items)} contract"
+                f"{'s' if len(top_items) != 1 else ''} each: " + ", ".join(f"**{shown[k]}**" for k, _ in tied) + ".")
+    lines = [f"| # | {label} | Contracts | Total amount | Which |", "|---|---|---|---|---|"]
+    for i, (key, items) in enumerate(ordered, start=1):
+        names = ", ".join(_name(a) for a in items[:6]) + (" …" if len(items) > 6 else "")
+        lines.append(f"| {i} | {shown[key].replace('|', '/')} | {len(items)} | {totals(items)} | {names.replace('|', '/')} |")
+    if unknown:
+        notes.append(f"No {label.lower()} recorded for: {_names(unknown)}.")
+    parts = [lead, "\n".join(lines)]
+    if notes:
+        parts.append("\n".join(f"- {n}" for n in notes))
+    # References: the contracts in the top group(s), each at its header.
+    rows = [a for _, items in tied for a in items]
+    return {"answer": "\n\n".join(parts), "rows": rows, "notes": notes}
+
+
+def _ordinal(n: int) -> str:
+    words = {2: "second", 3: "third", 4: "fourth", 5: "fifth", 6: "sixth", 7: "seventh", 8: "eighth", 9: "ninth", 10: "tenth"}
+    return words.get(n, f"{n}th")
 
 
 def _table(items: List[Dict[str, Any]], columns: List[str], start: int = 1) -> str:

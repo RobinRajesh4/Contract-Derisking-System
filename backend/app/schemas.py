@@ -298,7 +298,19 @@ StructuredField = Literal[
     "end_date",
     "indemnification_clause_present",
     "ip_shared_with_customer",
+    # From each contract's risk analysis (unknown until it's analyzed).
+    "high_risk_clauses",
+    "medium_risk_clauses",
+    "low_risk_clauses",
+    "total_clauses",
+    "policy_risk_score",
 ]
+
+SortField = Literal[
+    "contract_value", "start_date", "end_date", "customer_name",
+    "high_risk_clauses", "medium_risk_clauses", "low_risk_clauses", "total_clauses", "policy_risk_score",
+]
+GroupField = Literal["lender_name", "customer_name", "contract_about", "governing_law", "currency"]
 
 
 class QueryFilter(BaseModel):
@@ -317,10 +329,15 @@ class ChatQuerySpec(BaseModel):
     says, whether terms are risky, drafting, comparisons of terms)."""
 
     kind: Literal["structured", "semantic"]
-    operation: Literal["list", "count", "sum", "average"] = "list"
-    sort_by: Optional[Literal["contract_value", "start_date", "end_date", "customer_name"]] = None
+    operation: Literal["list", "count", "sum", "average", "group"] = "list"
+    sort_by: Optional[SortField] = None
     order: Literal["asc", "desc"] = "desc"
     limit: Optional[int] = Field(default=None, ge=1, le=100)
+    # Rows to skip after sorting: "second highest" -> offset 1, limit 1.
+    offset: int = Field(default=0, ge=0, le=100)
+    # operation="group": count contracts (and total their amounts) per
+    # value of this field - "which lender has the most contracts".
+    group_by: Optional[GroupField] = None
     filters: List[QueryFilter] = Field(default_factory=list)
     # Which fields a lookup asks for ("When does Contract_3 end?" ->
     # ["end_date"]), so the answer shows that field, not a default set.
