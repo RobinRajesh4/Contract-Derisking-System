@@ -351,6 +351,19 @@ export default function Chat() {
                       )}
                     </div>
 
+                    {/* Which model answered, and how */}
+                    {isBot && message.route && (
+                      <p className="mt-2 text-[10px] text-muted-foreground">
+                        {message.route === "structured"
+                          ? `Exact answer computed from the contract data${
+                              message.routerModel ? ` · question read by ${message.routerModel}` : ""
+                            }`
+                          : message.route === "semantic"
+                            ? `Answered by ${message.model ?? "the AI model"} from the contract text`
+                            : null}
+                      </p>
+                    )}
+
                     {/* Source chips */}
                     {isBot &&
                       message.sources &&
@@ -392,6 +405,14 @@ export default function Chat() {
                                     {typeof source.score === "number" && (
                                       <span>
                                         Relevance {source.score.toFixed(2)}
+                                      </span>
+                                    )}
+                                    {source.also_in && source.also_in.length > 0 && (
+                                      <span
+                                        title={source.also_in.map((o) => o.filename).join(", ")}
+                                      >
+                                        Same wording in {source.also_in.length} other contract
+                                        {source.also_in.length === 1 ? "" : "s"}
                                       </span>
                                     )}
                                     <span className="font-medium text-primary group-hover:underline">

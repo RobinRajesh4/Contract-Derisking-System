@@ -66,7 +66,7 @@ def test_server_error_is_retried_then_succeeds(monkeypatch, no_sleep):
 
 
 def test_server_error_gives_up_after_retries(monkeypatch, no_sleep):
-    calls = script(monkeypatch, [FakeResponse(500, "out of memory")])
+    calls = script(monkeypatch, [FakeResponse(503, "server busy, try again")])
     with pytest.raises(LLMError, match="after 4 attempts"):
         OllamaProvider(model="qwen3:8b").invoke("hi")
     assert len(calls) == 4
@@ -196,3 +196,13 @@ def test_check_left_out_by_the_model_is_not_a_server_failure(client, fake_llm):
     fake_llm.handlers["ComplianceResponse"] = lambda p: json.dumps({"results": []})
     r = client.post("/analyze", json={"analysis_id": aid, "policy": TEST_POLICY}).json()
     assert r["analysis_quality"]["complete"] is True
+
+
+
+def test_out_of_memory_is_not_retried(monkeypatch, no_sleep):
+    # A bigger model that doesn't fit won't fit 2 seconds later either;
+    # fail fast so the chat can use a smaller one.
+    calls = script(monkeypatch, [FakeResponse(500, '{"error":"model requires more system memory (13.5 GiB) than is available (13.0 GiB)"}')])
+    with pytest.raises(LLMError, match="memory"):
+        OllamaProvider(model="qwen3:32b").invoke("hi")
+    assert len(calls) == 1

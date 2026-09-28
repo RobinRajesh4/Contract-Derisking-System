@@ -58,7 +58,7 @@ const navItems = [
     icon: GitCompare,
   },
   {
-    title: "Chatbot",
+    title: "Interact",
     url: "/chat",
     icon: MessageSquare,
   },

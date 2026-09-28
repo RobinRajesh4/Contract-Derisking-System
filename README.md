@@ -155,6 +155,10 @@ stored facts and risk figures, never by the model doing arithmetic:
   clauses (ties broken by medium-risk clauses);
 - grouping: **"which lender has the most contracts"**.
 
+Under each answer the chat shows how it was produced: **"Exact answer
+computed from the contract data"** or **"Answered by <model> from the
+contract text"**. The backend log also prints `[chat] answered by …`.
+
 Rankings, counts and totals always cover **all** contracts, even when
 one contract is open. Different currencies are never compared or added
 together. Each answer says how many contracts it covers.
@@ -200,14 +204,18 @@ contract has the highest amount?", "how many contracts are there?",
   "ollama_num_ctx": 16384,
   "llm_timeout_sec": 240,
   "embedding_url": "",
-  "embedding_model": "qwen3-embedding:8b"
+  "embedding_model": "qwen3-embedding:8b",
+  "ollama_chat_model": "qwen3:32b",
+  "ollama_chat_fallback_models": ["gpt-oss:20b", "qwen3:8b"]
 }
 ```
 
 | Key | Meaning |
 |---|---|
 | `ollama_model` | Model for per-clause work (classification, compliance checks) |
-| `ollama_quality_model` | Model for per-contract work: fact extraction, summaries, question routing, chat answers. `qwen3:32b` is stronger but needs about 13.5 GB free on the server. |
+| `ollama_quality_model` | Model for per-contract work: fact extraction, summaries, question routing. Also the last fallback for chat answers. |
+| `ollama_chat_model` | Optional: a bigger model for writing chat answers, e.g. `qwen3:32b` (needs about 13.5 GB free on the server). |
+| `ollama_chat_fallback_models` | Models tried next, in order, if the chat model can't answer (out of memory, timeout, error), e.g. `["gpt-oss:20b", "qwen3:8b"]`. The chat shows which model answered. |
 | `ollama_num_ctx` | Context window. Must be large enough for whole-contract chat prompts; answers are refused rather than silently truncated if a prompt doesn't fit. |
 | `llm_concurrency` | How many LLM calls run in parallel during one analysis |
 | `llm_timeout_sec` | How long to wait for one model answer |
@@ -363,4 +371,3 @@ The full list with request/response schemas is at
 - **Shared AI server**: analysis speed depends on how busy it is.
   Bigger models may not fit in its memory; see `ollama_quality_model`
   above.
-  

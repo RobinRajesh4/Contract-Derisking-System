@@ -5,7 +5,7 @@ import re
 from pydantic import BaseModel, ValidationError
 
 from .utils import MCPConfig, mcp_post
-from ..llm_providers import get_llm_provider, LLMError
+from ..llm_providers import get_llm_provider, provider_for_model, LLMError
 from ..parser import _FIELD_LABELS, extract_labeled_facts, find_money_amounts
 from ..schemas import (
     parse_money,
@@ -775,6 +775,10 @@ def ground_metadata(meta: Dict[str, Any], text: str) -> Dict[str, Any]:
 class LLMClient:
     def __init__(self) -> None:
         self.cfg = MCPConfig()
+
+    def _provider_for_model(self, model: str):
+        """Provider for one named model (used by the chat fallback chain)."""
+        return provider_for_model(model)
 
     def _get_provider(self, task: str = "bulk"):
         """

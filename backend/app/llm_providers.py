@@ -8,9 +8,10 @@ Two model "tiers" are used, selected per task:
              metadata extraction, executive summary, chat answers,
              chat question routing). Accuracy matters more than speed.
 """
-from typing import Optional, Dict, Any
+from typing import Any, Dict, List, Optional
 from abc import ABC, abstractmethod
 import json
+import re
 import os
 import threading
 import time
@@ -65,6 +66,8 @@ EDITABLE_SETTINGS = [
     "llm_timeout_sec",
     "embedding_url",
     "embedding_model",
+    "ollama_chat_model",
+    "ollama_chat_fallback_models",
 ]
 
 
@@ -127,6 +130,26 @@ def silence_insecure_warning_if_needed() -> None:
         "are disabled for the Ollama server."
     )
     _warned_insecure = True
+
+
+def chat_models() -> List[str]:
+    """
+    Models to try, in order, for writing chat answers:
+    ollama_chat_model, then ollama_chat_fallback_models, then the quality
+    model. A bigger model can be used when the shared server has room,
+    with a smaller one answering when it doesn't.
+    """
+    ordered: List[str] = []
+    candidates = [_settings.get("ollama_chat_model")]
+    fallbacks = _settings.get("ollama_chat_fallback_models") or []
+    if isinstance(fallbacks, str):
+        fallbacks = [f.strip() for f in fallbacks.split(",")]
+    candidates += list(fallbacks) + [model_for_task("quality")]
+    for m in candidates:
+        m = str(m or "").strip()
+        if m and m not in ordered:
+            ordered.append(m)
+    return ordered
 
 
 def model_for_task(task: str = "bulk") -> str:
@@ -203,6 +226,7 @@ _server_caps = {"format_schema": True, "think": True}
 _availability_cache: Dict[str, Any] = {"url": None, "ok": False, "at": 0.0}
 _availability_lock = threading.Lock()
 
+_NOT_TRANSIENT = re.compile(r"requires more system memory|out of memory|not enough memory|model .* not found", re.IGNORECASE)
 _MAX_TRANSIENT_RETRIES = 3   # 5xx / connection errors: waits 2s, 4s, 8s
 # A timeout already cost llm_timeout_sec; retrying it doubles the wait
 # for little gain, so it isn't retried.
@@ -301,6 +325,13 @@ class OllamaProvider(BaseLLMProvider):
                     use_think = False
                     capability_retries += 1
                     continue
+            if r.status_code >= 500 and _NOT_TRANSIENT.search(r.text or ""):
+                # The model can't be loaded at all right now (not enough
+                # memory, unknown model); retrying won't help, a smaller
+                # model might.
+                raise LLMError(
+                    f"Ollama returned HTTP {r.status_code} for model {self.model}: {r.text[:300]}"
+                )
             if r.status_code >= 500:
                 transient_failures += 1
                 last_error = f"HTTP {r.status_code}: {r.text[:300]}"
@@ -373,6 +404,11 @@ class OllamaProvider(BaseLLMProvider):
                 ok = False
             _availability_cache.update({"url": self.base_url, "ok": ok, "at": now})
             return ok
+
+
+def provider_for_model(model: str) -> BaseLLMProvider:
+    """An Ollama provider for one specific model (chat fallback chain)."""
+    return OllamaProvider(model=model)
 
 
 def get_llm_provider(task: str = "bulk") -> BaseLLMProvider:

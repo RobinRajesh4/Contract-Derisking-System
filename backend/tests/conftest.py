@@ -90,6 +90,7 @@ class FakeLLM:
 
 FAKE = FakeLLM()
 llm_agent.get_llm_provider = lambda task="bulk": FAKE
+llm_agent.provider_for_model = lambda model: FAKE
 
 import app.main as main  # noqa: E402
 

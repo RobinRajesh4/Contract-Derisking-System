@@ -72,6 +72,33 @@ def _default_min_score(model: str) -> float:
     return 0.30
 
 
+_LEXICAL_STOPWORDS = {
+    "the", "and", "for", "are", "what", "which", "does", "with", "this", "that", "from", "have", "has",
+    "any", "all", "contract", "contracts", "clause", "clauses", "say", "says", "about", "more", "than",
+    "less", "how", "much", "many", "there", "their", "they", "who", "when", "mentioned", "mention",
+    "is", "was", "were", "been", "being", "its", "into", "our", "your", "you", "did", "do", "can",
+    "agreement", "agreements", "specifically", "wrong", "please", "tell", "show", "list", "give",
+}
+# Added to a passage's similarity for each distinct word of the question it
+# contains (capped): exact contract terms ("interest", "penalty") should
+# lift a passage even when the embedding ranks a generic one higher.
+_LEXICAL_BONUS = 0.1
+_LEXICAL_CAP = 0.3
+
+
+def _query_terms(text: str) -> List[str]:
+    words = {w.strip(".%") for w in re.findall(r"[a-z0-9%.]{3,}", (text or "").lower())}
+    return [w for w in words if w and w not in _LEXICAL_STOPWORDS]
+
+
+def _lexical_bonus(terms: List[str], passage: str) -> float:
+    if not terms:
+        return 0.0
+    low = (passage or "").lower()
+    hits = sum(1 for t in terms if re.search(r"(?<![a-z0-9])" + re.escape(t), low))
+    return min(_LEXICAL_CAP, _LEXICAL_BONUS * hits)
+
+
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip().lower()
 
@@ -279,7 +306,10 @@ class RAGStore:
 
     # ------------------------------------------------------------ read
 
-    def _search(self, vector: List[float], query_filter, limit: int, use_floor: bool = True) -> List[Dict[str, Any]]:
+    def _search(
+        self, vector: List[float], query_filter, limit: int, use_floor: bool = True, margin: Optional[float] = None,
+        terms: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         with _QDRANT_LOCK:
             hits = self.client.query_points(
                 collection_name=self.collection,
@@ -291,12 +321,21 @@ class RAGStore:
         if not hits:
             return []
 
-        best = float(hits[0].score)
-        cutoff = max(self.min_score if use_floor else float("-inf"), best - self.relative_margin)
+        # Similarity plus a bonus for the question's own words, then the
+        # usual cut-offs on that combined score.
+        scored = sorted(
+            ((float(h.score) + _lexical_bonus(terms or [], (h.payload or {}).get("text", "")), h) for h in hits),
+            key=lambda pair: pair[0],
+            reverse=True,
+        )
+        best = scored[0][0]
+        cutoff = max(
+            self.min_score if use_floor else float("-inf"),
+            best - (self.relative_margin if margin is None else margin),
+        )
         seen = set()
         output: List[Dict[str, Any]] = []
-        for hit in hits:
-            score = float(hit.score)
+        for score, hit in scored:
             if score < cutoff:
                 break
             payload = hit.payload or {}
@@ -351,7 +390,7 @@ class RAGStore:
         if exclude_analysis_ids:
             must_not.append(qmodels.FieldCondition(key="analysis_id", match=qmodels.MatchAny(any=list(exclude_analysis_ids))))
         query_filter = qmodels.Filter(must=must or None, must_not=must_not or None) if (must or must_not) else None
-        return self._search(vector, query_filter, max(1, min(int(top_k), 20)))
+        return self._search(vector, query_filter, max(1, min(int(top_k), 20)), terms=_query_terms(query_text))
 
     def query_per_contract(
         self, text: str, analysis_ids: List[str], per_contract: int = 1
@@ -368,13 +407,18 @@ class RAGStore:
         if not query_text or not analysis_ids:
             return []
         vector = self.embed([query_text], kind="query")[0]
+        terms = _query_terms(query_text)
         output: List[Dict[str, Any]] = []
         for analysis_id in analysis_ids:
             # No absolute floor here: the question must look at every
             # contract, so each one's best passage is kept and the model
             # judges whether it says anything relevant.
+            # A wider margin than normal search: the best few passages of
+            # each contract, since an answer can span clauses whose scores
+            # differ (regular interest vs. late-payment interest).
             output.extend(
-                self._search(vector, self._analysis_filter(analysis_id), max(1, per_contract), use_floor=False)
+                self._search(vector, self._analysis_filter(analysis_id), max(1, per_contract),
+                             use_floor=False, margin=max(self.relative_margin, 0.3), terms=terms)
             )
         return output
 

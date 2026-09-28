@@ -1087,6 +1087,20 @@ Rules:
    high / medium / low-risk clause counts and the clause wording). Never
    infer risk from the amount, the lender or anything else, and never state
    a general rule (e.g. "larger loans are riskier") that isn't in the sources.
+9. Refer to a clause only by the clause shown in its source's label, and
+   state a value only if that source's text contains it. Never move a
+   number from one clause, rate or contract to another.
+10. A source marked "identical wording also in: ..." applies to every
+   contract listed; say so instead of repeating it per contract.
+11. When a contract states several values of one kind (e.g. a regular
+   interest rate and a late-payment interest rate, or a penalty and an
+   interest), list each with what it is for and its clause.
+12. If asked whether a term is fine, acceptable, reasonable or compliant,
+   and no policy or standard in the sources defines what is acceptable,
+   state the term(s) exactly and say there is no defined standard to judge
+   them against. Do not approve or reject them on your own.
+13. If the user says an earlier answer was wrong, re-check against the
+   sources only; don't defend or repeat the earlier answer.
 """.strip()
 
 
@@ -1199,6 +1213,101 @@ def _whole_contract_passages(record: Dict[str, Any], budget: int) -> Optional[Li
     return out
 
 
+_NUMBER_WORDS = {w: i for i, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen "
+    "sixteen seventeen eighteen nineteen twenty".split())}
+_NUM = r"(?:\d{1,3}|" + "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True)) + r")"
+_CLAUSE_REF = re.compile(
+    r"\b(?:clauses?|articles?|sections?|§)\s*(" + _NUM + r"(?:\s*(?:,|and|&|or|/)\s*" + _NUM + r")*)",
+    re.IGNORECASE,
+)
+
+
+def _clause_numbers(text: str) -> List[int]:
+    """Clause numbers the question refers to: "clauses 3 and 6",
+    "clause six", "section 2, 4"."""
+    found: List[int] = []
+    for m in _CLAUSE_REF.finditer(text or ""):
+        for tok in re.findall(_NUM, m.group(1), re.IGNORECASE):
+            n = int(tok) if tok.isdigit() else _NUMBER_WORDS.get(tok.lower())
+            if n and n not in found:
+                found.append(n)
+    return found[:6]
+
+
+def _clause_by_number(record: Dict[str, Any], n: int) -> Optional[Dict[str, Any]]:
+    """The clause headed "CLAUSE SIX" / "Clause 6" / "6." in this contract,
+    else the clause stored as number n."""
+    word = [w for w, i in _NUMBER_WORDS.items() if i == n]
+    heading = re.compile(
+        r"^\s*(?:(?:clause|article|section)\s+(?:" + str(n) + (("|" + word[0]) if word else "") + r")\b|" + str(n) + r"[.)]\s)",
+        re.IGNORECASE,
+    )
+    clauses = record.get("clauses") or []
+    for c in clauses:
+        if heading.match(str(c.get("text", ""))):
+            return c
+    for c in clauses:
+        if str(c.get("id")) == str(n):
+            return c
+    return None
+
+
+def _merge_identical(passages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Many contracts are the same template: the same clause wording appears
+    in each of them. Sending 17 copies of one sentence wastes the prompt
+    and invites the model to mix them up, so identical wording becomes
+    one source that lists every contract it appears in.
+    """
+    merged: List[Dict[str, Any]] = []
+    by_key: Dict[str, Dict[str, Any]] = {}
+    for p in passages:
+        text = str(p.get("text", "")).strip()
+        if not text:
+            continue
+        key = re.sub(r"\s+", " ", text).lower()
+        if key in by_key:
+            first = by_key[key]
+            if p.get("analysis_id") != first.get("analysis_id") and p.get("analysis_id") not in first["also_in"]:
+                first["also_in"].append(p.get("analysis_id"))
+            continue
+        entry = dict(p, text=text, also_in=[])
+        by_key[key] = entry
+        merged.append(entry)
+    return merged
+
+
+def _answer_with_fallback(prompt: str):
+    """
+    Write the chat answer with the first model that can: the configured
+    chat model, then its fallbacks (settings: ollama_chat_model,
+    ollama_chat_fallback_models, then ollama_quality_model). A bigger
+    model that doesn't fit in the shared server's memory right now hands
+    over to the next one instead of failing the question.
+    Returns (reply, model, failures) - reply None if every model failed.
+    """
+    from .llm_providers import chat_models
+
+    if get_settings().get("provider", "ollama") != "ollama":
+        provider = llm._get_provider("quality")
+        try:
+            return provider.invoke(prompt, system=CHAT_SYSTEM_PROMPT, temperature=0), getattr(provider, "model", None), []
+        except Exception as error:
+            return None, None, [str(error)]
+
+    failures: List[str] = []
+    for model in chat_models():
+        try:
+            reply = llm._provider_for_model(model).invoke(prompt, system=CHAT_SYSTEM_PROMPT, temperature=0)
+            if failures:
+                print(f"[chat] fell back to {model} after: {' | '.join(failures)}")
+            return reply, model, failures
+        except Exception as error:
+            failures.append(f"{model}: {str(error)[:160]}")
+    return None, None, failures
+
+
 def _cited_source_numbers(reply: str) -> List[int]:
     found = re.findall(r"#source-(\d+)|\[Source (\d+)\]", reply or "")
     return sorted({int(a or b) for a, b in found})
@@ -1258,6 +1367,7 @@ def chat_endpoint(request: ChatRequest):
 
     spec = route_question(llm, query, history)
     routed_by = "llm"
+    router_model = getattr(llm._get_provider("quality"), "model", None)
     if spec is None:
         spec = heuristic_spec(query)
         routed_by = "heuristic" if spec is not None else "none"
@@ -1299,6 +1409,9 @@ def chat_endpoint(request: ChatRequest):
             "route": "structured",
             "routed_by": routed_by,
             "query_spec": spec.model_dump(),
+            # Computed in code; the model only interpreted the question.
+            "model": None,
+            "router_model": router_model,
         }
 
     # 2) Semantic questions: clause text + LLM.
@@ -1311,6 +1424,11 @@ def chat_endpoint(request: ChatRequest):
     passages: List[Dict[str, Any]] = []
     coverage = ""
     from_search = False
+    # "you're wrong about clauses 3 and 6": fetch those clauses directly -
+    # the sentence itself says nothing about what they contain, so search
+    # alone would miss them.
+    asked_clauses = _clause_numbers(f"{query} {rewritten}")
+    shorten_to_budget = False
     try:
         if named:
             targets = named[:_MAX_NAMED_CONTRACTS]
@@ -1338,17 +1456,16 @@ def chat_endpoint(request: ChatRequest):
                 whole = need_rag().query(search_text, top_k=top_k, filter_by_analysis=single)
                 from_search = True
             passages = whole
-        elif (spec is not None and spec.across_contracts) or looks_across_contracts(search_text):
+        elif (spec is not None and spec.across_contracts) or looks_across_contracts(search_text) or asked_clauses:
             ids = [a["analysis_id"] for a in all_analyses]
-            passages = need_rag().query_per_contract(search_text, ids, per_contract=1)
+            # Up to 3 passages per contract: an answer can span clauses
+            # (regular interest in one, late interest in another).
+            passages = need_rag().query_per_contract(search_text, ids, per_contract=3)
             from_search = True
-            if passages:
-                share = max(250, _ACROSS_CHAR_BUDGET // len(passages))
-                for p in passages:
-                    p["text"] = _focus_passage(p.get("text", ""), search_text, share)
+            shorten_to_budget = True  # after identical wording is merged
             covered = {p["analysis_id"] for p in passages}
             coverage = (
-                f"The sources are the most relevant passage from each of {len(covered)} of the "
+                f"The sources are the most relevant passages from each of {len(covered)} of the "
                 f"{len(all_analyses)} contracts (long passages shortened with '…')."
             )
             missing = [a.get("filename") or a["analysis_id"] for a in all_analyses if a["analysis_id"] not in covered]
@@ -1368,16 +1485,47 @@ def chat_endpoint(request: ChatRequest):
     except Exception as error:
         raise HTTPException(status_code=503, detail=f"Contract search failed: {error}")
 
+    if asked_clauses:
+        # The clauses the question names, from every contract in scope,
+        # ahead of the search results.
+        if named:
+            in_scope = named[:_MAX_NAMED_CONTRACTS]
+        elif selected is not None:
+            in_scope = [selected]
+        else:
+            in_scope = all_analyses
+        pinned = []
+        for record in in_scope:
+            for n in asked_clauses:
+                c = _clause_by_number(record, n)
+                if c and str(c.get("text", "")).strip():
+                    pinned.append({"analysis_id": record["analysis_id"], "clause_id": c.get("id"),
+                                   "kind": "clause", "text": c["text"], "score": None})
+        have = {(p.get("analysis_id"), str(p.get("clause_id"))) for p in pinned}
+        passages = pinned + [p for p in passages if (p.get("analysis_id"), str(p.get("clause_id"))) not in have]
+        coverage = (coverage + " " if coverage else "") + (
+            "The question names clause(s) " + ", ".join(str(n) for n in asked_clauses)
+            + "; those clauses are included first for every contract in scope."
+        )
+
     names = {a.get("analysis_id"): (a.get("filename") or f"Contract {a.get('analysis_id')}") for a in all_analyses}
     context_parts, sources = [], []
-    for p in passages:
-        text = str(p.get("text", "")).strip()
-        if not text:
-            continue
+    merged = _merge_identical(passages)
+    if shorten_to_budget and merged:
+        share = max(250, _ACROSS_CHAR_BUDGET // len(merged))
+        for p in merged:
+            p["text"] = _focus_passage(p["text"], search_text, share)
+    for p in merged:
+        text = p["text"]
         index = len(sources) + 1
         label = names.get(p.get("analysis_id"), f"Contract {p.get('analysis_id')}")
         where = "contract header (parties, amounts)" if p.get("kind") == "header" else f"clause {p.get('clause_id')}"
-        context_parts.append(f"[Source {index} | {label} | {where}]\n{text}")
+        others = [names.get(i, str(i)) for i in p["also_in"]]
+        shared = ""
+        if others:
+            listed = ", ".join(others[:30]) + (f" and {len(others) - 30} more" if len(others) > 30 else "")
+            shared = f" | identical wording also in: {listed}"
+        context_parts.append(f"[Source {index} | {label} | {where}{shared}]\n{text}")
         sources.append({
             "source_number": index,
             "analysis_id": p.get("analysis_id"),
@@ -1386,11 +1534,14 @@ def chat_endpoint(request: ChatRequest):
             "text": text,
             "score": p.get("score"),
             "kind": p.get("kind", "clause"),
+            "also_in": [{"analysis_id": i, "filename": names.get(i, str(i))} for i in p["also_in"]],
         })
 
     # Directory rows only for the contracts being discussed; a short form
     # when there are many, so the prompt stays inside the context window.
-    in_sources = {src["analysis_id"] for src in sources}
+    in_sources = {src["analysis_id"] for src in sources} | {
+        o["analysis_id"] for src in sources for o in src.get("also_in", [])
+    }
     discussed = [a for a in all_analyses if a.get("analysis_id") in in_sources or a is selected]
     if len(discussed) > 12:
         directory = "\n".join(
@@ -1434,17 +1585,27 @@ def chat_endpoint(request: ChatRequest):
     if len(prompt) > _MAX_PROMPT_CHARS:
         # The sources matter more than the conversation.
         prompt = build_prompt([], context_parts)
+    dropped = 0
+    while len(prompt) > _MAX_PROMPT_CHARS and len(context_parts) > 1:
+        # Last resort: drop the least relevant sources (they're ordered
+        # best first within each contract), and say so.
+        context_parts.pop()
+        sources.pop()
+        dropped += 1
+        coverage = (coverage.split(" [")[0] + f" [{dropped} further passage(s) left out to fit; "
+                    "the answer may not cover every contract.]")
+        prompt = build_prompt([], context_parts)
 
-    provider = llm._get_provider("quality")
-    try:
-        reply = provider.invoke(prompt, system=CHAT_SYSTEM_PROMPT, temperature=0)
-    except Exception as error:
+    reply, answer_model, tried = _answer_with_fallback(prompt)
+    if reply is None:
         raise HTTPException(
             status_code=503,
-            detail=f"The AI server didn't produce an answer ({error}). Please try again in a minute.",
+            detail="The AI server didn't produce an answer (" + "; ".join(tried)
+            + "). Please try again in a minute.",
         )
 
     reply = remove_reasoning_traces(str(reply)).strip()
+    print(f"[chat] answered by {answer_model} (routing: {routed_by}, {len(sources)} sources)")
     # Show the sources the answer actually cites (numbers kept, so the
     # inline links still match); if it cites none, the best few search
     # hits, so the user can still check what was looked at.
@@ -1460,6 +1621,8 @@ def chat_endpoint(request: ChatRequest):
         "route": "semantic",
         "routed_by": routed_by,
         "coverage": coverage,
+        "model": answer_model,
+        "router_model": router_model,
     }
 
 

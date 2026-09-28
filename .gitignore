@@ -45,3 +45,11 @@ Thumbs.db
 backend/data/analyses.json
 backend/uploaded_files/
 .ipynb_checkpoints/
+
+# Backups of stored data (e.g. old-data-20260928-1149/) - contain contract
+# text and personal data; never commit.
+old-data-*/
+backend/data/analyses.json
+
+# Patch files used to apply changes
+*.patch

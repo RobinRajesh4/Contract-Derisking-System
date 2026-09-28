@@ -18,6 +18,8 @@ export interface ChatSource {
   text: string;
   score?: number | null;
   kind?: "header" | "clause";
+  /** Other contracts with identical wording for this passage. */
+  also_in?: { analysis_id: string; filename: string }[];
 }
 
 export interface ChatMessage {
@@ -25,6 +27,12 @@ export interface ChatMessage {
   content: string;
   sources?: ChatSource[];
   coverage?: string;
+  /** "structured" = computed exactly from contract data; "semantic" = written by the model. */
+  route?: string;
+  /** Model that wrote the answer (null for exact answers). */
+  model?: string | null;
+  /** Model that interpreted the question. */
+  routerModel?: string | null;
 }
 
 const MESSAGES_KEY = "contract-chat-messages";
@@ -147,6 +155,9 @@ export function ask(question: string, analysisId: string | null): Promise<void> 
         content: data.reply || "The AI returned an empty response.",
         sources: data.sources || [],
         coverage: data.coverage || undefined,
+        route: data.route,
+        model: data.model ?? null,
+        routerModel: data.router_model ?? null,
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown connection error";
