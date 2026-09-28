@@ -27,6 +27,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { listAnalyses } from "@/services/analysis";
+import { analysisState } from "@/lib/analysisStatus";
 import {
   AnalysisFilters,
   AnalysisFilterState,
@@ -85,7 +86,7 @@ export default function Insights() {
         .slice(0, 10);
 
       const results =
-        a.results || a.clauses || [];
+        analysisState(a) === "not_analyzed" ? [] : a.results || [];
 
       const highRisk = results.filter(
         (r: any) =>
@@ -122,9 +123,11 @@ export default function Insights() {
     let medium = 0;
     let low = 0;
 
+    // Unanalyzed contracts have unknown risk, not zero: leave them out
+    // of the risk figures (they're counted separately).
     filtered.forEach((a: any) => {
-      const results =
-        a.results || a.clauses || [];
+      if (analysisState(a) === "not_analyzed") return;
+      const results = a.results || [];
 
       totalClauses += results.length;
 
@@ -147,6 +150,7 @@ export default function Insights() {
       medium,
       low,
       contracts: filtered.length,
+      notAnalyzed: filtered.filter((a) => analysisState(a) === "not_analyzed").length,
     };
   }, [filtered]);
 
@@ -182,6 +186,11 @@ export default function Insights() {
                 ? "..."
                 : stats.contracts}
             </div>
+            {!isLoading && stats.notAnalyzed > 0 && (
+              <p className="mt-1 text-xs text-amber-600">
+                {stats.notAnalyzed} not risk-analyzed (left out of risk figures)
+              </p>
+            )}
           </CardContent>
         </Card>
 
@@ -362,14 +371,18 @@ export default function Insights() {
                     <div className="flex items-center gap-2 shrink-0">
                       <Badge
                         variant={
-                          highRisk > 0
-                            ? "destructive"
-                            : "secondary"
+                          analysisState(a) === "not_analyzed"
+                            ? "outline"
+                            : highRisk > 0
+                              ? "destructive"
+                              : "secondary"
                         }
                       >
-                        {highRisk > 0
-                          ? `${highRisk} High Risk`
-                          : "Low Risk"}
+                        {analysisState(a) === "not_analyzed"
+                          ? "Not analyzed"
+                          : highRisk > 0
+                            ? `${highRisk} High Risk`
+                            : "No high risk"}
                       </Badge>
 
                       <Button

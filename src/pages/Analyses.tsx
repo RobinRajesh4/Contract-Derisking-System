@@ -7,6 +7,7 @@ import {
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { RiskBadge } from "@/components/RiskBadge";
+import { analysisState, NOT_ANALYZED_TEXT, partialText } from "@/lib/analysisStatus";
 import {
   FileText,
   Calendar,
@@ -134,6 +135,8 @@ export default function Analyses() {
                   ).toLowerCase() === "high"
               ).length;
 
+            const state = analysisState(a);
+
             const overall:
               | "high"
               | "medium"
@@ -168,9 +171,20 @@ export default function Analyses() {
                         </CardDescription>
                       </div>
 
-                      <RiskBadge
-                        level={overall}
-                      />
+                      {state === "not_analyzed" ? (
+                        <Badge variant="outline" title={NOT_ANALYZED_TEXT}>
+                          Not analyzed
+                        </Badge>
+                      ) : (
+                        <div className="flex flex-col items-end gap-1">
+                          <RiskBadge level={overall} />
+                          {state === "partial" && (
+                            <span className="text-[11px] font-medium text-amber-600" title={partialText(a)}>
+                              Partial analysis
+                            </span>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </CardHeader>
 
@@ -178,7 +192,7 @@ export default function Analyses() {
                     <div className="flex gap-4 text-sm flex-wrap">
                       <div>
                         <span className="text-muted-foreground">
-                          Clauses Analyzed:
+                          {state === "not_analyzed" ? "Clauses:" : "Clauses Analyzed:"}
                         </span>
 
                         <span className="ml-2 font-medium">
@@ -186,6 +200,7 @@ export default function Analyses() {
                         </span>
                       </div>
 
+                      {state !== "not_analyzed" && (
                       <div>
                         <span className="text-muted-foreground">
                           High Risk Found:
@@ -198,6 +213,7 @@ export default function Analyses() {
                           {highRiskCount}
                         </Badge>
                       </div>
+                      )}
 
                       {a.ocr_info?.used && (
                         <div className="flex items-center gap-1">

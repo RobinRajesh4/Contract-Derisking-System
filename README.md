@@ -135,7 +135,7 @@ results look off.
 Start the API server:
 
 ```sh
-uvicorn app.main:app --reload --port 8000
+uvicorn app.main:app --reload --port 8001
 ```
 
 ### Frontend
@@ -145,8 +145,8 @@ npm install
 npm run dev
 ```
 
-By default the frontend expects the backend at `http://localhost:8000`
-— check `src/services/analysis.ts` if you've changed the backend port.
+By default the frontend expects the backend at `http://localhost:8001`
+— set `VITE_API_URL` in a `.env` file if the backend runs elsewhere.
 
 ---
 
@@ -173,7 +173,7 @@ Contracts uploaded before the metadata-extraction or auto-summary
 features existed won't have that data until you backfill:
 
 ```sh
-curl -X POST http://localhost:8000/contracts/backfill-metadata
+curl -X POST http://localhost:8001/contracts/backfill-metadata
 ```
 
 Add `?force=true` to re-extract for every contract, not just ones
@@ -197,7 +197,7 @@ Summary" button on the contract's detail page.
 | GET | `/policy/{policy_id}` | Fetch a saved policy |
 | POST | `/chat` | Ask a question about one contract or across all of them |
 
-Run the server and check `http://localhost:8000/docs` for the full,
+Run the server and check `http://localhost:8001/docs` for the full,
 current list with request/response schemas.
 
 ---

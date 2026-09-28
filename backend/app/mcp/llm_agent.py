@@ -6,8 +6,9 @@ from pydantic import BaseModel, ValidationError
 
 from .utils import MCPConfig, mcp_post
 from ..llm_providers import get_llm_provider, LLMError
-from ..parser import extract_labeled_facts, find_money_amounts
+from ..parser import _FIELD_LABELS, extract_labeled_facts, find_money_amounts
 from ..schemas import (
+    parse_money,
     ApplicabilityResponse,
     ClauseClassification,
     ComplianceResponse,
@@ -692,12 +693,7 @@ def ground_metadata(meta: Dict[str, Any], text: str) -> Dict[str, Any]:
     model_label = "model" if model_method == "llm" else "pattern match"
 
     # Amount ---------------------------------------------------------
-    model_value = meta.get("contract_value")
-    if isinstance(model_value, str):
-        try:
-            model_value = float(model_value.replace(",", ""))
-        except ValueError:
-            model_value = None
+    model_value = parse_money(meta.get("contract_value"))
     if "contract_value" in facts:
         if model_value is not None and abs(model_value - facts["contract_value"]) > 0.005:
             warnings.append(
@@ -730,6 +726,21 @@ def ground_metadata(meta: Dict[str, Any], text: str) -> Dict[str, Any]:
     # Parties --------------------------------------------------------
     for key, label in (("customer_name", "customer/borrower"), ("lender_name", "lender")):
         model_name = meta.get(key)
+        label_norm = _norm_name(facts.get(key, ""))
+        model_norm = _norm_name(model_name or "")
+        extension = model_norm[len(label_norm):] if model_norm.startswith(label_norm + " ") else ""
+        if (
+            key in facts
+            and extension
+            and model_norm in norm_text
+            and not re.search(r"\b(?:" + _FIELD_LABELS + r")\b", extension, re.IGNORECASE)
+        ):
+            # The label reading stopped early ("Julia Maria da" of "Julia
+            # Maria da Silva Costa"); the model's longer name continues it
+            # and is written in the document, so keep the full name.
+            meta[key] = model_name
+            sources[key] = f"{model_label}, continuing the document label '{facts[key]}'"
+            continue
         if key in facts:
             if model_name and _norm_name(model_name) not in _norm_name(facts[key]) \
                     and _norm_name(facts[key]) not in _norm_name(model_name):

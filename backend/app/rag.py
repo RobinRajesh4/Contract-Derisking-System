@@ -13,6 +13,7 @@ the new collection.
 import os
 import re
 import threading
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -34,6 +35,9 @@ HEADER_ID = "header"
 # goes through this lock. Embedding (the slow network part) stays
 # outside it.
 _QDRANT_LOCK = threading.RLock()
+
+_EMBED_ATTEMPTS = 3
+_EMBED_BACKOFF_SEC = 2.0
 
 # How each embedding model expects documents and queries to be framed.
 # Both models were trained with these prefixes; leaving them off makes
@@ -149,6 +153,44 @@ class RAGStore:
 
     # ------------------------------------------------------------ embed
 
+    def _post_embed(self, batch: List[str]) -> Dict[str, Any]:
+        """
+        One embedding request, retried: the Ollama server is shared, so a
+        busy moment (timeout, connection reset, 5xx such as "model is
+        loading" or out of memory) is common and usually passes within
+        seconds. Bad requests (4xx) are not retried.
+        """
+        last_error: Optional[Exception] = None
+        for attempt in range(_EMBED_ATTEMPTS):
+            try:
+                response = requests.post(
+                    f"{self.embedding_url}/api/embed",
+                    json={"model": self.embedding_model, "input": batch, "truncate": True},
+                    timeout=180,
+                    verify=self.verify,
+                )
+                if response.status_code >= 500:
+                    raise requests.HTTPError(f"HTTP {response.status_code}: {response.text[:200]}")
+                response.raise_for_status()
+                return response.json()
+            except requests.HTTPError as error:
+                last_error = error
+                status = getattr(getattr(error, "response", None), "status_code", None)
+                if status is not None and status < 500:
+                    break
+            except requests.Timeout as error:
+                # Already waited the full timeout; don't wait it again.
+                last_error = error
+                break
+            except requests.RequestException as error:
+                last_error = error
+            if attempt < _EMBED_ATTEMPTS - 1:
+                time.sleep(_EMBED_BACKOFF_SEC * (2 ** attempt))
+        raise RuntimeError(
+            f"Could not get embeddings from {self.embedding_url} with "
+            f"{self.embedding_model}: {last_error}"
+        )
+
     def embed(self, texts: List[str], kind: str = "document") -> List[List[float]]:
         """kind: "document" for stored passages, "query" for questions."""
         prepared = [
@@ -158,20 +200,7 @@ class RAGStore:
         vectors: List[List[float]] = []
         for start in range(0, len(prepared), 16):
             batch = prepared[start:start + 16]
-            try:
-                response = requests.post(
-                    f"{self.embedding_url}/api/embed",
-                    json={"model": self.embedding_model, "input": batch, "truncate": True},
-                    timeout=180,
-                    verify=self.verify,
-                )
-                response.raise_for_status()
-                data = response.json()
-            except requests.RequestException as error:
-                raise RuntimeError(
-                    f"Could not get embeddings from {self.embedding_url} with "
-                    f"{self.embedding_model}: {error}"
-                ) from error
+            data = self._post_embed(batch)
             embeddings = data.get("embeddings")
             if not isinstance(embeddings, list) or len(embeddings) != len(batch):
                 raise RuntimeError("Ollama returned an unexpected embeddings response")
@@ -250,32 +279,7 @@ class RAGStore:
 
     # ------------------------------------------------------------ read
 
-    def query(
-        self,
-        text: str,
-        top_k: int = 5,
-        filter_by_analysis: Optional[str] = None,
-        exclude_analysis_ids: Optional[List[str]] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Passages related to a question: best match first, near-identical
-        text returned once, and anything scoring far below the best
-        match (or below the model's floor) dropped.
-        """
-        query_text = str(text or "").strip()
-        if not query_text:
-            return []
-        vector = self.embed([query_text], kind="query")[0]
-
-        must = []
-        if filter_by_analysis:
-            must.append(qmodels.FieldCondition(key="analysis_id", match=qmodels.MatchValue(value=filter_by_analysis)))
-        must_not = []
-        if exclude_analysis_ids:
-            must_not.append(qmodels.FieldCondition(key="analysis_id", match=qmodels.MatchAny(any=list(exclude_analysis_ids))))
-        query_filter = qmodels.Filter(must=must or None, must_not=must_not or None) if (must or must_not) else None
-
-        limit = max(1, min(int(top_k), 20))
+    def _search(self, vector: List[float], query_filter, limit: int, use_floor: bool = True) -> List[Dict[str, Any]]:
         with _QDRANT_LOCK:
             hits = self.client.query_points(
                 collection_name=self.collection,
@@ -288,7 +292,7 @@ class RAGStore:
             return []
 
         best = float(hits[0].score)
-        cutoff = max(self.min_score, best - self.relative_margin)
+        cutoff = max(self.min_score if use_floor else float("-inf"), best - self.relative_margin)
         seen = set()
         output: List[Dict[str, Any]] = []
         for hit in hits:
@@ -316,3 +320,79 @@ class RAGStore:
             if len(output) >= limit:
                 break
         return output
+
+    @staticmethod
+    def _analysis_filter(analysis_id: str):
+        return qmodels.Filter(
+            must=[qmodels.FieldCondition(key="analysis_id", match=qmodels.MatchValue(value=analysis_id))]
+        )
+
+    def query(
+        self,
+        text: str,
+        top_k: int = 5,
+        filter_by_analysis: Optional[str] = None,
+        exclude_analysis_ids: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Passages related to a question: best match first, near-identical
+        text returned once, and anything scoring far below the best
+        match (or below the model's floor) dropped.
+        """
+        query_text = str(text or "").strip()
+        if not query_text:
+            return []
+        vector = self.embed([query_text], kind="query")[0]
+
+        must = []
+        if filter_by_analysis:
+            must.append(qmodels.FieldCondition(key="analysis_id", match=qmodels.MatchValue(value=filter_by_analysis)))
+        must_not = []
+        if exclude_analysis_ids:
+            must_not.append(qmodels.FieldCondition(key="analysis_id", match=qmodels.MatchAny(any=list(exclude_analysis_ids))))
+        query_filter = qmodels.Filter(must=must or None, must_not=must_not or None) if (must or must_not) else None
+        return self._search(vector, query_filter, max(1, min(int(top_k), 20)))
+
+    def query_per_contract(
+        self, text: str, analysis_ids: List[str], per_contract: int = 1
+    ) -> List[Dict[str, Any]]:
+        """
+        The best passage(s) from *each* of the given contracts, in the
+        order given. Used when a question must be answered across
+        contracts: plain top-k search returns whichever few contracts
+        happen to score highest, and many contracts share identical
+        boilerplate, so a "which contracts ..." answer would silently
+        cover only a handful of them. The question is embedded once.
+        """
+        query_text = str(text or "").strip()
+        if not query_text or not analysis_ids:
+            return []
+        vector = self.embed([query_text], kind="query")[0]
+        output: List[Dict[str, Any]] = []
+        for analysis_id in analysis_ids:
+            # No absolute floor here: the question must look at every
+            # contract, so each one's best passage is kept and the model
+            # judges whether it says anything relevant.
+            output.extend(
+                self._search(vector, self._analysis_filter(analysis_id), max(1, per_contract), use_floor=False)
+            )
+        return output
+
+    def indexed_analysis_ids(self) -> set:
+        """Which contracts have at least one passage in the index."""
+        ids = set()
+        offset = None
+        with _QDRANT_LOCK:
+            while True:
+                points, offset = self.client.scroll(
+                    collection_name=self.collection,
+                    limit=512,
+                    offset=offset,
+                    with_payload=["analysis_id"],
+                    with_vectors=False,
+                )
+                ids.update((p.payload or {}).get("analysis_id") for p in points)
+                if offset is None:
+                    break
+        ids.discard(None)
+        return ids

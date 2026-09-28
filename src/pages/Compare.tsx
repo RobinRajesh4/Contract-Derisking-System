@@ -458,7 +458,11 @@ export default function Compare() {
 
             <CardContent className="space-y-4">
               <div className="flex flex-wrap items-center gap-3">
-                {result.comparison.is_tie ? (
+                {result.comparison.not_analyzed?.length ? (
+                  <Badge variant="outline" className="border-amber-400 text-amber-700">
+                    Not comparable yet
+                  </Badge>
+                ) : result.comparison.is_tie ? (
                   <Badge variant="outline">
                     Equal risk result
                   </Badge>

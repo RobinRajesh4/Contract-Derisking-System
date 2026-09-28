@@ -203,6 +203,12 @@ _server_caps = {"format_schema": True, "think": True}
 _availability_cache: Dict[str, Any] = {"url": None, "ok": False, "at": 0.0}
 _availability_lock = threading.Lock()
 
+_MAX_TRANSIENT_RETRIES = 3   # 5xx / connection errors: waits 2s, 4s, 8s
+# A timeout already cost llm_timeout_sec; retrying it doubles the wait
+# for little gain, so it isn't retried.
+_MAX_TIMEOUT_RETRIES = 0
+_RETRY_BACKOFF_SEC = 2.0
+
 
 class OllamaProvider(BaseLLMProvider):
     """Ollama over its HTTP /api/chat endpoint."""
@@ -244,8 +250,19 @@ class OllamaProvider(BaseLLMProvider):
         use_format = _server_caps["format_schema"]
         use_think = _server_caps["think"]
         last_error: Optional[str] = None
+        # The server is shared: a busy moment shows up as a timeout, a
+        # dropped connection or a 5xx ("model is loading", out of
+        # memory while another model is resident). Those usually pass
+        # within seconds, so they're retried with a growing pause
+        # instead of failing an upload, an analysis or a chat answer
+        # (worst case about 14s of extra waiting). Timeouts are not
+        # retried: each one already cost the full llm_timeout_sec.
+        # Request errors (4xx) are not retried.
+        transient_failures = 0
+        timeouts = 0
+        capability_retries = 0
 
-        for attempt in range(3):
+        while True:
             payload = self._payload(prompt, system, temperature, json_schema, use_format, use_think)
             try:
                 r = requests.post(
@@ -255,25 +272,45 @@ class OllamaProvider(BaseLLMProvider):
                     verify=self.verify,
                 )
             except requests.Timeout:
-                raise LLMError(
-                    f"Ollama model {self.model} did not answer within {timeout:.0f}s"
-                )
+                timeouts += 1
+                last_error = f"no answer within {timeout:.0f}s"
+                if timeouts > _MAX_TIMEOUT_RETRIES:
+                    raise LLMError(
+                        f"Ollama model {self.model} did not answer within {timeout:.0f}s "
+                        f"({timeouts} attempts); the server may be overloaded"
+                    )
+                continue
             except requests.RequestException as e:
+                transient_failures += 1
                 last_error = f"network error: {e}"
-                time.sleep(1.5)
+                if transient_failures > _MAX_TRANSIENT_RETRIES:
+                    break
+                time.sleep(_RETRY_BACKOFF_SEC * (2 ** (transient_failures - 1)))
                 continue
 
-            if r.status_code == 400:
+            if r.status_code == 400 and capability_retries < 2:
                 body = r.text.lower()
                 # Older servers: retry without the newer request fields.
                 if "format" in payload and use_format and "format" in body:
                     _server_caps["format_schema"] = False
                     use_format = False
+                    capability_retries += 1
                     continue
                 if "think" in payload and "think" in body:
                     _server_caps["think"] = False
                     use_think = False
+                    capability_retries += 1
                     continue
+            if r.status_code >= 500:
+                transient_failures += 1
+                last_error = f"HTTP {r.status_code}: {r.text[:300]}"
+                if transient_failures > _MAX_TRANSIENT_RETRIES:
+                    raise LLMError(
+                        f"Ollama returned HTTP {r.status_code} for model {self.model} "
+                        f"after {transient_failures} attempts: {r.text[:300]}"
+                    )
+                time.sleep(_RETRY_BACKOFF_SEC * (2 ** (transient_failures - 1)))
+                continue
             if r.status_code >= 400:
                 raise LLMError(
                     f"Ollama returned HTTP {r.status_code} for model "
@@ -318,14 +355,18 @@ class OllamaProvider(BaseLLMProvider):
         instead of listing every model on the server each time."""
         with _availability_lock:
             now = time.time()
+            # A success is trusted for 30s; a failure only for 5s, so one
+            # slow moment doesn't make every call in the next half
+            # minute give up without trying.
+            ttl = 30 if _availability_cache["ok"] else 5
             if (
                 _availability_cache["url"] == self.base_url
-                and now - _availability_cache["at"] < 30
+                and now - _availability_cache["at"] < ttl
             ):
                 return _availability_cache["ok"]
             try:
                 r = requests.get(
-                    f"{self.base_url}/api/tags", timeout=5, verify=self.verify
+                    f"{self.base_url}/api/tags", timeout=15, verify=self.verify
                 )
                 ok = r.status_code == 200
             except requests.RequestException:

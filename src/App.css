@@ -24,6 +24,10 @@
 .pdf-clause-highlight {
   background: hsl(48 96% 65% / 0.55);
   border-radius: 2px;
+  /* The PDF's own canvas draws the text; the text layer only positions
+     the highlight. A <mark> would otherwise paint a second, slightly
+     offset black copy of the words on top. */
+  color: transparent;
 }
 
 /* Drag-to-resize handle between chat and document panes */

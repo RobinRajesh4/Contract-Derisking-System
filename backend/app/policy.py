@@ -152,6 +152,9 @@ def apply_policy(
                         else "Evaluated by keyword fallback (no LLM available)."
                     ),
                     "method": "keyword",
+                    # The model call itself failed (vs. the model answering
+                    # but leaving this one check out).
+                    "call_failed": llm_results is None,
                 }
 
         return per_check
@@ -338,8 +341,20 @@ def apply_policy(
             }
         )
 
+    # How many clause-level checks had to fall back to keyword matching
+    # because the model call failed - reported so a degraded analysis
+    # doesn't pass for a real one. (A check the model merely left out of
+    # an otherwise good answer isn't a server failure.)
+    keyword_checks = sum(
+        1 for per_check in clause_check_results.values()
+        for r in per_check.values() if r.get("call_failed")
+    )
+    total_checks = sum(len(per_check) for per_check in clause_check_results.values())
+
     risk_threshold = int(policy.get("risk_threshold", 0))
     summary = {
+        "keyword_fallback_checks": keyword_checks,
+        "total_checks": total_checks,
         "policy_id": policy.get("policy_id"),
         "total_policy_score": total_score,
         "is_above_threshold": (

@@ -147,3 +147,48 @@ def test_concurrent_store_updates_are_not_lost(tmp_path):
     with ThreadPoolExecutor(8) as ex:
         list(ex.map(lambda i: store.update_analysis(i, {"contract_metadata": {"v": 1}}), ids))
     assert all(store.get_analysis(i).get("contract_metadata") for i in ids)
+
+
+def _reparse_clears_results(client, fake_llm):
+    ids = load_three(client)
+    aid = ids["julia_miller.txt"]
+    client.post("/analyze", json={"analysis_id": aid, "policy": TEST_POLICY})
+    # Clauses changed on re-parse -> results cleared to None.
+    main.store.update_analysis(aid, {"status": "uploaded", "results": None, "summary": None})
+    return ids, aid
+
+
+def test_summary_works_after_results_were_cleared(client, fake_llm):
+    ids, aid = _reparse_clears_results(client, fake_llm)
+    r = client.post(f"/summary/{aid}")
+    assert r.status_code == 200, r.text
+
+
+def test_compare_does_not_call_an_unanalyzed_contract_safer(client, fake_llm):
+    ids, aid = _reparse_clears_results(client, fake_llm)
+    other = ids["carlos_brown_real_estate.txt"]
+    client.post("/analyze", json={"analysis_id": other, "policy": TEST_POLICY})
+    r = client.post("/compare", json={"analysis_id_1": aid, "analysis_id_2": other})
+    assert r.status_code == 200, r.text
+    text = json.dumps(r.json())
+    assert "hasn't been risk-analyzed" in text
+    assert '"safer_contract": null' in text and '"is_tie": false' in text
+
+
+def test_office_files_are_rejected_clearly(client):
+    import io, zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("word/document.xml", "<w:document>CLAUSE ONE</w:document>")
+    r = client.post("/upload", files={"file": ("contract.docx", buf.getvalue(), "application/octet-stream")})
+    assert r.status_code == 400 and "Save the contract as PDF" in r.json()["detail"]
+
+
+def test_windows_encoded_text_file_is_read_correctly(client):
+    text = fixture_text("julia_miller.txt").replace("$45,892.00", "£45,892.00")
+    r = client.post("/upload", files={"file": ("julia_ansi.txt", text.encode("cp1252"), "text/plain")})
+    assert r.status_code == 200, r.text
+    assert r.json()["total_clauses"] == 8
+    record = main.store.get_analysis(r.json()["analysis_id"])
+    assert record["contract_metadata"]["contract_value"] == 45892.0
+    assert record["contract_metadata"]["currency"] == "GBP"

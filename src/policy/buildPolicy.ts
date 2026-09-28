@@ -1,4 +1,4 @@
-import { ROOT_DOMAIN_LABELS, uiLabels, uiPolicies, UILibraryPolicy, PolicyLabel, RiskLevel } from "./policyLibrary";
+import { ROOT_DOMAIN_LABELS, loadPolicyLibrary, UILibraryPolicy, PolicyLabel, RiskLevel } from "./policyLibrary";
 
 export interface CompiledPolicy {
   policy_id: string;
@@ -41,10 +41,12 @@ export function buildCompiledPolicy(options?: { includeRoots?: string[]; policyI
   const { includeRoots, policyId = "default_ui_policy", riskThreshold = 10, context } = options || {};
 
   const roots = Object.keys(ROOT_DOMAIN_LABELS).filter(rootId => !includeRoots || includeRoots.includes(rootId));
+  // The library as edited on the Policies page (or the built-in one).
+  const { policies, labels } = loadPolicyLibrary();
 
   const domains = roots.map(rootId => {
     const domain_name = ROOT_DOMAIN_LABELS[rootId] || "Other";
-    const list = collectPoliciesForRoot(rootId, uiLabels, uiPolicies);
+    const list = collectPoliciesForRoot(rootId, labels, policies);
     const micro_policies = list.map(p => ({
       id: p.id,
       name: p.name,

@@ -112,7 +112,7 @@ DEBUG=false
 #### Frontend Environment Variables
 Create a file `.env` in the project root:
 ```env
-VITE_API_BASE_URL=http://localhost:8000
+VITE_API_URL=http://localhost:8001
 ```
 
 ### Step 6: Start the Application
@@ -136,8 +136,8 @@ npm run dev
 
 ### Step 7: Access the Application
 - **Frontend**: http://localhost:8080
-- **Backend API**: http://localhost:8000
-- **API Documentation**: http://localhost:8000/docs
+- **Backend API**: http://localhost:8001
+- **API Documentation**: http://localhost:8001/docs
 
 ## Optional Components
 
@@ -244,4 +244,4 @@ After successful installation:
 2. Explore the analysis features
 3. Configure AI providers (Groq, Ollama, etc.)
 4. Set up custom risk assessment policies
-5. Explore the API documentation at http://localhost:8000/docs
+5. Explore the API documentation at http://localhost:8001/docs

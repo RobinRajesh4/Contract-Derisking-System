@@ -93,6 +93,9 @@ llm_agent.get_llm_provider = lambda task="bulk": FAKE
 
 import app.main as main  # noqa: E402
 
+# Uploaded files go to the temp folder too, never backend/uploaded_files.
+main.UPLOADS_DIR = os.path.join(_TMP, "uploaded_files")
+
 
 def fixture_text(name: str) -> str:
     with open(os.path.join(FIXTURES, name), encoding="utf-8") as f:

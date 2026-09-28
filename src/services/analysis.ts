@@ -1,4 +1,5 @@
-import { apiFetch } from "./api";
+import { apiFetch, errorMessage, getBaseUrl } from "./api";
+import { buildCompiledPolicy } from "@/policy/buildPolicy";
 
 export interface AnalyzeRequest {
   analysis_id?: string;
@@ -7,11 +8,19 @@ export interface AnalyzeRequest {
   policy?: Record<string, any>;
 }
 
+export interface AnalysisQuality {
+  complete: boolean;
+  fallback_clauses?: Array<string | number>;
+  fallback_policy_checks?: number;
+  message?: string | null;
+}
+
 export interface AnalyzeResponse {
   analysis_id: string;
   total_clauses: number;
   results: Array<Record<string, any>>;
   policy_summary?: Record<string, any> | null;
+  analysis_quality?: AnalysisQuality | null;
 }
 
 export interface OCRInfo {
@@ -19,44 +28,33 @@ export interface OCRInfo {
   method?: string;
   pages?: number;
   characters?: number;
+  error?: string;
 }
 
-export async function uploadContract(
-  file: File
-): Promise<{
+export interface UploadResult {
   analysis_id: string;
   total_clauses: number;
   ocr_info?: OCRInfo;
-}> {
+  reprocessed?: boolean;
+  clauses_changed?: boolean;
+  parse_quality?: { ok: boolean; ratio: number; missing_sample?: string[] };
+  search_index?: { ok: boolean; passages: number; error?: string | null };
+}
+
+export async function uploadContract(file: File): Promise<UploadResult> {
   const fd = new FormData();
   fd.append("file", file);
 
-  const res = await fetch(
-    `${location.origin}/__bypass_cors__`,
-    { method: "HEAD" }
-  ).catch(() => undefined);
-
-  // Directly call API; CORS handled server-side.
-  const base =
-    (import.meta as any).env?.VITE_API_URL ||
-    "http://localhost:8000";
-
-  const resp = await fetch(`${base}/upload`, {
+  const resp = await fetch(`${getBaseUrl()}/upload`, {
     method: "POST",
     body: fd,
   });
 
   if (!resp.ok) {
-    throw new Error(
-      (await resp.text()) || "Upload failed"
-    );
+    throw new Error(await errorMessage(resp));
   }
 
-  return (await resp.json()) as {
-    analysis_id: string;
-    total_clauses: number;
-    ocr_info?: OCRInfo;
-  };
+  return (await resp.json()) as UploadResult;
 }
 
 export async function analyze(
@@ -218,6 +216,8 @@ export interface CompareResult {
     high_risk_rate_difference: number;
     safer_contract: string | null;
     is_tie: boolean;
+    /** Contracts that can't be compared because they aren't risk-analyzed. */
+    not_analyzed?: string[];
     verdict: string;
     verdict_reasons: string[];
     domain_comparison: DomainComparison[];
@@ -242,4 +242,30 @@ export async function compareAnalyses(
       }),
     }
   );
+}
+
+/** Risk-analyze a stored contract with the current policy library. */
+export function runAnalysis(analysis_id: string): Promise<AnalyzeResponse> {
+  const policy = buildCompiledPolicy({ policyId: "ui_policy_v1", riskThreshold: 15 });
+  return analyze({ analysis_id, policy });
+}
+
+/** Warnings worth telling the user about after an upload. */
+export function uploadWarnings(u: UploadResult): string[] {
+  const notes: string[] = [];
+  if (u.reprocessed) {
+    notes.push(
+      u.clauses_changed
+        ? "This file was already uploaded; its record was re-processed and updated."
+        : "This file was already uploaded; the existing record was updated (no duplicate created)."
+    );
+  }
+  if (u.parse_quality && u.parse_quality.ok === false) {
+    notes.push(
+      `Only about ${Math.round((u.parse_quality.ratio || 0) * 100)}% of the document's text ended up in clauses. Check the clauses before relying on this analysis.`
+    );
+  }
+  if (u.ocr_info?.error) notes.push(u.ocr_info.error);
+  if (u.search_index && u.search_index.ok === false && u.search_index.error) notes.push(u.search_index.error);
+  return notes;
 }

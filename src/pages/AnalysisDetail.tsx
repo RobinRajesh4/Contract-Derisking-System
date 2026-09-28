@@ -1,5 +1,7 @@
 import { useParams } from "react-router-dom";
-import { useQuery, useMutation } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { runAnalysis } from "@/services/analysis";
+import { analysisState, partialText } from "@/lib/analysisStatus";
 import {
   getAnalysis,
   getSummary,
@@ -63,6 +65,28 @@ export default function AnalysisDetail() {
     queryFn: () =>
       getAnalysis(id as string),
     enabled: !!id,
+  });
+
+  const queryClient = useQueryClient();
+  const rerunAnalysis = useMutation({
+    mutationFn: () => runAnalysis(id as string),
+    onSuccess: async (result) => {
+      await queryClient.invalidateQueries({ queryKey: ["analysis", id] });
+      await queryClient.invalidateQueries({ queryKey: ["analyses"] });
+      const quality = result.analysis_quality;
+      toast({
+        title: quality && quality.complete === false ? "Analysis finished, with gaps" : "Analysis complete",
+        description: quality && quality.complete === false ? quality.message || "" : `Analyzed ${result.total_clauses} clauses.`,
+        variant: quality && quality.complete === false ? "destructive" : "default",
+      });
+    },
+    onError: (error) => {
+      toast({
+        title: "Analysis failed",
+        description: error instanceof Error ? error.message : "The AI server didn't respond. Try again later.",
+        variant: "destructive",
+      });
+    },
   });
 
   const [
@@ -196,11 +220,19 @@ export default function AnalysisDetail() {
       }));
     },
 
-    onError: () => {
+    onError: (error, payload) => {
+      // Re-enable the button; it used to stay on "Generating..." until
+      // the page was reloaded.
+      setLoadingRec((prev) => ({
+        ...prev,
+        [payload.clauseId]: false,
+      }));
       toast({
-        title: "Error",
+        title: "Couldn't generate a suggestion",
         description:
-          "Failed to generate recommendation.",
+          error instanceof Error && error.message
+            ? error.message
+            : "Failed to generate recommendation.",
         variant: "destructive",
       });
     },
@@ -809,6 +841,35 @@ export default function AnalysisDetail() {
           </div>
         </div>
       </div>
+
+      {/* Analysis status: a contract without (complete) risk analysis
+          must not read as low risk. */}
+      {analysisState(a) !== "analyzed" && (
+        <div
+          className={`flex flex-wrap items-center justify-between gap-3 rounded-lg border p-4 text-sm ${
+            analysisState(a) === "not_analyzed"
+              ? "border-amber-300 bg-amber-50 text-amber-900 dark:bg-amber-950/40 dark:text-amber-200"
+              : "border-orange-300 bg-orange-50 text-orange-900 dark:bg-orange-950/40 dark:text-orange-200"
+          }`}
+        >
+          <p className="max-w-2xl">
+            {analysisState(a) === "not_analyzed"
+              ? "This contract hasn't been risk-analyzed yet (or its clauses changed when it was re-processed, which clears the old analysis). The risk figures below are unknown, not low."
+              : partialText(a)}
+          </p>
+          <Button
+            size="sm"
+            onClick={() => rerunAnalysis.mutate()}
+            disabled={rerunAnalysis.isPending}
+          >
+            {rerunAnalysis.isPending
+              ? "Analyzing..."
+              : analysisState(a) === "not_analyzed"
+                ? "Run analysis"
+                : "Re-run analysis"}
+          </Button>
+        </div>
+      )}
 
       {/* Summary Card */}
       <Card className="border-2">

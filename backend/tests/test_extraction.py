@@ -76,3 +76,55 @@ def test_schema_normalizes_harmless_formatting():
     assert (c.domain, c.risk_level, c.reasons, c.key_metadata) == ("Financial", "High", ["one reason"], {"rate": "1.2"})
     m = ContractMetadataExtraction.model_validate(NULLS | {"contract_value": "$1,203,432.00", "customer_name": "unknown"})
     assert m.contract_value == 1203432.0 and m.customer_name is None
+
+
+def test_model_name_that_continues_a_short_label_reading_is_kept():
+    doc = "Borrower: Julia Maria da Silva Costa Address: 1 Main Road. LENDER: Bank X, NY."
+    # Simulate a label reading that stopped early.
+    from app import parser
+    facts = parser.extract_labeled_facts(doc)
+    assert facts["customer_name"] == "Julia Maria da Silva Costa"
+    meta = ground_metadata({"customer_name": "Julia Maria da Silva Costa", "lender_name": "Bank X"}, doc)
+    assert meta["customer_name"] == "Julia Maria da Silva Costa" and not meta["extraction_warnings"]
+
+
+def test_longer_model_name_running_into_the_next_field_is_not_used(monkeypatch):
+    doc = "Borrower: Julia Miller Address: 1 Main Road."
+    meta = ground_metadata({"customer_name": "Julia Miller Address 1 Main Road"}, doc)
+    assert meta["customer_name"] == "Julia Miller"
+
+
+import pytest  # noqa: E402
+
+from app.parser import extract_labeled_facts  # noqa: E402
+
+
+@pytest.mark.parametrize("text, key, expected", [
+    ("Borrower: Julia Maria da Silva Costa Address: 1 Road", "customer_name", "Julia Maria da Silva Costa"),
+    ("Borrower: The Smith Family Trust Dated: 2020", "customer_name", "The Smith Family Trust"),
+    ("LENDER: Acme Holdings Limited Trading As Acme: Retail, NY", "lender_name", "Acme Holdings Limited Trading As Acme"),
+    ("Borrower: Sunrise Solar\nPrivate Limited\nAddress: x", "customer_name", "Sunrise Solar Private Limited"),
+    ("Borrower: John Smith Lender: First Bank, NY", "customer_name", "John Smith"),
+    ("LENDER: Beta Capital LLC Attn: J. Doe", "lender_name", "Beta Capital LLC"),
+    ("Borrower: John Smith\nThis agreement is made", "customer_name", "John Smith"),
+])
+def test_name_boundaries(text, key, expected):
+    assert extract_labeled_facts(text)[key] == expected
+
+
+@pytest.mark.parametrize("text, value", [
+    ("Principal Amount: Rupees Five Lakh Only: Rs. 5,00,000", 500000),
+    ("LOAN AMOUNT: $1,250.500", 1250.5),
+    ("FINANCED AMOUNT: EUR 45.892", 45892),
+])
+def test_amount_edge_cases(text, value):
+    assert extract_labeled_facts(text)["contract_value"] == value
+
+
+def test_short_label_reading_does_not_replace_the_full_model_name(monkeypatch):
+    import app.mcp.llm_agent as agent
+    monkeypatch.setattr(agent, "extract_labeled_facts", lambda text: {"customer_name": "Julia Maria da"})
+    doc = "Borrower: Julia Maria da Silva Costa, residing in Rio."
+    meta = ground_metadata({"customer_name": "Julia Maria da Silva Costa"}, doc)
+    assert meta["customer_name"] == "Julia Maria da Silva Costa"
+    assert "continuing the document label" in meta["field_sources"]["customer_name"]

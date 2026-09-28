@@ -53,6 +53,7 @@ class AnalyzeResponse(BaseModel):
     total_clauses: int
     results: List[Dict[str, Any]]
     policy_summary: Optional[Dict[str, Any]] = None
+    analysis_quality: Optional[Dict[str, Any]] = None
 
 
 def orjson_dumps(v, *, default):
@@ -99,9 +100,7 @@ def _persist_original_file(
     frontend can later render the real document instead of only our
     parsed text."""
     try:
-        uploads_dir = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), "uploaded_files"
-        )
+        uploads_dir = UPLOADS_DIR
         os.makedirs(uploads_dir, exist_ok=True)
 
         _, ext = os.path.splitext(filename or "")
@@ -116,6 +115,8 @@ def _persist_original_file(
         )
     except Exception as error:
         print(f"Failed to persist original file for {analysis_id}: {error}")
+UPLOADS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploaded_files")
+
 llm = LLMClient()
 rag = None
 
@@ -235,7 +236,21 @@ def ingest_document(
                     "results": None,
                     "policy_summary": None,
                     "summary": None,
+                    "analysis_quality": None,
                 })
+            # If the AI server failed this time but an earlier extraction
+            # by the model exists, keep that one: a pattern-only fallback
+            # would otherwise wipe fields like the contract type or end
+            # date that only the model can read.
+            old_meta = existing.get("contract_metadata") or {}
+            new_meta = contract_metadata or {}
+            if new_meta.get("extraction_method") != "llm" and old_meta.get("extraction_method") == "llm":
+                kept = dict(old_meta)
+                kept["extraction_warnings"] = list(old_meta.get("extraction_warnings") or []) + [
+                    "The AI server was unavailable when this file was re-processed; "
+                    "the previous extraction was kept."
+                ]
+                fields["contract_metadata"] = kept
             store.update_analysis(analysis_id, fields)
         else:
             analysis_id = store.save_analysis({
@@ -246,13 +261,19 @@ def ingest_document(
 
     _persist_original_file(analysis_id, filename, content, content_type)
 
-    indexed = 0
+    # Search index. A failure here means the chatbot can't find this
+    # contract, so it's recorded on the contract and reported, not just
+    # printed to the server log.
+    search_index: Dict[str, Any] = {"ok": False, "passages": 0, "error": "Search is not available on this server."}
     if rag is not None:
         try:
             indexed = rag.index_analysis(analysis_id, doc["clauses"], doc["header"])
+            search_index = {"ok": True, "passages": indexed, "error": None}
             print(f"Indexed {indexed} passages for analysis {analysis_id}")
         except Exception as error:
             print(f"RAG indexing failed for {analysis_id}: {error}")
+            search_index = {"ok": False, "passages": 0, "error": f"Could not add this contract to chat search: {error}"}
+    store.update_analysis(analysis_id, {"search_index": search_index})
 
     return {
         "analysis_id": analysis_id,
@@ -261,6 +282,7 @@ def ingest_document(
         "reprocessed": reprocessed,
         "clauses_changed": clauses_changed,
         "parse_quality": doc["parse_quality"],
+        "search_index": search_index,
     }
 
 
@@ -446,15 +468,35 @@ def analyze(payload: AnalyzeRequest):
         if policy_obj is None:
             raise HTTPException(status_code=404, detail="policy_id not found")
 
+    # Classifications that fell back to keyword guessing (the model call
+    # failed even after its retries) get one more try, in parallel; the
+    # shared server has often recovered by the end of the batch. If most
+    # clauses failed, the server is down: don't wait on it again - the
+    # analysis is recorded as incomplete instead.
+    failed = [
+        i for i, r in enumerate(results)
+        if (r.get("classification") or {}).get("method") == "keyword_fallback"
+    ]
+    if failed and len(failed) <= len(results) / 2:
+        retry_inputs = [
+            {k: v for k, v in results[i].items() if k not in ("classification", "title")} for i in failed
+        ]
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            for i, retried in zip(failed, executor.map(_classify_one, retry_inputs)):
+                results[i] = retried
+
     if policy_obj:
         enriched, summary = apply_policy(results, policy_obj, llm=llm)
         results = enriched
         policy_summary = summary
 
+    analysis_quality = _analysis_quality(results, policy_summary)
+
     # update store
     update_payload: Dict[str, Any] = {
         "status": "analyzed",
         "results": results,
+        "analysis_quality": analysis_quality,
         # Stored so a later re-index can re-run the exact same policy
         # (the app builds its policy in the browser; the backend can't
         # reconstruct it).
@@ -480,8 +522,9 @@ def analyze(payload: AnalyzeRequest):
         print(f"Automatic summary generation failed for {payload.analysis_id}: {error}")
         executive_summary = None
 
-    if executive_summary:
-        update_payload["summary"] = executive_summary
+    # A failed summary must not leave the previous one (with old risk
+    # counts) next to the new results.
+    update_payload["summary"] = executive_summary or None
 
     store.update_analysis(payload.analysis_id, update_payload)
 
@@ -490,7 +533,41 @@ def analyze(payload: AnalyzeRequest):
         total_clauses=len(results),
         results=results,
         policy_summary=policy_summary,
+        analysis_quality=analysis_quality,
     )
+
+
+def _analysis_quality(results: List[Dict[str, Any]], policy_summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Whether the model actually did the analysis. When the AI server
+    fails, clauses are classified by keyword matching instead, which is
+    much less accurate - most clauses come out "Low" risk. That used to
+    be saved as a normal analysis with nothing to show for it.
+    """
+    fallback_clauses = [
+        r.get("id") for r in results
+        if (r.get("classification") or {}).get("method") == "keyword_fallback"
+    ]
+    fallback_checks = int((policy_summary or {}).get("keyword_fallback_checks") or 0)
+    total_checks = int((policy_summary or {}).get("total_checks") or 0)
+    complete = not fallback_clauses and not fallback_checks
+    message = None
+    if not complete:
+        parts = []
+        if fallback_clauses:
+            parts.append(f"{len(fallback_clauses)} of {len(results)} clauses")
+        if fallback_checks:
+            parts.append(f"{fallback_checks} of {total_checks} policy checks")
+        message = (
+            "The AI server didn't respond for " + " and ".join(parts) + ", so they were scored by "
+            "keyword matching, which is much less reliable. Re-run the analysis when the server is available."
+        )
+    return {
+        "complete": complete,
+        "fallback_clauses": fallback_clauses,
+        "fallback_policy_checks": fallback_checks,
+        "message": message,
+    }
 
 
 @app.get("/rag/status")
@@ -594,7 +671,7 @@ def generate_summary(analysis_id: str):
     if not analysis:
         raise HTTPException(status_code=404, detail="Analysis not found")
     
-    clauses = analysis.get("results", analysis.get("clauses", []))
+    clauses = analysis.get("results") or analysis.get("clauses") or []
     contract_text = " ".join([c.get("text", "") for c in clauses])
     
     summary = llm.generate_contract_summary(contract_text, clauses)
@@ -698,6 +775,11 @@ def backfill_contract_metadata(force: bool = False):
 
         try:
             contract_metadata = llm.extract_contract_metadata(contract_text, a.get("filename"))
+            old_meta = a.get("contract_metadata") or {}
+            if contract_metadata.get("extraction_method") != "llm" and old_meta.get("extraction_method") == "llm":
+                # AI server failed this time: don't replace a model
+                # extraction with a pattern-only one.
+                return ("failed", analysis_id, "The AI server didn't respond; kept the existing extraction.")
             store.update_analysis(analysis_id, {"contract_metadata": contract_metadata})
             return ("updated", analysis_id, None)
         except Exception as error:
@@ -798,6 +880,12 @@ def _run_reindex(reanalyze: str, remove_duplicates: bool, reset_index: bool) -> 
                 if content is not None:
                     info = ingest_document(a.get("filename") or aid, content, a.get("content_type"), analysis_id=aid)
                     changed = info["clauses_changed"]
+                    if not info["search_index"]["ok"]:
+                        # Parsed and stored fine (so it still gets re-analyzed),
+                        # but the chatbot can't find it until this is fixed.
+                        return {"analysis_id": aid, "filename": a.get("filename"), "ok": True,
+                                "clauses_changed": changed, "search_ok": False,
+                                "warning": info["search_index"]["error"]}
                 else:
                     # No original file (text submissions): keep clauses,
                     # re-index what's stored.
@@ -814,6 +902,7 @@ def _run_reindex(reanalyze: str, remove_duplicates: bool, reset_index: bool) -> 
         with ThreadPoolExecutor(max_workers=concurrency) as ex:
             outcomes = list(ex.map(_one, analyses))
         state["results"] = outcomes
+        state["not_searchable"] = [o["filename"] or o["analysis_id"] for o in outcomes if o.get("search_ok") is False]
 
         # Re-run risk analysis where needed, with the policy each
         # contract was originally analyzed with.
@@ -889,6 +978,7 @@ def start_reindex(
             "results": [],
             "reanalyzed": [],
             "needs_analysis": [],
+            "not_searchable": [],
             "errors": [],
         })
         threading.Thread(
@@ -987,6 +1077,119 @@ def _history_block(history: List[Dict[str, str]]) -> str:
     return "Conversation so far:\n" + "\n".join(lines) + "\n\n"
 
 
+# Total characters of clause text sent with one question when it has to
+# look across many contracts (one passage per contract, shortened to fit).
+_ACROSS_CHAR_BUDGET = 20000
+_MAX_NAMED_CONTRACTS = 6
+
+
+# Upper bound for the whole chat prompt, in characters (~3.5 characters
+# per token): leaves room in ollama_num_ctx (16384 tokens) for the system
+# prompt and the answer.
+_MAX_PROMPT_CHARS = 40000
+
+_FOCUS_STOPWORDS = {
+    "the", "and", "for", "are", "what", "which", "does", "with", "this", "that", "from", "have",
+    "has", "any", "all", "contract", "contracts", "clause", "clauses", "say", "says", "about",
+    "more", "than", "less", "how", "much", "many", "there", "their", "they", "who", "when",
+}
+
+
+def _focus_passage(text: str, question: str, limit: int) -> str:
+    """
+    Shorten a passage to about `limit` characters around the sentences
+    that share the most words with the question, instead of keeping just
+    its opening - a rate or amount stated late in a clause survives.
+    """
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    words = {w.strip(".") for w in re.findall(r"[a-z0-9%.]{3,}", question.lower())}
+    words = {w for w in words if w and w not in _FOCUS_STOPWORDS}
+    patterns = [re.compile(r"(?<![a-z0-9])" + re.escape(w) + r"(?![a-z0-9])") for w in words]
+
+    def score(chunk: str) -> int:
+        low = chunk.lower()
+        return sum(1 for p in patterns if p.search(low))
+
+    sentences = re.split(r"(?<=[.;:])\s+", text)
+    if len(sentences) == 1:
+        # One long sentence: take the window around the best-matching
+        # words instead of its opening.
+        low = text.lower()
+        hits = [(m.start(), i) for i, p in enumerate(patterns) for m in p.finditer(low)]
+        if not hits:
+            return text[:limit].rsplit(" ", 1)[0] + " …"
+        # Centre on the spot where the most distinct question words meet,
+        # rare ones counting more ("1.4%" once beats "monthly" five times).
+        counts: Dict[int, int] = {}
+        for _, i in hits:
+            counts[i] = counts.get(i, 0) + 1
+        half = limit // 2
+
+        def window_score(pos: int) -> float:
+            near = {i for p2, i in hits if abs(p2 - pos) <= half}
+            return sum(1.0 / counts[i] for i in near)
+
+        centre = max((p2 for p2, _ in hits), key=window_score)
+        start = max(0, min(centre - limit // 2, len(text) - limit))
+        window = text[start:start + limit]
+        if start > 0:
+            window = window.split(" ", 1)[-1]
+        if start + limit < len(text):
+            window = window.rsplit(" ", 1)[0]
+        return ("… " if start > 0 else "") + window + (" …" if start + limit < len(text) else "")
+    scores = [score(s) for s in sentences]
+    best = max(range(len(sentences)), key=lambda i: (scores[i], -i))
+    lo = hi = best
+    size = len(sentences[best])
+    while True:
+        grew = False
+        for j in (hi + 1, lo - 1):
+            if 0 <= j < len(sentences) and not (lo <= j <= hi) and size + len(sentences[j]) + 1 <= limit:
+                size += len(sentences[j]) + 1
+                lo, hi = min(lo, j), max(hi, j)
+                grew = True
+        if not grew:
+            break
+    out = " ".join(sentences[lo:hi + 1])
+    if len(out) > limit:
+        out = out[:limit].rsplit(" ", 1)[0]
+    return ("… " if lo > 0 else "") + out + (" …" if hi < len(sentences) - 1 or len(out) < len(" ".join(sentences[lo:hi + 1])) else "")
+
+
+def _whole_contract_passages(record: Dict[str, Any], budget: int) -> Optional[List[Dict[str, Any]]]:
+    """Header + every clause of one contract, or None if it doesn't fit."""
+    header = record.get("header") or {}
+    clauses = record.get("clauses") or []
+    total = len(header.get("text") or "") + sum(len(c.get("text") or "") for c in clauses)
+    if total > budget:
+        return None
+    aid = record.get("analysis_id")
+    out: List[Dict[str, Any]] = []
+    if header.get("text"):
+        out.append({"analysis_id": aid, "clause_id": "header", "kind": "header", "text": header["text"], "score": None})
+    out.extend(
+        {"analysis_id": aid, "clause_id": c.get("id"), "kind": "clause", "text": c.get("text", ""), "score": None}
+        for c in clauses
+    )
+    return out
+
+
+def _cited_source_numbers(reply: str) -> List[int]:
+    found = re.findall(r"#source-(\d+)|\[Source (\d+)\]", reply or "")
+    return sorted({int(a or b) for a, b in found})
+
+
+def _follow_up_search_text(query: str, history: List[Dict[str, str]]) -> str:
+    """Without the router's rewrite, a short follow-up ("and for Peter?")
+    is searched together with the previous question."""
+    if len(query) >= 80:
+        return query
+    previous = next((t["content"] for t in reversed(history) if t.get("role") == "user"), "")
+    return f"{previous} {query}".strip() if previous else query
+
+
 @app.post("/chat")
 def chat_endpoint(request: ChatRequest):
     """
@@ -994,12 +1197,19 @@ def chat_endpoint(request: ChatRequest):
 
     1. Questions answerable from contract fields (highest/lowest amount,
        totals, counts, lookups, filters by lender/date/amount) are
-       answered in code, exactly, with each contract's header as the
-       reference (see chat_router).
-    2. Everything else gets the relevant passages (or the whole contract,
-       when one contract is selected) and an LLM answer that must cite them.
+       answered in code, exactly (see chat_router). Rankings and totals
+       always cover all contracts; lookups cover the contracts the
+       question names, else the open one.
+    2. Everything else gets clause text and an LLM answer that must cite
+       it: the whole contract(s) when the question names them or one is
+       open; the best passage from every contract when the question is
+       across contracts; otherwise the most relevant passages, with the
+       model told how much of the portfolio they cover.
     """
-    from .chat_router import execute_spec, route_question, sources_for_rows
+    from .chat_router import (
+        execute_spec, heuristic_spec, is_aggregate, looks_across_contracts, resolve_named_contracts,
+        route_question, sources_for_rows, structured_scope,
+    )
     from .mcp.llm_agent import remove_reasoning_traces
 
     query = request.message.strip()
@@ -1014,51 +1224,130 @@ def chat_endpoint(request: ChatRequest):
 
     single = request.analysis_id if request.analysis_id not in (None, "", "all") else None
     all_analyses = store.list_analyses()
-    scope = [a for a in all_analyses if a.get("analysis_id") == single] if single else all_analyses
-    if single and not scope:
-        raise HTTPException(status_code=404, detail="analysis_id not found")
+    selected = next((a for a in all_analyses if a.get("analysis_id") == single), None) if single else None
+    if single and selected is None:
+        raise HTTPException(
+            status_code=404,
+            detail="The selected contract no longer exists. Choose another contract or 'All contracts'.",
+        )
+    if not all_analyses:
+        return {"reply": "No contracts have been uploaded yet.", "sources": [], "route": "none"}
+
+    spec = route_question(llm, query, history)
+    routed_by = "llm"
+    if spec is None:
+        spec = heuristic_spec(query)
+        routed_by = "heuristic" if spec is not None else "none"
+
+    rewritten = spec.standalone_question.strip() if spec and spec.standalone_question else ""
+    search_text = rewritten or (_follow_up_search_text(query, history) if history else query)
+    # Names come from this question (and the router's rewrite of it), never
+    # from the previous question merged in for search: "which has the
+    # highest amount?" after asking about Julia is not about Julia.
+    named, loose_only = resolve_named_contracts(f"{query} {rewritten}".strip(), spec, all_analyses)
+    if loose_only and (
+        (spec is not None and spec.kind == "structured" and is_aggregate(spec))
+        or (spec is not None and spec.kind == "semantic" and spec.across_contracts)
+        or looks_across_contracts(query)
+    ):
+        # A first name that happens to match a word ("Grace Period") must
+        # not turn a question about all contracts into one about a single one.
+        named = []
 
     # 1) Structured questions: exact answer from the directory.
-    spec = route_question(llm, query, history)
     if spec is not None and spec.kind == "structured":
-        result = execute_spec(spec, scope)
+        scope, note = structured_scope(spec, all_analyses, named, selected)
+        run_spec = spec
+        if named:
+            # The named contracts are already the scope; a filename filter
+            # holding a borrower's name would otherwise match nothing.
+            run_spec = spec.model_copy(update={"filters": [f for f in spec.filters if f.field != "filename"]})
+        result = execute_spec(run_spec, scope)
+        answer = result["answer"]
+        if note:
+            answer = f"_{note}_\n\n{answer}"
         return {
-            "reply": result["answer"],
+            "reply": answer,
             "sources": sources_for_rows(result["rows"]),
             "route": "structured",
+            "routed_by": routed_by,
             "query_spec": spec.model_dump(),
         }
 
-    # 2) Semantic questions: passages + LLM.
-    passages: List[Dict[str, Any]] = []
-    if single:
-        record = scope[0]
-        header = record.get("header")
-        clauses = record.get("clauses") or []
-        total_chars = len((header or {}).get("text", "")) + sum(len(c.get("text", "")) for c in clauses)
-        if total_chars <= _SINGLE_CONTRACT_CHAR_BUDGET:
-            if header and header.get("text"):
-                passages.append({"analysis_id": single, "clause_id": "header", "kind": "header", "text": header["text"], "score": None})
-            passages.extend(
-                {"analysis_id": single, "clause_id": c.get("id"), "kind": "clause", "text": c.get("text", ""), "score": None}
-                for c in clauses
-            )
-
-    if not passages:
+    # 2) Semantic questions: clause text + LLM.
+    def need_rag():
         if rag is None:
             raise HTTPException(status_code=503, detail="Contract search is not available (RAG failed to start; see the server log).")
-        top_k = max(1, min(request.top_k, 10))
-        try:
-            passages = rag.query(query, top_k=top_k, filter_by_analysis=single)
-        except Exception as error:
-            raise HTTPException(status_code=500, detail=f"Contract search failed: {error}")
+        return rag
+
+    top_k = max(1, min(request.top_k, 10))
+    passages: List[Dict[str, Any]] = []
+    coverage = ""
+    from_search = False
+    try:
+        if named:
+            targets = named[:_MAX_NAMED_CONTRACTS]
+            per_contract = _SINGLE_CONTRACT_CHAR_BUDGET // len(targets)
+            for record in targets:
+                whole = _whole_contract_passages(record, per_contract)
+                if whole is None:
+                    # Too long to send whole: the best passages, within
+                    # this contract's share of the budget.
+                    found = need_rag().query(search_text, top_k=6, filter_by_analysis=record["analysis_id"])
+                    share = max(400, per_contract // max(1, len(found)))
+                    for p in found:
+                        p["text"] = _focus_passage(p.get("text", ""), search_text, share)
+                    whole = found
+                    from_search = True
+                passages.extend(whole)
+            coverage = "The sources are from the contract(s) the question names: " + ", ".join(
+                r.get("filename") or r["analysis_id"] for r in targets
+            ) + "."
+            if len(named) > len(targets):
+                coverage += f" The question matches {len(named)} contracts; only the first {len(targets)} were read."
+        elif selected is not None:
+            whole = _whole_contract_passages(selected, _SINGLE_CONTRACT_CHAR_BUDGET)
+            if whole is None:
+                whole = need_rag().query(search_text, top_k=top_k, filter_by_analysis=single)
+                from_search = True
+            passages = whole
+        elif (spec is not None and spec.across_contracts) or looks_across_contracts(search_text):
+            ids = [a["analysis_id"] for a in all_analyses]
+            passages = need_rag().query_per_contract(search_text, ids, per_contract=1)
+            from_search = True
+            if passages:
+                share = max(250, _ACROSS_CHAR_BUDGET // len(passages))
+                for p in passages:
+                    p["text"] = _focus_passage(p.get("text", ""), search_text, share)
+            covered = {p["analysis_id"] for p in passages}
+            coverage = (
+                f"The sources are the most relevant passage from each of {len(covered)} of the "
+                f"{len(all_analyses)} contracts (long passages shortened with '…')."
+            )
+            missing = [a.get("filename") or a["analysis_id"] for a in all_analyses if a["analysis_id"] not in covered]
+            if missing:
+                coverage += " No relevant passage was found in: " + ", ".join(missing[:20]) + (" …" if len(missing) > 20 else "") + "."
+        else:
+            passages = need_rag().query(search_text, top_k=top_k)
+            from_search = True
+            covered = {p["analysis_id"] for p in passages}
+            coverage = (
+                f"The sources are the {len(passages)} most relevant passages, from {len(covered)} of the "
+                f"{len(all_analyses)} contracts. If the question needs every contract checked, say that "
+                "this answer only covers the contracts in the sources."
+            )
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=503, detail=f"Contract search failed: {error}")
 
     names = {a.get("analysis_id"): (a.get("filename") or f"Contract {a.get('analysis_id')}") for a in all_analyses}
     context_parts, sources = [], []
-    for index, p in enumerate(passages, start=1):
+    for p in passages:
         text = str(p.get("text", "")).strip()
         if not text:
             continue
+        index = len(sources) + 1
         label = names.get(p.get("analysis_id"), f"Contract {p.get('analysis_id')}")
         where = "contract header (parties, amounts)" if p.get("kind") == "header" else f"clause {p.get('clause_id')}"
         context_parts.append(f"[Source {index} | {label} | {where}]\n{text}")
@@ -1072,33 +1361,78 @@ def chat_endpoint(request: ChatRequest):
             "kind": p.get("kind", "clause"),
         })
 
-    # Directory rows only for the contracts being discussed, so the
-    # prompt doesn't grow with every contract ever uploaded.
-    cited = {src["analysis_id"] for src in sources}
-    directory = "\n".join(
-        _directory_line(a) for a in scope if single or a.get("analysis_id") in cited
-    )
-    prompt = (
-        _history_block(history)
-        + "Contracts directory (fields extracted from each document; 'not found' means the document doesn't state it):\n"
-        + (directory or "(none)")
-        + "\n\nSources:\n"
-        + ("\n\n".join(context_parts) if context_parts else "(no passages matched this question)")
-        + f"\n\nQuestion: {query}"
-    )
+    # Directory rows only for the contracts being discussed; a short form
+    # when there are many, so the prompt stays inside the context window.
+    in_sources = {src["analysis_id"] for src in sources}
+    discussed = [a for a in all_analyses if a.get("analysis_id") in in_sources or a is selected]
+    if len(discussed) > 12:
+        directory = "\n".join(
+            f"- ID: {a.get('analysis_id')} | File: {a.get('filename')} | Borrower: "
+            f"{(a.get('contract_metadata') or {}).get('customer_name') or 'not found'}"
+            for a in discussed
+        )
+    else:
+        directory = "\n".join(_directory_line(a) for a in discussed)
+
+    def build_prompt(turns: List[Dict[str, str]], parts: List[str]) -> str:
+        return (
+            _history_block(turns)
+            + "Contracts directory (fields extracted from each document; 'not found' means the document doesn't state it):\n"
+            + (directory or "(none)")
+            + ("\n\nCoverage: " + coverage if coverage else "")
+            + "\n\nSources:\n"
+            + ("\n\n".join(parts) if parts else "(no passages matched this question)")
+            + f"\n\nQuestion: {query}"
+            + (f"\n(Meaning: {rewritten})" if rewritten and rewritten != query else "")
+        )
+
+    # Never send more than fits the model's context window: a cut-off
+    # prompt fails, or worse, is answered without part of the sources.
+    # Shed the older conversation first, then shorten the passages.
+    prompt = build_prompt(history, context_parts)
+    if len(prompt) > _MAX_PROMPT_CHARS:
+        prompt = build_prompt(history[-2:], context_parts)
+    if len(prompt) > _MAX_PROMPT_CHARS and context_parts:
+        overflow = len(prompt) - _MAX_PROMPT_CHARS
+        total = sum(len(c) for c in context_parts)
+        ratio = max(0.1, 1 - overflow / max(1, total) - 0.02)
+        trimmed = []
+        for part, src in zip(context_parts, sources):
+            head, _, body = part.partition("\n")
+            body = _focus_passage(body, search_text, max(200, int(len(body) * ratio)))
+            src["text"] = body
+            trimmed.append(f"{head}\n{body}")
+        context_parts = trimmed
+        prompt = build_prompt(history[-2:], context_parts)
+    if len(prompt) > _MAX_PROMPT_CHARS:
+        # The sources matter more than the conversation.
+        prompt = build_prompt([], context_parts)
 
     provider = llm._get_provider("quality")
-    if not provider.is_available():
-        raise HTTPException(status_code=503, detail="The configured AI provider is unavailable. Check the Ollama or Groq settings.")
     try:
         reply = provider.invoke(prompt, system=CHAT_SYSTEM_PROMPT, temperature=0)
     except Exception as error:
-        raise HTTPException(status_code=500, detail=f"AI response generation failed: {error}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"The AI server didn't produce an answer ({error}). Please try again in a minute.",
+        )
+
+    reply = remove_reasoning_traces(str(reply)).strip()
+    # Show the sources the answer actually cites (numbers kept, so the
+    # inline links still match); if it cites none, the best few search
+    # hits, so the user can still check what was looked at.
+    cited = set(_cited_source_numbers(reply))
+    if cited:
+        shown = [s for s in sources if s["source_number"] in cited]
+    else:
+        shown = sources[:5] if from_search else []
 
     return {
-        "reply": remove_reasoning_traces(str(reply)).strip(),
-        "sources": sources,
+        "reply": reply,
+        "sources": shown,
         "route": "semantic",
+        "routed_by": routed_by,
+        "coverage": coverage,
     }
 
 
@@ -1235,10 +1569,7 @@ term_patterns = {
 def extract_structured_terms(
     analysis: Dict[str, Any],
 ) -> Dict[str, Dict[str, Any]]:
-    results = analysis.get(
-        "results",
-        analysis.get("clauses", []),
-    )
+    results = analysis.get("results") or analysis.get("clauses") or []
 
     extracted: Dict[
         str,
@@ -1367,10 +1698,7 @@ def compare_contracts(
     def get_stats(
         analysis: Dict[str, Any],
     ) -> Dict[str, Any]:
-        results = analysis.get(
-            "results",
-            analysis.get("clauses", []),
-        )
+        results = analysis.get("results") or analysis.get("clauses") or []
 
         high = 0
         medium = 0
@@ -1565,7 +1893,19 @@ def compare_contracts(
         contract_2["filename"] or "Contract 2"
     )
 
-    if score_1 < score_2:
+    # A contract that hasn't been risk-analyzed has no risky clauses on
+    # record - which is "unknown", not "safe".
+    not_analyzed = [
+        name for name, a in ((contract_1_name, analysis_1), (contract_2_name, analysis_2))
+        if a.get("status") != "analyzed" or not a.get("results")
+    ]
+    if not_analyzed:
+        verdict = (
+            "Can't say which is safer: " + " and ".join(not_analyzed)
+            + (" hasn't" if len(not_analyzed) == 1 else " haven't")
+            + " been risk-analyzed yet. Run the analysis first."
+        )
+    elif score_1 < score_2:
         safer_contract = analysis_id_1
         verdict = (
             f"{contract_1_name} has the lower "
@@ -1750,7 +2090,8 @@ def compare_contracts(
                 high_risk_rate_difference
             ),
             "safer_contract": safer_contract,
-            "is_tie": safer_contract is None,
+            "is_tie": safer_contract is None and not not_analyzed,
+            "not_analyzed": not_analyzed,
             "verdict": verdict,
             "verdict_reasons": verdict_reasons,
             "domain_comparison": domain_comparison,

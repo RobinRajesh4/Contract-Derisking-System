@@ -78,33 +78,50 @@ Rules for structured specs:
   earliest / oldest -> order "asc".
 - filters use op "contains" for names, "greater_than"/"less_than" for amounts,
   "before"/"after" for dates (value YYYY-MM-DD or YYYY), "is_true"/"is_false"
-  for yes/no fields.
-- A named contract such as "Contract_7" is a filter on filename (contains).
+  for yes/no fields. Copy amounts as written (e.g. "50k", "1.5 million").
+- "fields": the directory fields the question asks to see, e.g. "When does
+  Contract_3 end?" -> ["end_date"]. Empty when it just asks which contracts.
+
+Rules for every spec (structured and semantic):
+- "contracts": every contract the question refers to by file name (Contract_7,
+  lease_2024.pdf) or by party name (Julia Miller, Acme Ltd). Empty if none.
+- "across_contracts": true when a semantic question needs every contract
+  checked ("which contracts ...", "any contract ...", "compare ... across",
+  "all contracts ..."); false otherwise.
+- "standalone_question": the question rewritten so it makes sense without the
+  conversation (resolve "it", "that one", "and for X?", "what about the lowest?").
+  Same as the question when it already stands alone.
 
 Examples:
 Q: Which contract has the highest financed amount?
-A: {{"kind":"structured","operation":"list","sort_by":"contract_value","order":"desc","limit":1,"filters":[]}}
+A: {{"kind":"structured","operation":"list","sort_by":"contract_value","order":"desc","limit":1,"filters":[],"fields":[],"contracts":[],"across_contracts":false,"standalone_question":"Which contract has the highest financed amount?"}}
 Q: which contracts have the least financial amounts
-A: {{"kind":"structured","operation":"list","sort_by":"contract_value","order":"asc","limit":null,"filters":[]}}
+A: {{"kind":"structured","operation":"list","sort_by":"contract_value","order":"asc","limit":null,"filters":[],"fields":[],"contracts":[],"across_contracts":false,"standalone_question":"Which contracts have the lowest financed amounts?"}}
 Q: How many contracts are with Financial Bank of America?
-A: {{"kind":"structured","operation":"count","sort_by":null,"order":"desc","limit":null,"filters":[{{"field":"lender_name","op":"contains","value":"Financial Bank of America"}}]}}
-Q: What is the total amount financed?
-A: {{"kind":"structured","operation":"sum","sort_by":null,"order":"desc","limit":null,"filters":[]}}
-Q: Loans above $50,000 ending before 2027
-A: {{"kind":"structured","operation":"list","sort_by":"contract_value","order":"desc","limit":null,"filters":[{{"field":"contract_value","op":"greater_than","value":"50000"}},{{"field":"end_date","op":"before","value":"2027"}}]}}
-Q: Who is the lender in Contract_3?
-A: {{"kind":"structured","operation":"list","sort_by":null,"order":"desc","limit":null,"filters":[{{"field":"filename","op":"contains","value":"Contract_3"}}]}}
+A: {{"kind":"structured","operation":"count","sort_by":null,"order":"desc","limit":null,"filters":[{{"field":"lender_name","op":"contains","value":"Financial Bank of America"}}],"fields":[],"contracts":[],"across_contracts":false,"standalone_question":"How many contracts are with Financial Bank of America?"}}
+Q: What is the total of the 3 largest loans?
+A: {{"kind":"structured","operation":"sum","sort_by":"contract_value","order":"desc","limit":3,"filters":[],"fields":[],"contracts":[],"across_contracts":false,"standalone_question":"What is the total of the 3 largest loans?"}}
+Q: Loans above 50k ending before 2027
+A: {{"kind":"structured","operation":"list","sort_by":"contract_value","order":"desc","limit":null,"filters":[{{"field":"contract_value","op":"greater_than","value":"50k"}},{{"field":"end_date","op":"before","value":"2027"}}],"fields":[],"contracts":[],"across_contracts":false,"standalone_question":"Which loans are above 50k and end before 2027?"}}
+Q: When does Contract_3 end?
+A: {{"kind":"structured","operation":"list","sort_by":null,"order":"desc","limit":null,"filters":[],"fields":["end_date"],"contracts":["Contract_3"],"across_contracts":false,"standalone_question":"When does Contract_3 end?"}}
+Q: Who is the lender for Julia Miller?
+A: {{"kind":"structured","operation":"list","sort_by":null,"order":"desc","limit":null,"filters":[],"fields":["lender_name"],"contracts":["Julia Miller"],"across_contracts":false,"standalone_question":"Who is the lender in Julia Miller's contract?"}}
 Q: What is the interest rate in Contract_5?
-A: {{"kind":"semantic","operation":"list","sort_by":null,"order":"desc","limit":null,"filters":[]}}
-Q: Which contracts have the harshest default penalties?
-A: {{"kind":"semantic","operation":"list","sort_by":null,"order":"desc","limit":null,"filters":[]}}
+A: {{"kind":"semantic","operation":"list","sort_by":null,"order":"desc","limit":null,"filters":[],"fields":[],"contracts":["Contract_5"],"across_contracts":false,"standalone_question":"What is the interest rate in Contract_5?"}}
+Q: Which contracts charge more than 1.4% monthly interest?
+A: {{"kind":"semantic","operation":"list","sort_by":null,"order":"desc","limit":null,"filters":[],"fields":[],"contracts":[],"across_contracts":true,"standalone_question":"Which contracts charge more than 1.4% monthly interest?"}}
+Conversation: user asked "What is the interest rate in Julia Miller's contract?"
+Q: and for Peter Chen?
+A: {{"kind":"semantic","operation":"list","sort_by":null,"order":"desc","limit":null,"filters":[],"fields":[],"contracts":["Peter Chen"],"across_contracts":false,"standalone_question":"What is the interest rate in Peter Chen's contract?"}}
 
 {convo}Question: {question}
 """
 
 
 def route_question(llm_client: Any, question: str, history: List[Dict[str, str]]) -> Optional[ChatQuerySpec]:
-    """The spec, or None if routing failed (caller then uses the semantic path)."""
+    """The spec, or None if routing failed (caller then falls back to
+    heuristic_spec, then to the semantic path)."""
     try:
         return llm_client.structured_call(
             ChatQuerySpec,
@@ -113,8 +130,222 @@ def route_question(llm_client: Any, question: str, history: List[Dict[str, str]]
             task="quality",
         )
     except Exception as error:
-        print(f"[chat] question routing failed, using retrieval instead: {error}")
+        print(f"[chat] question routing failed: {error}")
         return None
+
+
+# Words that mean the question is about something other than the
+# financed amount (a clause, a rate, a duration, a count of something else).
+_NOT_ABOUT_AMOUNT = re.compile(
+    r"\b(interest|rate|ratio|ltv|loan-to-value|penalt\w*|fee\w*|fine|clause\w*|terminat\w*|"
+    r"insur\w*|guarantee\w*|default|obligation\w*|risk\w*|terms?|condition\w*|warrant\w*|"
+    r"indemn\w*|confidential\w*|jurisdiction|law|tenure|duration|period|months?|years?|days?|"
+    r"install?ments?|payments?|mention\w*|contain\w*|say|says|include\w*)\b",
+    re.I,
+)
+_AMOUNT_WORDS = re.compile(r"\b(amounts?|value|valuable|financed|principal|money|worth|loans?|contracts?)\b", re.I)
+_PLAIN_COUNT = re.compile(
+    r"^\s*(?:how many|what is the number of|number of|count(?: of)?)\s+(?:contracts|loans|agreements|documents)"
+    r"(?:\s+(?:are there|do (?:we|i) have|in total|have been uploaded|are uploaded|are stored|in the system))?\s*\??\s*$",
+    re.I,
+)
+
+
+def heuristic_spec(question: str) -> Optional[ChatQuerySpec]:
+    """
+    A conservative stand-in when the router can't be reached: the plain
+    amount questions ("which contract has the highest amount?", "total
+    financed", "how many contracts are there?") are still answered
+    exactly instead of being handed to the language model. Anything with
+    another condition ("... mention prepayment", "highest interest rate",
+    "total tenure") returns None and goes to the semantic path.
+    """
+    q = question.strip()
+    if _PLAIN_COUNT.match(q):
+        return ChatQuerySpec(kind="structured", operation="count")
+    if _NOT_ABOUT_AMOUNT.search(q) or not _AMOUNT_WORDS.search(q):
+        return None
+    ql = q.lower()
+    if re.search(r"\b(?:number|count) of (?:contracts|loans|agreements)\b", ql):
+        return ChatQuerySpec(kind="structured", operation="count")
+    if re.search(r"\b(total|sum|combined|altogether)\b", ql):
+        return ChatQuerySpec(kind="structured", operation="sum")
+    if re.search(r"\b(average|mean)\b", ql):
+        return ChatQuerySpec(kind="structured", operation="average")
+    plural = bool(re.search(r"\bcontracts\b|\bloans\b|\bamounts\b", ql))
+    top = re.search(r"\btop\s+(\d{1,2})\b|\b(\d{1,2})\s+(?:largest|biggest|highest|smallest|lowest)\b", ql)
+    limit = int(top.group(1) or top.group(2)) if top else (None if plural else 1)
+    if re.search(r"\b(highest|largest|biggest|maximum|max|most valuable)\b|\bworth the most\b|\bmost (?:money|expensive)\b", ql):
+        return ChatQuerySpec(kind="structured", sort_by="contract_value", order="desc", limit=limit)
+    if re.search(r"\b(lowest|smallest|minimum|min)\b|(?<!\bat )\bleast\b", ql):
+        return ChatQuerySpec(kind="structured", sort_by="contract_value", order="asc", limit=limit)
+    if top:
+        # "Top 5 contracts by value"
+        return ChatQuerySpec(kind="structured", sort_by="contract_value", order="desc", limit=limit)
+    return None
+
+
+_ACROSS_HINT = re.compile(
+    r"\b(which|what|any|all|every|each|how many)\b[^?]*\bcontracts\b|\bany contract\b|\bevery contract\b|"
+    r"\beach contract\b|\bacross\b|\bcompare\b",
+    re.I,
+)
+
+
+def looks_across_contracts(question: str) -> bool:
+    return bool(_ACROSS_HINT.search(question or ""))
+
+
+# ------------------------------------------------------------ named contracts
+
+def _stem(filename: str) -> str:
+    return re.sub(r"\.[a-z0-9]{2,4}$", "", str(filename or ""), flags=re.I)
+
+
+def _contains_name(text_norm: str, name_norm: str) -> bool:
+    """Whole-word match; "contract 3" doesn't match "contract 31"."""
+    if len(name_norm) < 3:
+        return False
+    return bool(re.search(r"(?<![a-z0-9])" + re.escape(name_norm) + r"(?![a-z0-9])", text_norm))
+
+
+def _named_in_passing(question: str, token: str) -> bool:
+    """
+    A single first or last name ("Julia", "Omar") counts as naming a
+    contract only when it's written like a name: possessive ("Julia's"),
+    or capitalised somewhere other than the start of a sentence. Lower
+    case ("grace period", "solar equipment", "total amount") never counts,
+    and neither does a capital that's only there because a sentence
+    starts with the word ("Total amount financed?").
+    """
+    word = re.escape(token)
+    if re.search(r"(?<![A-Za-z])" + word + r"(?:'s|’s)\b", question, re.IGNORECASE):
+        return True
+    for m in re.finditer(r"(?<![A-Za-z])" + word + r"(?![A-Za-z])", question, re.IGNORECASE):
+        found = question[m.start():m.end()]
+        if not found[:1].isupper():
+            continue
+        before = question[:m.start()].rstrip()
+        if before and before[-1] not in ".?!:":
+            return True
+    return False
+
+
+def _multi_word_file_named(stem: str, question: str) -> bool:
+    """
+    "Loan Agreement.pdf" / "ACME_LOAN.pdf" is named when the question
+    writes it joined the same way ("acme_loan") or as a name, with a
+    capital ("the Loan Agreement", "Acme Loan") - but not in ordinary
+    lower-case prose ("does any loan agreement ...").
+    """
+    joined = re.search(r"[_-]", stem)
+    if joined and re.search(r"(?<![A-Za-z0-9])" + re.escape(stem) + r"(?![A-Za-z0-9])", question, re.IGNORECASE):
+        return True
+    spaced = re.sub(r"[_-]+", " ", stem).strip()
+    for m in re.finditer(r"(?<![A-Za-z0-9])" + re.escape(spaced).replace(r"\ ", r"[\s_-]+") + r"(?![A-Za-z0-9])",
+                         question, re.IGNORECASE):
+        if re.search(r"[A-Z]", m.group(0)):
+            return True
+    return False
+
+
+def resolve_named_contracts(
+    question: str, spec: Optional[ChatQuerySpec], analyses: List[Dict[str, Any]]
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """
+    Contracts the question is about, and whether that rests only on a
+    loose match. Found two ways so neither alone has to be perfect:
+    - strong: names the router listed (spec.contracts, filename filters);
+      a borrower's full name or a distinctive file name ("Contract_7",
+      "Lease 2024") written in the question;
+    - loose: one first/last name that belongs to a single borrower,
+      written like a name (see _named_in_passing).
+    Returns (contracts, loose_only). Callers don't let a loose match
+    narrow a ranking or total.
+    """
+    text_norm = _norm(question)
+    wanted = [_norm(n) for n in (spec.contracts if spec else [])]
+    if spec:
+        wanted += [_norm(f.value) for f in spec.filters if f.field == "filename" and f.value]
+    wanted = [w for w in wanted if w]
+
+    # First/last-name tokens that identify exactly one contract.
+    token_owner: Dict[str, Optional[str]] = {}
+    for a in analyses:
+        for token in set(_norm((a.get("contract_metadata") or {}).get("customer_name")).split()):
+            if len(token) >= 4:
+                token_owner[token] = None if token in token_owner else a.get("analysis_id")
+
+    strong: List[Dict[str, Any]] = []
+    loose: List[Dict[str, Any]] = []
+    for a in analyses:
+        stem = _stem(a.get("filename"))
+        file_norm = _norm(stem)
+        full_file = _norm(a.get("filename"))
+        customer = _norm((a.get("contract_metadata") or {}).get("customer_name"))
+
+        hit = any(
+            _contains_name(file_norm, w) or _contains_name(w, file_norm) or w == full_file
+            or (customer and (_contains_name(customer, w) or _contains_name(w, customer)))
+            for w in wanted
+        )
+        if not hit:
+            filename = str(a.get("filename") or "")
+            if filename and filename.lower() in question.lower():
+                # The full file name, extension included, in any case.
+                hit = True
+            elif re.search(r"\d", file_norm):
+                # "Contract_7", "lease 2024": distinctive in any case.
+                hit = _contains_name(text_norm, file_norm)
+            elif len(file_norm.split()) >= 2:
+                hit = _multi_word_file_named(stem, question)
+        if not hit and customer and len(customer.split()) >= 2 and _contains_name(text_norm, customer):
+            hit = True
+        if hit:
+            strong.append(a)
+            continue
+        if customer and any(
+            token_owner.get(t) == a.get("analysis_id") and _named_in_passing(question, t)
+            for t in customer.split()
+        ):
+            loose.append(a)
+
+    if strong:
+        return strong + [a for a in loose if a not in strong], False
+    return loose, bool(loose)
+
+
+def is_aggregate(spec: ChatQuerySpec) -> bool:
+    """Rankings, counts, totals and field filters are about the whole
+    set of contracts, never about whichever one happens to be open."""
+    return bool(
+        spec.sort_by
+        or spec.operation != "list"
+        or any(f.field != "filename" for f in spec.filters)
+    )
+
+
+def structured_scope(
+    spec: ChatQuerySpec,
+    all_analyses: List[Dict[str, Any]],
+    named: List[Dict[str, Any]],
+    selected: Optional[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], str]:
+    """
+    Which contracts a structured question runs over, and a short note
+    saying so when it isn't obvious:
+    - contracts the question names -> those;
+    - rankings / counts / totals / filters -> all contracts, even if one
+      is open in the viewer ("which has the highest amount?" means of all);
+    - a plain lookup ("who is the lender?") with a contract open -> that one;
+    - otherwise all contracts.
+    """
+    if named:
+        return named, ""
+    if is_aggregate(spec) or selected is None:
+        note = "Across all contracts (not only the one that's open)." if selected is not None else ""
+        return all_analyses, note
+    return [selected], ""
 
 
 # ------------------------------------------------------------------ execution
@@ -251,6 +482,16 @@ def execute_spec(spec: ChatQuerySpec, analyses: List[Dict[str, Any]]) -> Dict[st
         by_currency: Dict[str, List[Dict[str, Any]]] = {}
         for a in have:
             by_currency.setdefault((_field(a, "currency") or "unknown currency").upper(), []).append(a)
+        # "total of the 3 largest loans": rank, cut, then add up.
+        if spec.limit:
+            key_field = spec.sort_by or "contract_value"
+            reverse = spec.order == "desc"
+            for code in by_currency:
+                ranked = [a for a in by_currency[code] if _field(a, key_field) is not None]
+                ranked.sort(key=lambda a: _field(a, key_field), reverse=reverse)
+                by_currency[code] = ranked[:spec.limit]
+            by_currency = {code: items for code, items in by_currency.items() if items}
+            have = [a for items in by_currency.values() for a in items]
         lines = []
         for code, items in sorted(by_currency.items()):
             values = [_field(a, "contract_value") for a in items]
@@ -262,6 +503,14 @@ def execute_spec(spec: ChatQuerySpec, analyses: List[Dict[str, Any]]) -> Dict[st
                     f"- **{format_money(total / len(items), code)}** average across {len(items)} contract(s)"
                 )
         title = "Total amount" if spec.operation == "sum" else "Average amount"
+        if spec.limit:
+            key_field = spec.sort_by or "contract_value"
+            which = {
+                ("contract_value", "desc"): "largest", ("contract_value", "asc"): "smallest",
+                ("end_date", "desc"): "latest-ending", ("end_date", "asc"): "earliest-ending",
+                ("start_date", "desc"): "most recent", ("start_date", "asc"): "oldest",
+            }.get((key_field, spec.order), "selected")
+            title += f" of the {spec.limit} {which} contract{'s' if spec.limit != 1 else ''}"
         answer = f"**{title}**" + (" (per currency; different currencies are not added together)" if len(by_currency) > 1 else "") + ":\n" + "\n".join(lines)
         if missing:
             notes.append(f"No amount found in: {_names(missing)} (not included).")
@@ -317,8 +566,8 @@ def execute_spec(spec: ChatQuerySpec, analyses: List[Dict[str, Any]]) -> Dict[st
             answer += "\n\n" + "\n".join(f"- {n}" for n in notes)
         return {"answer": answer, "rows": [], "notes": notes}
 
-    columns: List[str] = []
-    if value_involved or spec.sort_by == "contract_value":
+    columns: List[str] = [f for f in spec.fields if f != "filename"]
+    if (value_involved or spec.sort_by == "contract_value") and "contract_value" not in columns:
         columns.append("contract_value")
     for f in spec.filters:
         if f.field not in columns and f.field not in ("filename", "contract_value"):

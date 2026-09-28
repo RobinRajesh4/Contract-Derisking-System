@@ -49,20 +49,91 @@ def _pick_case_insensitive(value: Any, allowed, default=None):
     return lookup.get(str(value).strip().lower(), default if default is not None else value)
 
 
+# One written number: digits with , or . separators, or the European
+# "45 892,00" form. A plain space only joins groups when a decimal comma
+# follows, so "$45,892 360" is 45,892, not 45,892,360.
+_MONEY_NUMBER = re.compile(r"-?\d{1,3}(?: \d{3})+,\d{1,2}(?!\d)|-?\d[\d,.]*\d|-?\d")
+_DATE_LIKE = re.compile(r"\b\d{4}-\d{1,2}-\d{1,2}\b|\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b")
+_MONEY_SCALE = [
+    (re.compile(r"^\s*(?:k|thousand)\b", re.I), 1e3),
+    (re.compile(r"^\s*(?:m|mn|mm|million)\b", re.I), 1e6),
+    (re.compile(r"^\s*(?:b|bn|billion)\b", re.I), 1e9),
+    (re.compile(r"^\s*(?:lakh|lac|lakhs|lacs)\b", re.I), 1e5),
+    (re.compile(r"^\s*(?:crore|crores|cr)\b", re.I), 1e7),
+]
+
+
+def _number_from_digits(raw: str) -> Optional[float]:
+    """Read one written number, whatever its grouping convention:
+    1,203,432.00 (US) / 5,00,000 (Indian) / 45.892,00 and 45 892,00
+    (European) / 1203432."""
+    s = re.sub(r"\s", "", raw)
+    negative = s.startswith("-")
+    s = s.lstrip("-")
+    if "," in s and "." in s:
+        # Whichever separator comes last is the decimal point.
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        # "45,50" (two decimals, one comma) is a decimal comma;
+        # "5,00,000" / "1,203" are thousands separators.
+        head, _, tail = s.rpartition(",")
+        if s.count(",") == 1 and len(tail) in (1, 2):
+            s = head + "." + tail
+        else:
+            s = s.replace(",", "")
+    elif s.count(".") > 1:
+        # "45.892.000" - dots as thousands separators (every group 3 digits).
+        head, *groups = s.split(".")
+        if not all(len(g) == 3 for g in groups):
+            return None
+        s = s.replace(".", "")
+    # A single dot is a decimal point ("2.125", "0.875"), as in Python.
+    try:
+        number = float(s)
+    except ValueError:
+        return None
+    return -number if negative else number
+
+
 def parse_money(value: Any) -> Optional[float]:
-    """'$1,203,432.00' / '1203432' / 1203432 -> 1203432.0; else None."""
+    """
+    '$1,203,432.00' / '1203432' / 1203432 -> 1203432.0; '$50k' -> 50000;
+    '1.5M' / '1.5 million' -> 1500000; 'Rs. 5,00,000' -> 500000;
+    'EUR 45.892,00' -> 45892.0. None when there's no number.
+
+    Only the first number is read, so prefixes like "Rs." or "USD" and
+    trailing words can't bleed into it.
+    """
     value = _none_if_blank(value)
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
         return float(value)
-    cleaned = re.sub(r"[^\d.\-]", "", str(value))
-    if not cleaned or cleaned in {".", "-"}:
+    text = str(value)
+    # Dates aren't amounts: "2024-01-15" -> None, but "$45,892 as of
+    # 01/15/2024" -> 45,892.
+    text = _DATE_LIKE.sub(" ", text)
+    if not re.search(r"\d", text):
         return None
-    try:
-        return float(cleaned)
-    except ValueError:
+    # A value that is nothing but one space-grouped number ("12 500 000",
+    # "EUR 12 500 000") is unambiguous; inside a sentence it isn't.
+    whole = re.fullmatch(r"\s*(?:[A-Za-z$€£₹]{1,3}\.?\s*)?(-?\d{1,3}(?: \d{3})+)\s*(?:[A-Za-z€£₹$]{1,3})?\s*", text)
+    if whole:
+        return float(whole.group(1).replace(" ", ""))
+    match = _MONEY_NUMBER.search(text)
+    if not match:
         return None
+    number = _number_from_digits(match.group(0))
+    if number is None:
+        return None
+    rest = text[match.end():]
+    for pattern, factor in _MONEY_SCALE:
+        if pattern.match(rest):
+            return number * factor
+    return number
 
 
 # ---------------------------------------------------------------- clauses
@@ -251,3 +322,31 @@ class ChatQuerySpec(BaseModel):
     order: Literal["asc", "desc"] = "desc"
     limit: Optional[int] = Field(default=None, ge=1, le=100)
     filters: List[QueryFilter] = Field(default_factory=list)
+    # Which fields a lookup asks for ("When does Contract_3 end?" ->
+    # ["end_date"]), so the answer shows that field, not a default set.
+    fields: List[StructuredField] = Field(default_factory=list)
+    # Contracts the question names, by file name or party name
+    # ("Contract_3", "Julia Miller"). Used to narrow both paths.
+    contracts: List[str] = Field(default_factory=list)
+    # True when a clause question must look at every contract ("which
+    # contracts charge more than 1.4%?", "compare the penalties").
+    across_contracts: bool = False
+    # The question rewritten to stand on its own, resolving follow-ups
+    # ("and for Peter Chen?" -> "What is the interest rate in Peter
+    # Chen's contract?"). Used for search.
+    standalone_question: Optional[str] = None
+
+    @field_validator("fields", mode="before")
+    @classmethod
+    def _known_fields_only(cls, value):
+        allowed = set(StructuredField.__args__)
+        if not isinstance(value, list):
+            return []
+        return [v for v in value if isinstance(v, str) and v in allowed]
+
+    @field_validator("contracts", mode="before")
+    @classmethod
+    def _names_only(cls, value):
+        if not isinstance(value, list):
+            return []
+        return [str(v).strip() for v in value if str(v or "").strip()][:10]

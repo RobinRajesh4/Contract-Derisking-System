@@ -3,8 +3,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Button } from "@/components/ui/button";
 import { Upload as UploadIcon, FileText } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
-import { uploadContract, analyze } from "@/services/analysis";
-import { buildCompiledPolicy } from "@/policy/buildPolicy";
+import { uploadContract, runAnalysis, uploadWarnings, type UploadResult } from "@/services/analysis";
 
 export default function Upload() {
   const [file, setFile] = useState<File | null>(null);
@@ -30,28 +29,47 @@ export default function Upload() {
     if (!file) return;
 
     setUploading(true);
+    let uploaded: UploadResult;
     try {
-      const { analysis_id, total_clauses, ocr_info } = await uploadContract(file);
-      // Compile policy from the Policy Library and include it in analysis
-      const compiledPolicy = buildCompiledPolicy({ policyId: "ui_policy_v1", riskThreshold: 15 });
-      const result = await analyze({ analysis_id, policy: compiledPolicy });
-      
-      let description = `Analyzed ${result.total_clauses} clauses`;
-      if (ocr_info?.used) {
-        description += ` (OCR used: ${ocr_info.characters} characters from ${ocr_info.pages} page${ocr_info.pages > 1 ? 's' : ''})`;
-      }
-      
-      toast({
-        title: "Analysis complete",
-        description,
-      });
-      setFile(null);
+      uploaded = await uploadContract(file);
     } catch (error) {
       toast({
         title: "Upload failed",
         description: error instanceof Error ? error.message : "Please try again",
         variant: "destructive",
       });
+      setUploading(false);
+      return;
+    }
+
+    // The contract is stored from here on; a failed analysis is reported
+    // as that, not as a failed upload.
+    const notes = uploadWarnings(uploaded);
+    try {
+      const result = await runAnalysis(uploaded.analysis_id);
+      if (result.analysis_quality && result.analysis_quality.complete === false && result.analysis_quality.message) {
+        notes.push(result.analysis_quality.message);
+      }
+      let description = `Analyzed ${result.total_clauses} clauses`;
+      if (uploaded.ocr_info?.used) {
+        const pages = uploaded.ocr_info.pages ?? 0;
+        description += ` (OCR used on ${pages} page${pages === 1 ? "" : "s"})`;
+      }
+      toast({
+        title: notes.length ? "Analysis complete, with warnings" : "Analysis complete",
+        description: [description + ".", ...notes].join(" "),
+        variant: notes.length ? "destructive" : "default",
+      });
+      setFile(null);
+    } catch (error) {
+      toast({
+        title: "Uploaded, but the analysis failed",
+        description:
+          (error instanceof Error ? error.message : "The AI server didn't respond.") +
+          " The contract is saved; open it from Analyses to run the analysis again.",
+        variant: "destructive",
+      });
+      setFile(null);
     } finally {
       setUploading(false);
     }

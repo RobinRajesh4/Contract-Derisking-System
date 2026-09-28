@@ -130,3 +130,90 @@ export const uiLabels: PolicyLabel[] = [
   { id: "8.2", name: "Green Procurement", parentLabelId: "8", color: "#0d9488", policyIds: ["36"] },
   { id: "8.3", name: "ESG Commitments", parentLabelId: "8", color: "#0d9488", policyIds: ["37"] },
 ];
+
+// ---------------------------------------------------------------- saved edits
+//
+// Edits made on the Policies page are saved in this browser (localStorage)
+// and used by every analysis started from it. They used to live only in
+// the page's state: lost on navigation, and never used by the analysis,
+// which always compiled the built-in list above.
+
+const LIBRARY_KEY = "policy-library";
+// Bump when the built-in library changes in a way saved copies should
+// not hide; a saved copy from an older version is then ignored.
+export const LIBRARY_VERSION = 1;
+
+export interface PolicyLibrary {
+  policies: UILibraryPolicy[];
+  labels: PolicyLabel[];
+}
+
+/** True when this browser has its own edited copy of the library. */
+export function hasSavedPolicyLibrary(): boolean {
+  try {
+    const raw = localStorage.getItem(LIBRARY_KEY);
+    return !!raw && JSON.parse(raw)?.version === LIBRARY_VERSION;
+  } catch {
+    return false;
+  }
+}
+
+export function loadPolicyLibrary(): PolicyLibrary {
+  try {
+    const raw = localStorage.getItem(LIBRARY_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (
+        parsed?.version === LIBRARY_VERSION &&
+        Array.isArray(parsed?.policies) &&
+        Array.isArray(parsed?.labels)
+      ) {
+        return { policies: parsed.policies, labels: parsed.labels };
+      }
+    }
+  } catch {
+    /* storage unavailable or corrupt: fall back to the built-in library */
+  }
+  return { policies: uiPolicies, labels: uiLabels };
+}
+
+export function savePolicyLibrary(library: PolicyLibrary): boolean {
+  try {
+    localStorage.setItem(LIBRARY_KEY, JSON.stringify({ version: LIBRARY_VERSION, ...library }));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function resetPolicyLibrary(): PolicyLibrary {
+  try {
+    localStorage.removeItem(LIBRARY_KEY);
+  } catch {
+    /* ignore */
+  }
+  return { policies: uiPolicies, labels: uiLabels };
+}
+
+/** The top-level label a label sits under. */
+export function rootLabelId(labelId: string, labels: PolicyLabel[]): string {
+  const byId = new Map(labels.map((l) => [l.id, l]));
+  let current = byId.get(labelId);
+  const seen = new Set<string>();
+  while (current?.parentLabelId && !seen.has(current.id)) {
+    seen.add(current.id);
+    current = byId.get(current.parentLabelId);
+  }
+  return current?.id ?? labelId;
+}
+
+/**
+ * Policies the analysis never uses: every label they carry sits under a
+ * top-level category that isn't mapped to an analysis domain (e.g.
+ * "Risk & Audit", or a category created on the Policies page).
+ */
+export function unusedPolicies(library: PolicyLibrary): UILibraryPolicy[] {
+  return library.policies.filter(
+    (p) => !p.labelIds.some((lid) => ROOT_DOMAIN_LABELS[rootLabelId(lid, library.labels)])
+  );
+}

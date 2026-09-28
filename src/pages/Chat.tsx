@@ -13,6 +13,7 @@ import {
   Send,
   User,
   ChevronRight,
+  RotateCcw,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -27,64 +28,56 @@ import {
 } from "@/components/ui/select";
 import { listAnalyses } from "@/services/analysis";
 import DocumentViewer from "@/components/DocumentViewer";
+import {
+  ask,
+  clearConversation,
+  getMessages,
+  isPending,
+  subscribe,
+  type ChatMessage as Message,
+  type ChatSource as Source,
+} from "@/lib/chatSession";
 
-/* ─── Types ──────────────────────────────────────────────── */
+const SELECTED_KEY = "contract-chat-selected-analysis";
 
-interface Source {
-  source_number?: number;
-  analysis_id?: string;
-  filename?: string;
-  clause_id?: string | number;
-  text: string;
-  score?: number | null;
-  kind?: "header" | "clause";
+function readSelected(): string {
+  try {
+    return sessionStorage.getItem(SELECTED_KEY) || "all";
+  } catch {
+    return "all";
+  }
 }
-
-interface Message {
-  role: "user" | "assistant";
-  content: string;
-  sources?: Source[];
-}
-
-
-/**
- * Strip common Markdown syntax so it doesn't render as literal
- * asterisks/hashes in the plain-text chat bubble.
- */
-/* ─── Helpers ────────────────────────────────────────────── */
 
 /* ─── Main Chat Component ────────────────────────────────── */
 
 export default function Chat() {
   const navigate = useNavigate();
 
-  /* ── State: messages ─── */
-  const [messages, setMessages] = useState<Message[]>(() => {
-    const saved = sessionStorage.getItem("contract-chat-messages");
-    if (saved) {
-      try {
-        return JSON.parse(saved) as Message[];
-      } catch {
-        sessionStorage.removeItem("contract-chat-messages");
-      }
-    }
-    return [
-      {
-        role: "assistant",
-        content:
-          "Hello! I can answer questions about contracts that have been uploaded and indexed. " +
-          "Select a contract on the right or search across all contracts. What would you like to know?",
-      },
-    ];
-  });
-
+  /* ── State: messages (owned by chatSession, so an answer that
+     arrives while this page is closed isn't lost) ─── */
+  const [messages, setMessages] = useState<Message[]>(() => getMessages());
+  const [isLoading, setIsLoading] = useState(() => isPending());
   const [input, setInput] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
 
-  /* ── State: contract selection ─── */
-  const [selectedAnalysisId, setSelectedAnalysisId] = useState(
-    () => sessionStorage.getItem("contract-chat-selected-analysis") || "all"
+  useEffect(
+    () =>
+      subscribe((next, pending) => {
+        setMessages(next);
+        setIsLoading(pending);
+      }),
+    []
   );
+
+  /* ── State: which contracts questions cover ("all" or one id) ─── */
+  const [selectedAnalysisId, setSelectedAnalysisId] = useState(readSelected);
+
+  /* ── State: which contract the document viewer shows. Separate from
+     the scope above: clicking a reference opens that contract in the
+     viewer without narrowing every later question to it. ─── */
+  const [viewerAnalysisId, setViewerAnalysisId] = useState<string | null>(() => {
+    const s = readSelected();
+    return s === "all" ? null : s;
+  });
 
   /* ── State: highlighted clause in document viewer ─── */
   const [highlightedClauseId, setHighlightedClauseId] = useState<
@@ -124,14 +117,14 @@ export default function Chat() {
     []
   );
 
-  /* ── Persist session ─── */
+  /* ── Persist the scope ─── */
   useEffect(() => {
-    sessionStorage.setItem("contract-chat-selected-analysis", selectedAnalysisId);
+    try {
+      sessionStorage.setItem(SELECTED_KEY, selectedAnalysisId);
+    } catch {
+      /* storage unavailable */
+    }
   }, [selectedAnalysisId]);
-
-  useEffect(() => {
-    sessionStorage.setItem("contract-chat-messages", JSON.stringify(messages));
-  }, [messages]);
 
   /* ── Fetch analyses list ─── */
   const {
@@ -143,12 +136,33 @@ export default function Chat() {
     queryFn: () => listAnalyses(),
   });
 
-  const analyses = (analysesData as any[] | undefined) || [];
+  const analyses = useMemo(() => (analysesData as any[] | undefined) || [], [analysesData]);
 
   const selectedAnalysis =
     selectedAnalysisId === "all"
       ? null
       : analyses.find((a: any) => a.analysis_id === selectedAnalysisId);
+
+  // A contract remembered from before it was deleted (e.g. after the
+  // data was wiped and re-uploaded) would make every question fail.
+  useEffect(() => {
+    if (isLoadingAnalyses || isAnalysesError) return;
+    const ids = new Set(analyses.map((a) => a.analysis_id));
+    if (selectedAnalysisId !== "all" && !ids.has(selectedAnalysisId)) {
+      setSelectedAnalysisId("all");
+    }
+    if (viewerAnalysisId && !ids.has(viewerAnalysisId)) {
+      setViewerAnalysisId(null);
+      setHighlightedClauseId(null);
+    }
+  }, [analyses, isLoadingAnalyses, isAnalysesError, selectedAnalysisId, viewerAnalysisId]);
+
+  const changeScope = (value: string) => {
+    setSelectedAnalysisId(value);
+    setViewerAnalysisId(value === "all" ? null : value);
+    // A highlight belongs to the contract it was clicked in.
+    setHighlightedClauseId(null);
+  };
 
   /* ── Scroll messages to bottom ─── */
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -156,98 +170,24 @@ export default function Chat() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  /* ── Build a source-number → clause mapping from last assistant message ─── */
-  const lastSourceMap = useMemo(() => {
-    const map: Record<number, Source> = {};
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === "assistant" && messages[i].sources?.length) {
-        for (const src of messages[i].sources!) {
-          if (src.source_number != null) map[src.source_number] = src;
-        }
-        break;
-      }
-    }
-    return map;
-  }, [messages]);
-
   /* ── Jump-to-source handler ─── */
-  const handleSourceClick = useCallback(
-    (source: Source) => {
-      // If a specific analysis is referenced, switch to it
-      if (source.analysis_id && selectedAnalysisId !== source.analysis_id) {
-        setSelectedAnalysisId(source.analysis_id);
-      }
-      if (source.clause_id != null) {
-        // Clear first so clicking the same reference again (or the same
-        // clause number in another contract) still re-triggers the
-        // highlight; the delay lets the viewer load a switched contract.
-        setHighlightedClauseId(null);
-        setTimeout(() => setHighlightedClauseId(source.clause_id!), 150);
-      }
-    },
-    [selectedAnalysisId]
-  );
+  const handleSourceClick = useCallback((source: Source) => {
+    if (source.analysis_id) setViewerAnalysisId(source.analysis_id);
+    if (source.clause_id != null) {
+      // Clear first so clicking the same reference again (or the same
+      // clause number in another contract) still re-triggers the
+      // highlight; the delay lets the viewer load a switched contract.
+      setHighlightedClauseId(null);
+      setTimeout(() => setHighlightedClauseId(source.clause_id!), 150);
+    }
+  }, []);
 
   /* ── Send message ─── */
-  const sendMessage = async () => {
+  const sendMessage = () => {
     const question = input.trim();
     if (!question || isLoading) return;
     setInput("");
-    setMessages((prev) => [...prev, { role: "user", content: question }]);
-    setIsLoading(true);
-
-    try {
-      // Recent turns (before this question) so the assistant can follow
-      // up on and correct its own earlier answers.
-      const history = messages
-        .filter((m) => m.content && m.content.trim())
-        .slice(-8)
-        .map((m) => ({ role: m.role, content: m.content.slice(0, 2000) }));
-
-      const requestBody: {
-        message: string;
-        top_k: number;
-        analysis_id?: string;
-        history: { role: string; content: string }[];
-      } = { message: question, top_k: 5, history };
-
-      if (selectedAnalysisId !== "all") {
-        requestBody.analysis_id = selectedAnalysisId;
-      }
-
-      const response = await fetch("http://127.0.0.1:8001/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(requestBody),
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.detail || "Failed to get a response");
-      }
-
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: data.reply || "The AI returned an empty response.",
-          sources: data.sources || [],
-        },
-      ]);
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Unknown connection error";
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: `Sorry, the contract assistant could not complete the request. ${message}`,
-        },
-      ]);
-    } finally {
-      setIsLoading(false);
-    }
+    void ask(question, selectedAnalysisId === "all" ? null : selectedAnalysisId);
   };
 
   /* ── Render ─── */
@@ -266,14 +206,14 @@ export default function Chat() {
             <div className="w-56">
               <Select
                 value={selectedAnalysisId}
-                onValueChange={setSelectedAnalysisId}
+                onValueChange={changeScope}
                 disabled={isLoadingAnalyses}
               >
                 <SelectTrigger className="h-8 text-xs">
                   <SelectValue placeholder="Select contract" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="all">All Contracts</SelectItem>
+                  <SelectItem value="all">All contracts</SelectItem>
                   {analyses.map((a: any) => (
                     <SelectItem key={a.analysis_id} value={a.analysis_id}>
                       {a.filename ||
@@ -295,13 +235,25 @@ export default function Chat() {
             {!isLoadingAnalyses && analyses.length > 0 && (
               <span className="text-xs opacity-60">
                 {selectedAnalysisId === "all"
-                  ? `${analyses.length} contracts`
-                  : selectedAnalysis?.filename
-                    ? selectedAnalysis.filename
-                    : `Analysis ${selectedAnalysisId.slice(0, 8)}`}
+                  ? `Questions cover all ${analyses.length} contracts`
+                  : `Questions cover ${selectedAnalysis?.filename ?? "this contract"} only`}
               </span>
             )}
           </div>
+
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 text-xs"
+            disabled={isLoading}
+            onClick={() => {
+              clearConversation();
+              setHighlightedClauseId(null);
+            }}
+            title="Start a new conversation"
+          >
+            <RotateCcw className="mr-1 h-3.5 w-3.5" /> New chat
+          </Button>
         </div>
       </div>
 
@@ -316,6 +268,12 @@ export default function Chat() {
           <div className="flex-1 space-y-5 overflow-y-auto p-5">
             {messages.map((message, index) => {
               const isBot = message.role === "assistant";
+              // Inline [Source N] links point to this message's own
+              // sources, not whichever answer came last.
+              const sourceMap: Record<number, Source> = {};
+              for (const src of message.sources || []) {
+                if (src.source_number != null) sourceMap[src.source_number] = src;
+              }
               return (
                 <div
                   key={index}
@@ -365,11 +323,11 @@ export default function Chat() {
                                   <button
                                     onClick={(e) => {
                                       e.preventDefault();
-                                      const src = lastSourceMap[num];
+                                      const src = sourceMap[num];
                                       if (src) handleSourceClick(src);
                                     }}
                                     className="mx-0.5 inline-flex h-4 w-4 items-center justify-center rounded-full bg-primary/20 text-[10px] font-bold text-primary ring-1 ring-primary/40 hover:bg-primary/40 transition-colors cursor-pointer align-super"
-                                    title={`Jump to Source ${num}`}
+                                    title={sourceMap[num] ? `Jump to Source ${num}` : `Source ${num}`}
                                   >
                                     {num}
                                  </button>
@@ -482,7 +440,7 @@ export default function Chat() {
               className="flex gap-2"
               onSubmit={(e) => {
                 e.preventDefault();
-                void sendMessage();
+                sendMessage();
               }}
             >
               <input
@@ -514,7 +472,11 @@ export default function Chat() {
         {/* RIGHT: Document Viewer */}
         <div className="flex flex-1 flex-col overflow-hidden border-l">
           <DocumentViewer
-            analysisId={selectedAnalysisId === "all" ? null : selectedAnalysisId}
+            analysisId={
+              viewerAnalysisId && analyses.some((a) => a.analysis_id === viewerAnalysisId)
+                ? viewerAnalysisId
+                : null
+            }
             highlightedClauseId={highlightedClauseId}
           />
         </div>

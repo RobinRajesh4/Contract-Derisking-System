@@ -2,7 +2,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { AlertTriangle, CheckCircle2, FileText, Shield, TrendingUp, BarChart3, PieChart as PieChartIcon, Activity } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { listAnalyses } from "@/services/analysis";
-import { uiPolicies } from "@/policy/policyLibrary";
+import { buildCompiledPolicy } from "@/policy/buildPolicy";
+import { analysisState } from "@/lib/analysisStatus";
 import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from "recharts";
 import { Link } from "react-router-dom";
 import { Badge } from "@/components/ui/badge";
@@ -18,7 +19,8 @@ export default function Dashboard() {
   
   // Calculate real statistics
   const totalContracts = analyses.length;
-  const activePolicies = uiPolicies.length;
+  // Policies the analysis actually uses (see Policies page for any that aren't).
+  const activePolicies = buildCompiledPolicy().domains.reduce((n, d) => n + d.micro_policies.length, 0);
   
   let totalClauses = 0;
   let highRiskCount = 0;
@@ -27,8 +29,13 @@ export default function Dashboard() {
   const domainStats: Record<string, number> = {};
   const recentAnalyses = analyses.slice(0, 5);
   
-  analyses.forEach((a: any) => {
-    const results = a.results || a.clauses || [];
+  // Only contracts that were actually risk-analyzed count towards the
+  // risk figures; an unanalyzed one has unknown risk, not zero.
+  const analyzedContracts = analyses.filter((a) => analysisState(a) !== "not_analyzed");
+  const notAnalyzedCount = totalContracts - analyzedContracts.length;
+
+  analyzedContracts.forEach((a: any) => {
+    const results = a.results || [];
     totalClauses += results.length;
     results.forEach((r: any) => {
       const risk = (r.classification?.risk_level || "").toLowerCase();
@@ -61,7 +68,7 @@ export default function Dashboard() {
       title: "Total Contracts",
       value: isLoading ? "..." : totalContracts.toString(),
       icon: FileText,
-      description: "Analyzed contracts",
+      description: notAnalyzedCount > 0 ? `${notAnalyzedCount} not risk-analyzed yet` : "All risk-analyzed",
       trend: totalContracts > 0 ? "+" + totalContracts : undefined,
     },
     {
@@ -229,6 +236,7 @@ export default function Dashboard() {
             <div className="space-y-4">
               {recentAnalyses.map((a: any) => {
                 const results = a.results || a.clauses || [];
+                const state = analysisState(a);
                 const highRisk = results.filter((r: any) => (r.classification?.risk_level || "").toLowerCase() === "high").length;
                 const dateStr = a.updated_at || a.created_at;
                 return (
@@ -243,8 +251,13 @@ export default function Dashboard() {
                           </p>
                         </div>
                       </div>
-                      <Badge variant={highRisk > 0 ? "destructive" : "secondary"}>
-                        {highRisk > 0 ? `${highRisk} High Risk` : 'Low Risk'}
+                      <Badge variant={state === "not_analyzed" ? "outline" : highRisk > 0 ? "destructive" : "secondary"}>
+                        {state === "not_analyzed"
+                          ? "Not analyzed"
+                          : highRisk > 0
+                            ? `${highRisk} High Risk`
+                            : "No high risk"}
+                        {state === "partial" ? " (partial)" : ""}
                       </Badge>
                     </div>
                   </Link>
