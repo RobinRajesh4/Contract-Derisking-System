@@ -13,6 +13,7 @@ import {
   Send,
   User,
   ChevronRight,
+  ChevronDown,
   RotateCcw,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
@@ -78,6 +79,27 @@ export default function Chat() {
     const s = readSelected();
     return s === "all" ? null : s;
   });
+
+  /* ── State: which answers have their references expanded. Collapsed
+     by default; the last choice becomes the default for new answers. ─── */
+  const [refsDefaultOpen, setRefsDefaultOpen] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("chat-references-open") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const [refsOpen, setRefsOpen] = useState<Record<number, boolean>>({});
+  const toggleRefs = (index: number) => {
+    const next = !(refsOpen[index] ?? refsDefaultOpen);
+    setRefsOpen((prev) => ({ ...prev, [index]: next }));
+    setRefsDefaultOpen(next);
+    try {
+      localStorage.setItem("chat-references-open", next ? "1" : "0");
+    } catch {
+      /* storage unavailable */
+    }
+  };
 
   /* ── State: highlighted clause in document viewer ─── */
   const [highlightedClauseId, setHighlightedClauseId] = useState<
@@ -249,6 +271,7 @@ export default function Chat() {
             onClick={() => {
               clearConversation();
               setHighlightedClauseId(null);
+              setRefsOpen({});
             }}
             title="Start a new conversation"
           >
@@ -368,11 +391,23 @@ export default function Chat() {
                     {isBot &&
                       message.sources &&
                       message.sources.length > 0 && (
-                        <div className="mt-3 border-t border-border/40 pt-3">
-                          <p className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-                            References
-                          </p>
-                          <div className="flex flex-col gap-1.5">
+                        <div className="mt-3 border-t border-border/40 pt-2">
+                          <button
+                            type="button"
+                            onClick={() => toggleRefs(index)}
+                            aria-expanded={refsOpen[index] ?? refsDefaultOpen}
+                            className="flex w-full items-center gap-1 py-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground hover:text-foreground"
+                            title={(refsOpen[index] ?? refsDefaultOpen) ? "Hide references" : "Show references"}
+                          >
+                            {(refsOpen[index] ?? refsDefaultOpen) ? (
+                              <ChevronDown className="h-3 w-3" />
+                            ) : (
+                              <ChevronRight className="h-3 w-3" />
+                            )}
+                            References ({message.sources.length})
+                          </button>
+                          {(refsOpen[index] ?? refsDefaultOpen) && (
+                          <div className="mt-1 flex flex-col gap-1.5">
                             {message.sources.map((source, si) => (
                               <button
                                 key={si}
@@ -425,6 +460,7 @@ export default function Chat() {
                               </button>
                             ))}
                           </div>
+                          )}
                         </div>
                       )}
                   </div>
