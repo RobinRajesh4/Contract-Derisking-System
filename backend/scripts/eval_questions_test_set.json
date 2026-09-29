@@ -1,0 +1,19 @@
+[
+  {"question": "Which contract has the highest financed amount?", "expect_route": "structured", "expect_contains": ["$1,250,000.00"]},
+  {"question": "Which contract has the second highest financed amount?", "expect_route": "structured", "expect_contains": ["$412,000.00"]},
+  {"question": "Which contract has the lowest financed amount?", "expect_route": "structured", "expect_contains": ["$9,500.00"]},
+  {"question": "How many contracts are with HARBORLINE CREDIT UNION?", "expect_route": "structured", "expect_contains": ["3"]},
+  {"question": "Which lender has the most contracts?", "expect_route": "structured", "expect_contains": ["HARBORLINE"]},
+  {"question": "Who is the lender in 05_Personal_Loan_Delgado.pdf?", "expect_route": "structured", "expect_contains": ["QUICKFUND"]},
+  {"question": "What is the financed amount of 10_Home_Loan_Raghavan_INR.pdf?", "expect_route": "structured", "expect_contains": ["4,850,000"]},
+  {"question": "What is the monthly interest rate in 01_Auto_Loan_Okafor.pdf?", "expect_route": "semantic", "expect_contains": ["0.79%"]},
+  {"question": "What late interest applies in 01_Auto_Loan_Okafor.pdf?", "expect_route": "semantic", "expect_contains": ["1%"]},
+  {"question": "What is the late charge in 02_Home_Mortgage_Rahman.pdf?", "expect_route": "semantic", "expect_contains": ["4%"]},
+  {"question": "Is there a prepayment penalty in 03_Working_Capital_Bluewater.pdf?", "expect_route": "semantic", "expect_contains": ["5%"]},
+  {"question": "Can the lender change the interest rate in 05_Personal_Loan_Delgado.pdf?", "expect_route": "semantic", "expect_contains": ["website"]},
+  {"question": "What happens in 06_Farm_Equipment_Whitaker.pdf if a drought ruins the crop?", "expect_route": "semantic", "expect_contains": ["defer"]},
+  {"question": "Which courts have jurisdiction in 07_Student_Loan_Lindqvist.pdf?", "expect_route": "semantic", "expect_contains": ["Franklin County"]},
+  {"question": "How is the interest rate set in 08_Home_Renovation_Park.pdf?", "expect_route": "semantic", "expect_contains": ["Prime", "2.25%"]},
+  {"question": "What is the balloon payment in 09_Commercial_Real_Estate_Harbor_Point.pdf?", "expect_route": "semantic", "expect_contains": ["1,016,530.36"]},
+  {"question": "What are the penal charges in 10_Home_Loan_Raghavan_INR.pdf?", "expect_route": "semantic", "expect_contains": ["2%"]}
+]

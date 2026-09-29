@@ -145,3 +145,33 @@ def test_lender_with_most_contracts():
 def test_unanalyzed_contract_has_unknown_not_zero_risk():
     r = run_risky(sort_by="high_risk_clauses", order="asc", limit=1)
     assert "Contract_11.pdf" in r["answer"] and "Contract_12.pdf** has" not in r["answer"]
+
+
+MIXED = [
+    record(1, "01_Auto_Loan_Okafor.pdf", 38750),
+    record(2, "02_Home_Mortgage_Rahman.pdf", 412000),
+    record(9, "09_Commercial_Real_Estate_Harbor_Point.pdf", 1250000),
+    record(10, "10_Home_Loan_Raghavan_INR.pdf", 4850000, currency="INR"),
+]
+
+
+def test_second_highest_with_a_single_contract_in_another_currency():
+    # The one INR contract has no second place; it used to leave the
+    # answer titled "Highest amount in each currency".
+    r = execute_spec(ChatQuerySpec(kind="structured", sort_by="contract_value", order="desc", limit=1, offset=1), MIXED)
+    assert "**02_Home_Mortgage_Rahman.pdf** has the second highest amount: **$412,000.00**" in r["answer"]
+    assert "Highest amount" not in r["answer"]
+    assert "Only 1 INR contract, so no second one in INR." in r["answer"]
+
+
+def test_second_highest_in_each_currency():
+    data = MIXED + [record(11, "11_Car_Loan_INR.pdf", 950000, currency="INR")]
+    r = execute_spec(ChatQuerySpec(kind="structured", sort_by="contract_value", order="desc", limit=1, offset=1), data)
+    assert r["answer"].startswith("Second highest amount in each currency:")
+    assert [a["filename"] for a in r["rows"]] == ["11_Car_Loan_INR.pdf", "02_Home_Mortgage_Rahman.pdf"]
+
+
+def test_ordinal_beyond_the_number_of_contracts():
+    r = execute_spec(ChatQuerySpec(kind="structured", sort_by="contract_value", order="desc", limit=1, offset=4),
+                     MIXED[:3])
+    assert r["answer"] == "There are only 3 contracts with this information, so there is no fifth one."

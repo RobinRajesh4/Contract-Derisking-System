@@ -33,6 +33,9 @@ export interface ChatMessage {
   model?: string | null;
   /** Model that interpreted the question. */
   routerModel?: string | null;
+  /** "inferred": the answer cited nothing inline; the references are the
+   *  passages it most likely drew on. */
+  citations?: "cited" | "inferred" | "none";
 }
 
 const MESSAGES_KEY = "contract-chat-messages";
@@ -158,6 +161,7 @@ export function ask(question: string, analysisId: string | null): Promise<void> 
         route: data.route,
         model: data.model ?? null,
         routerModel: data.router_model ?? null,
+        citations: data.citations,
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown connection error";

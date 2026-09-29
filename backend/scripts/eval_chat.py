@@ -6,6 +6,7 @@ Ask the running backend real questions and check the answers.
    you checked yourself in the documents. Entries still marked TODO are
    skipped.
 3. From the backend folder:  python scripts/eval_chat.py
+   or, for another question file:  python scripts/eval_chat.py scripts/eval_questions_test_set.json
 
 Run it after any change to models, prompts, parsing or settings. A
 question that passed before and fails now is a regression.
@@ -21,7 +22,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def main() -> int:
-    with open(os.path.join(HERE, "eval_questions.json"), encoding="utf-8") as f:
+    path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "eval_questions.json")
+    with open(path, encoding="utf-8") as f:
         cases = json.load(f)
 
     passed = failed = skipped = 0

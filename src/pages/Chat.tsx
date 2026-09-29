@@ -405,6 +405,14 @@ export default function Chat() {
                               <ChevronRight className="h-3 w-3" />
                             )}
                             References ({message.sources.length})
+                            {message.citations === "inferred" && (
+                              <span
+                                className="ml-1 font-normal normal-case tracking-normal"
+                                title="The answer didn't point to its sources, so these are the passages it most likely drew on."
+                              >
+                                · not cited in the answer; most likely sources
+                              </span>
+                            )}
                           </button>
                           {(refsOpen[index] ?? refsDefaultOpen) && (
                           <div className="mt-1 flex flex-col gap-1.5">

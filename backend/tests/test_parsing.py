@@ -291,3 +291,65 @@ def test_schedule_rows_and_repeated_heading_survive():
 
 def test_bare_number_in_the_body_is_not_a_page_number():
     assert "1250" in strip_page_furniture(["installment is\n1250\ndollars and more text here"])[0]
+
+
+# ------------------------------------------ signed contracts, busy page edges
+
+SIGNED = """CAR FINANCING AGREEMENT
+BORROWER: Daniel Okafor, residing at 2147 Maplewood Lane, Westerville, OH.
+LENDER: HARBORLINE CREDIT UNION, headquartered at 88 Riverside Drive, Columbus, OH.
+FINANCED AMOUNT: $38,750.00.
+CLAUSE ONE – PURPOSE: This agreement grants the BORROWER financing for the Vehicle.
+CLAUSE TWO – PAYMENT: The BORROWER shall pay into account no. ______________ each month
+by direct debit, with interest of 0.79% per month.
+CLAUSE THREE – JURISDICTION: The parties elect the Courts of Franklin County, Ohio, to settle
+any disputes arising from this agreement.
+Signed in two counterparts at Columbus, Ohio, on March 14, 2026.
+______________________________ ______________________________
+Daniel Okafor, Borrower Authorized officer
+"""
+
+
+def test_signature_block_does_not_delete_the_last_clause():
+    _, clauses = split_document(SIGNED)
+    assert len(clauses) == 3
+    assert clauses[-1].startswith("CLAUSE THREE – JURISDICTION")
+    assert clauses[-1].endswith("arising from this agreement.")
+    assert "Signed in two counterparts" not in clauses[-1]
+
+
+def test_clause_with_a_fill_in_blank_is_kept():
+    _, clauses = split_document(SIGNED)
+    assert "account no. ______________ each month" in clauses[1]
+
+
+def test_page_number_behind_header_and_footer_lines_is_removed():
+    # Some PDF generators write header and footer first: four furniture
+    # lines before the body, the page number fourth.
+    def page(n, body):
+        return f"Agreement No. HCU-AUTO-17\nConfidential\nInitials: Borrower ____ Lender ____\nPage {n}\n{body}"
+    pages = [page(1, "CAR FINANCING AGREEMENT\nCLAUSE ONE – PURPOSE: financing of the vehicle."),
+             page(2, "CLAUSE TWO – TERM: sixty months."),
+             page(3, "CLAUSE THREE – LAW: courts of Ohio.")]
+    cleaned = strip_page_furniture(pages)
+    assert cleaned[1] == "CLAUSE TWO – TERM: sixty months."
+    assert cleaned[2] == "CLAUSE THREE – LAW: courts of Ohio."
+    assert "Page 1" not in cleaned[0]
+
+
+def test_table_rows_at_the_page_edge_are_not_peeled_away():
+    rows = [f"Installment {n} due on the fourteenth" for n in range(1, 6)]
+    pages = ["\n".join(["Loan schedule"] + rows) for _ in range(3)]
+    cleaned = strip_page_furniture(pages)
+    assert all(sum(r in p for r in rows) >= 4 for p in cleaned)
+
+
+def test_sentence_starting_with_signed_is_not_a_signature_block():
+    text = SIGNED.replace(
+        "CLAUSE THREE – JURISDICTION: The parties elect the Courts of Franklin County, Ohio, to settle\n",
+        "CLAUSE THREE – JURISDICTION: The parties elect the Courts of Franklin County, Ohio. Notices go by post.\n"
+        "Signed copies of every notice must be kept by both parties. The courts settle\n",
+    )
+    _, clauses = split_document(text)
+    assert "Signed copies of every notice must be kept" in clauses[-1]
+    assert "Signed in two counterparts" not in clauses[-1]

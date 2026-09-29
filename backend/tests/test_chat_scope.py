@@ -424,3 +424,75 @@ def test_semantic_prompt_carries_risk_counts_and_the_no_inference_rule(client, f
 def test_fallback_understands_risk_and_ordinals(question, sort_by, offset, limit):
     s = heuristic_spec(question)
     assert s is not None and (s.sort_by, s.offset, s.limit) == (sort_by, offset, limit)
+
+
+# ------------------------------------------- citations in other formats
+
+import pytest  # noqa: E402
+
+from app.main import likely_sources, link_citations  # noqa: E402
+
+
+@pytest.mark.parametrize("written, linked", [
+    ("1.2% [Source 2].", "1.2% [Source 2](#source-2)."),
+    ("1.2% [Source 2 | Contract_5.pdf | clause 3].", "1.2% [Source 2](#source-2)."),
+    ("1% (Source 4).", "1% ([Source 4](#source-4))."),
+    ("Both [Sources 1, 3].", "Both [Source 1](#source-1), [Source 3](#source-3)."),
+    ("See (Sources 1 and 2).", "See ([Source 1](#source-1), [Source 2](#source-2))."),
+    ("In Sources 2-4.", "In [Source 2](#source-2), [Source 3](#source-3), [Source 4](#source-4)."),
+    ("60 months [2].", "60 months [Source 2](#source-2)."),
+    ("Per Source 3, 60 months.", "Per [Source 3](#source-3), 60 months."),
+    ("Right [Source 2](#source-2).", "Right [Source 2](#source-2)."),
+    ("【Source 2】 x", "[Source 2](#source-2) x"),
+])
+def test_citation_formats_become_links(written, linked):
+    assert link_citations(written, 5) == linked
+
+
+def test_citation_of_a_missing_source_is_not_a_link():
+    assert link_citations("See [Source 9] and [Source 9](#source-9) and [12].", 5) == \
+        "See Source 9 and Source 9 and [12]."
+
+
+def test_citations_inside_code_blocks_are_left_alone():
+    assert link_citations("```\n[Source 1]\n```", 5) == "```\n[Source 1]\n```"
+
+
+def test_label_style_citation_on_a_selected_contract_still_gives_references(client, fake_llm):
+    # The whole contract is sent (no search), so before the fix an answer
+    # citing "[Source 5 | file | clause 4]" came back with no references.
+    ids = load_portfolio(client)
+    fake_llm.handlers["ChatQuerySpec"] = lambda p: json.dumps({"kind": "semantic"})
+    fake_llm.handlers["text"] = lambda p: "The penalty is 2% [Source 5 | Contract_1.txt | clause 4]."
+    r = chat(client, "What is the late interest?", analysis_id=ids["Julia Miller"])
+    assert "[Source 5](#source-5)" in r["reply"]
+    assert [s["source_number"] for s in r["sources"]] == [5]
+    assert "penalty of 2%" in r["sources"][0]["text"]
+    assert r["citations"] == "cited"
+
+
+def test_uncited_answer_shows_its_most_likely_sources(client, fake_llm):
+    ids = load_portfolio(client)
+    fake_llm.handlers["ChatQuerySpec"] = lambda p: json.dumps({"kind": "semantic"})
+    fake_llm.handlers["text"] = lambda p: "A payment delay results in a 2% penalty on the installment."
+    r = chat(client, "What happens if I pay late?", analysis_id=ids["Julia Miller"])
+    assert r["citations"] == "inferred"
+    assert r["sources"] and "penalty of 2%" in " ".join(r["sources"][0]["text"].split())
+
+
+def test_likely_sources_prefers_matching_figures():
+    sources = [
+        {"source_number": 1, "text": "The financing period shall be up to 60 months."},
+        {"source_number": 2, "text": "Interest of 1.2% per month, corrected by the CPI."},
+    ]
+    assert likely_sources("The interest is 1.2% per month.", sources)[0]["source_number"] == 2
+
+
+def test_copied_header_label_with_parentheses_becomes_a_link():
+    written = "Julia Miller [Source 1 | Contract_1.txt | contract header (parties, amounts)]."
+    assert link_citations(written, 5) == "Julia Miller [Source 1](#source-1)."
+
+
+def test_round_brackets_do_not_swallow_the_rest_of_the_sentence():
+    assert link_citations("It is 2% (Source 3) and applies (see below).", 5) == \
+        "It is 2% ([Source 3](#source-3)) and applies (see below)."

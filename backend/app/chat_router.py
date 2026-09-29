@@ -628,7 +628,20 @@ def execute_spec(spec: ChatQuerySpec, analyses: List[Dict[str, Any]]) -> Dict[st
 
     # Offset ("second highest") ---------------------------------------------
     if spec.offset and spec.sort_by:
+        place = _ordinal(spec.offset + 1)
+        too_few = [(code, len(items)) for code, items in groups if len(items) <= spec.offset]
         groups = [(code, items[spec.offset:]) for code, items in groups]
+        groups = [(code, items) for code, items in groups if items]
+        if not groups:
+            total = sum(n for _, n in too_few)
+            return {
+                "answer": f"There {'is' if total == 1 else 'are'} only {total} contract{'s' if total != 1 else ''} "
+                          f"with this information, so there is no {place} one.",
+                "rows": [], "notes": notes,
+            }
+        for code, n in too_few:
+            if code:
+                notes.append(f"Only {n} {code} contract{'s' if n != 1 else ''}, so no {place} one in {code}.")
 
     # Limit, keeping ties at the cut-off ------------------------------------
     if spec.limit:
@@ -698,8 +711,10 @@ def execute_spec(spec: ChatQuerySpec, analyses: List[Dict[str, Any]]) -> Dict[st
     elif spec.limit == 1 and spec.sort_by and len(rows) > 1 and len(groups) == 1:
         lead = f"{len(rows)} contracts are tied:"
     elif spec.limit == 1 and spec.sort_by == "contract_value" and len(groups) > 1:
-        which = "Highest" if spec.order == "desc" else "Lowest"
-        lead = f"{which} amount in each currency:"
+        which = "highest" if spec.order == "desc" else "lowest"
+        if spec.offset:
+            which = f"{_ordinal(spec.offset + 1)} {which}"
+        lead = f"{which[0].upper() + which[1:]} amount in each currency:"
     elif spec.sort_by:
         direction = "highest first" if spec.order == "desc" else "lowest first"
         if spec.sort_by in ("start_date", "end_date"):
@@ -764,17 +779,25 @@ def _grouped(spec: ChatQuerySpec, selected: List[Dict[str, Any]], notes: List[st
     else:
         lead = (f"{len(tied)} {label.lower()}s are tied with {len(top_items)} contract"
                 f"{'s' if len(top_items) != 1 else ''} each: " + ", ".join(f"**{shown[k]}**" for k, _ in tied) + ".")
+    # References: the contracts in the top group(s), each at its header,
+    # linked from their names in the table.
+    rows = [a for _, items in tied for a in items]
+    number = {id(a): n for n, a in enumerate(rows, start=1)}
+
+    def cite(a: Dict[str, Any]) -> str:
+        name = _name(a).replace("|", "/")
+        n = number.get(id(a))
+        return f"{name} [{n}](#source-{n})" if n else name
+
     lines = [f"| # | {label} | Contracts | Total amount | Which |", "|---|---|---|---|---|"]
     for i, (key, items) in enumerate(ordered, start=1):
-        names = ", ".join(_name(a) for a in items[:6]) + (" …" if len(items) > 6 else "")
-        lines.append(f"| {i} | {shown[key].replace('|', '/')} | {len(items)} | {totals(items)} | {names.replace('|', '/')} |")
+        names = ", ".join(cite(a) for a in items[:6]) + (" …" if len(items) > 6 else "")
+        lines.append(f"| {i} | {shown[key].replace('|', '/')} | {len(items)} | {totals(items)} | {names} |")
     if unknown:
         notes.append(f"No {label.lower()} recorded for: {_names(unknown)}.")
     parts = [lead, "\n".join(lines)]
     if notes:
         parts.append("\n".join(f"- {n}" for n in notes))
-    # References: the contracts in the top group(s), each at its header.
-    rows = [a for _, items in tied for a in items]
     return {"answer": "\n\n".join(parts), "rows": rows, "notes": notes}
 
 

@@ -1068,7 +1068,9 @@ numbered sources in the prompt.
 
 Rules:
 1. Every fact you state (name, amount, date, rate, term) must come from the
-   sources or the directory. Cite the source it came from as [Source N](#source-N).
+   sources or the directory. Cite the source it came from exactly as
+   [Source N](#source-N), e.g. [Source 2](#source-2) - not [2], (Source 2)
+   or the source's whole label.
    If something isn't in them, say it isn't in the provided documents. Never
    guess or fill in a value.
 2. Do not compute rankings, totals or comparisons of amounts in your head; if
@@ -1313,6 +1315,126 @@ def _cited_source_numbers(reply: str) -> List[int]:
     return sorted({int(a or b) for a, b in found})
 
 
+# How the model actually cites, besides the asked-for [Source 2](#source-2):
+# "[Source 2]", the whole label it was shown "[Source 2 | file.pdf | clause
+# 3]", "(Source 2)", "[Sources 1, 3]", "(Sources 1 and 2)", "[2]". Left as
+# they were, none of these was a link and the source list came back empty.
+_CITE_NUMS = r"\d+(?:\s*(?:,|;|&|and|to|-|\u2013)\s*(?:Sources?\s*)?\d+)*"
+_CITE_LINKED = re.compile(r"\[Sources?\s*(\d+)\]\(#source-(\d+)\)", re.I)
+# A copied label can hold parentheses ("contract header (parties,
+# amounts)"), so square brackets allow them inside; round ones don't.
+_CITE_BRACKETED = re.compile(
+    r"(?P<open>\[)\s*Sources?\s*(?P<nums>" + _CITE_NUMS + r")[^\[\]\n]{0,200}\](?!\()"
+    r"|(?P<open2>\()\s*Sources?\s*(?P<nums2>" + _CITE_NUMS + r")[^()\n]{0,120}\)"
+    r"|(?P<open3>\u3010)\s*Sources?\s*(?P<nums3>" + _CITE_NUMS + r")[^\u3010\u3011\n]{0,200}\u3011",
+    re.I,
+)
+_CITE_NUMERIC = re.compile(r"\[(?P<nums>\d+(?:\s*,\s*\d+)*)\](?![(:])")
+_CITE_BARE = re.compile(r"(?<![\[\w#-])Sources?\s+(?P<nums>" + _CITE_NUMS + r")\b(?![\]\w])")
+
+
+def _expand_cited(nums: str) -> List[int]:
+    out: List[int] = []
+    for part in re.split(r"\s*(?:,|;|&|\band\b)\s*", re.sub(r"(?i)sources?", "", nums)):
+        m = re.fullmatch(r"(\d+)\s*(?:-|\u2013|to)\s*(\d+)", part.strip())
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if 0 < b - a < 20:
+                out.extend(range(a, b + 1))
+                continue
+        out.extend(int(n) for n in re.findall(r"\d+", part))
+    return out
+
+
+def link_citations(reply: str, source_count: int) -> str:
+    """Every way the model cites a source, turned into [Source N](#source-N)
+    links; numbers with no such source are left as plain text."""
+    if not reply or source_count <= 0:
+        return reply
+
+    def links(numbers: List[int]) -> Optional[str]:
+        valid = [n for n in dict.fromkeys(numbers) if 1 <= n <= source_count]
+        if not valid:
+            return None
+        return ", ".join(f"[Source {n}](#source-{n})" for n in valid)
+
+    def fix_linked(m: "re.Match") -> str:
+        n = int(m.group(2))
+        return f"[Source {n}](#source-{n})" if 1 <= n <= source_count else f"Source {n}"
+
+    def fix_bracketed(m: "re.Match") -> str:
+        numbers = _expand_cited(m.group("nums") or m.group("nums2") or m.group("nums3"))
+        linked = links(numbers)
+        if linked is None:
+            return "Source " + ", ".join(str(n) for n in numbers)
+        return f"({linked})" if m.group("open2") else linked
+
+    def fix_numeric(m: "re.Match") -> str:
+        numbers = [int(n) for n in re.findall(r"\d+", m.group("nums"))]
+        if not all(1 <= n <= source_count for n in numbers):
+            return m.group(0)
+        return links(numbers) or m.group(0)
+
+    def fix_bare(m: "re.Match") -> str:
+        numbers = _expand_cited(m.group("nums"))
+        if all(1 <= n <= source_count for n in numbers):
+            return links(numbers) or m.group(0)
+        # "Per Source 3, 60 months": only the first number is a source;
+        # the rest of the sentence stays as written.
+        first = re.match(r"Sources?\s+(\d+)", m.group(0))
+        n = int(first.group(1))
+        if not 1 <= n <= source_count:
+            return m.group(0)
+        return f"[Source {n}](#source-{n})" + m.group(0)[first.end():]
+
+    # Code blocks (a drafted clause, a table in a fence) are left alone.
+    pieces = re.split(r"(```.*?```)", reply, flags=re.S)
+    for i, piece in enumerate(pieces):
+        if piece.startswith("```"):
+            continue
+        piece = _CITE_LINKED.sub(fix_linked, piece)
+        piece = _CITE_BRACKETED.sub(fix_bracketed, piece)
+        piece = _CITE_NUMERIC.sub(fix_numeric, piece)
+        # Bare "Source 2" / "Sources 1 and 3", outside the links made above.
+        parts = re.split(r"(\[Source \d+\]\(#source-\d+\))", piece)
+        piece = "".join(p if p.startswith("[Source ") else _CITE_BARE.sub(fix_bare, p) for p in parts)
+        pieces[i] = piece
+    return "".join(pieces)
+
+
+_EVIDENCE_STOP = {
+    "the", "and", "for", "that", "this", "with", "from", "shall", "will", "which", "their", "there",
+    "contract", "contracts", "agreement", "clause", "source", "sources", "borrower", "lender", "provided",
+    "documents", "document", "state", "states", "stated", "according",
+}
+
+
+def _evidence_terms(text: str) -> set:
+    text = (text or "").lower()
+    numbers = set(re.findall(r"\d+(?:[.,]\d+)*%?", text))
+    words = {w for w in re.findall(r"[a-z][a-z\-]{4,}", text) if w not in _EVIDENCE_STOP}
+    return numbers | words
+
+
+def likely_sources(reply: str, sources: List[Dict[str, Any]], limit: int = 5) -> List[Dict[str, Any]]:
+    """For an answer that cites nothing: the sources that share the most
+    figures and distinctive words with it, best first (numbers count
+    double - a rate or amount in the answer points at its clause)."""
+    answer = _evidence_terms(reply)
+    if not answer:
+        return sources[:limit]
+    scored = []
+    for position, src in enumerate(sources):
+        shared = answer & _evidence_terms(src.get("text", ""))
+        score = sum(2 if re.match(r"\d", t) else 1 for t in shared)
+        if score:
+            scored.append((-score, position, src))
+    if not scored:
+        return sources[: min(limit, 3)]
+    scored.sort()
+    return [src for _, _, src in scored[:limit]]
+
+
 def _follow_up_search_text(query: str, history: List[Dict[str, str]]) -> str:
     """Without the router's rewrite, a short follow-up ("and for Peter?")
     is searched together with the previous question."""
@@ -1423,7 +1545,6 @@ def chat_endpoint(request: ChatRequest):
     top_k = max(1, min(request.top_k, 10))
     passages: List[Dict[str, Any]] = []
     coverage = ""
-    from_search = False
     # "you're wrong about clauses 3 and 6": fetch those clauses directly -
     # the sentence itself says nothing about what they contain, so search
     # alone would miss them.
@@ -1443,7 +1564,6 @@ def chat_endpoint(request: ChatRequest):
                     for p in found:
                         p["text"] = _focus_passage(p.get("text", ""), search_text, share)
                     whole = found
-                    from_search = True
                 passages.extend(whole)
             coverage = "The sources are from the contract(s) the question names: " + ", ".join(
                 r.get("filename") or r["analysis_id"] for r in targets
@@ -1454,14 +1574,12 @@ def chat_endpoint(request: ChatRequest):
             whole = _whole_contract_passages(selected, _SINGLE_CONTRACT_CHAR_BUDGET)
             if whole is None:
                 whole = need_rag().query(search_text, top_k=top_k, filter_by_analysis=single)
-                from_search = True
             passages = whole
         elif (spec is not None and spec.across_contracts) or looks_across_contracts(search_text) or asked_clauses:
             ids = [a["analysis_id"] for a in all_analyses]
             # Up to 3 passages per contract: an answer can span clauses
             # (regular interest in one, late interest in another).
             passages = need_rag().query_per_contract(search_text, ids, per_contract=3)
-            from_search = True
             shorten_to_budget = True  # after identical wording is merged
             covered = {p["analysis_id"] for p in passages}
             coverage = (
@@ -1473,7 +1591,6 @@ def chat_endpoint(request: ChatRequest):
                 coverage += " No relevant passage was found in: " + ", ".join(missing[:20]) + (" …" if len(missing) > 20 else "") + "."
         else:
             passages = need_rag().query(search_text, top_k=top_k)
-            from_search = True
             covered = {p["analysis_id"] for p in passages}
             coverage = (
                 f"The sources are the {len(passages)} most relevant passages, from {len(covered)} of the "
@@ -1604,22 +1721,25 @@ def chat_endpoint(request: ChatRequest):
             + "). Please try again in a minute.",
         )
 
-    reply = remove_reasoning_traces(str(reply)).strip()
+    reply = link_citations(remove_reasoning_traces(str(reply)).strip(), len(sources))
     print(f"[chat] answered by {answer_model} (routing: {routed_by}, {len(sources)} sources)")
-    # Show the sources the answer actually cites (numbers kept, so the
-    # inline links still match); if it cites none, the best few search
-    # hits, so the user can still check what was looked at.
+    # Show the sources the answer cites (numbers kept, so the inline links
+    # still match). If it cites none, the passages it most likely drew on,
+    # marked as such - an answer with no way to check it is worse.
     cited = set(_cited_source_numbers(reply))
     if cited:
         shown = [s for s in sources if s["source_number"] in cited]
+        citations = "cited"
     else:
-        shown = sources[:5] if from_search else []
+        shown = likely_sources(reply, sources)
+        citations = "inferred" if shown else "none"
 
     return {
         "reply": reply,
         "sources": shown,
         "route": "semantic",
         "routed_by": routed_by,
+        "citations": citations,
         "coverage": coverage,
         "model": answer_model,
         "router_model": router_model,

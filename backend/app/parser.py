@@ -123,13 +123,15 @@ def strip_page_furniture(pages: List[str]) -> List[str]:
         return pages
     split = [p.split("\n") for p in pages]
 
-    def edge_positions(lines: List[str]) -> Dict[int, set]:
+    def edge_positions(lines: List[str], skip: frozenset = frozenset()) -> Dict[int, set]:
         """line index -> its positions from the page edges ("t0" = first
         non-empty line, "b0" = last, ...). A running header sits in the
         same position on every page; body text that merely happens to
         repeat doesn't. On a nearly empty page a line is near both
-        edges, so it gets both a top and a bottom position."""
-        filled = [i for i, line in enumerate(lines) if line.strip()]
+        edges, so it gets both a top and a bottom position. Lines in
+        `skip` (furniture already found) don't take up a position, so
+        the line behind them counts as being at the edge."""
+        filled = [i for i, line in enumerate(lines) if line.strip() and i not in skip]
         pos: Dict[int, set] = {}
         for n, i in enumerate(filled[:_EDGE_LINES]):
             pos.setdefault(i, set()).add(f"t{n}")
@@ -186,21 +188,42 @@ def strip_page_furniture(pages: List[str]) -> List[str]:
     # The first copy of a repeated line is kept: a running header then
     # appears once, and a real heading repeated on every page ("REPAYMENT
     # SCHEDULE (continued)") is never lost entirely.
+    #
+    # PDF generators often write the header and the footer before the page
+    # body, so a page can start "Agreement No. 123 / Confidential /
+    # Initials ____ / Page 2" - four furniture lines, with the page number
+    # beyond the first three. Once a line is found to be furniture, the
+    # next line in from that edge is checked too.
     seen_repeated: set = set()
     cleaned = []
     for page_index, lines in enumerate(split):
-        drop = set()
-        for i, tags in edge_positions(lines).items():
-            if is_page_number(lines[i], page_index):
-                drop.add(i)
-                continue
-            if not can_repeat_away(lines[i]):
-                continue
-            k = key(lines[i])
-            if any((p, k) in repeated for p in tags):
-                if k in seen_repeated:
+        drop: set = set()
+        furniture: set = set()  # dropped, or the kept first copy
+        page_keys: set = set()
+        while True:
+            found = set()
+            for i, tags in edge_positions(lines, frozenset(furniture)).items():
+                if is_page_number(lines[i], page_index):
+                    found.add(i)
                     drop.add(i)
-                seen_repeated.add(k)
+                    continue
+                if not can_repeat_away(lines[i]):
+                    continue
+                k = key(lines[i])
+                # A running header occurs once per page. Peeling off a
+                # second line with the same pattern ("Row 1 ...", "Row 2
+                # ...") would eat into a table, so that stops here.
+                if k in page_keys and i not in furniture:
+                    continue
+                if any((p, k) in repeated for p in tags):
+                    found.add(i)
+                    page_keys.add(k)
+                    if k in seen_repeated:
+                        drop.add(i)
+                    seen_repeated.add(k)
+            if not found - furniture:
+                break
+            furniture |= found
         cleaned.append("\n".join(line for i, line in enumerate(lines) if i not in drop))
     return cleaned
 
@@ -375,6 +398,30 @@ _KEYWORD_HEADING = (
 )
 
 
+_SIGNATURE_START = re.compile(
+    # "Signed" only as a signing statement ("Signed at Mumbai", "SIGNED
+    # AND DELIVERED", "Signed:"), not a sentence that happens to start a
+    # line ("Signed copies of the notice must be kept ...").
+    r"^[ \t]*(?:IN\s+WITNESS\s+WHEREOF\b"
+    r"|(?:SIGNED|Signed)(?=[ \t]*(?:$|[,:]|(?:at|by|on|in|and|for|this|as|sealed)\b))"
+    r"|(?:SIGNATURES?|Signatures?)[ \t]*(?::|$)"
+    r"|EXECUTED\b|Executed\s+(?:by|at|on|in|as)\b|WITNESS(?:ES)?\s*:|Witness(?:es)?\s*:)"
+    r"|^[ \t]*By\s*:\s*_{3,}|^[ \t_]*_{5,}[ \t_]*$",
+    re.MULTILINE,
+)
+
+
+def _cut_signature_block(clause: str) -> str:
+    """The clause without a signature block that follows it. Only a line
+    that starts like a signature block ("Signed at ...", "IN WITNESS
+    WHEREOF", a line of underscores) ends the clause - not underscores
+    inside a sentence, which are fill-in blanks."""
+    m = _SIGNATURE_START.search(clause, 1)
+    if not m or m.start() < 40:
+        return clause
+    return clause[: m.start()].rstrip()
+
+
 def split_document(text: str) -> Tuple[Optional[str], List[str]]:
     """
     Split a contract's text into (header, clauses).
@@ -439,13 +486,24 @@ def split_document(text: str) -> Tuple[Optional[str], List[str]]:
         parts = re.split(r"\n{2,}", collapsed)
         parts = [p.strip() for p in parts if p and p.strip()]
 
+    # The signature block after the last clause ("IN WITNESS WHEREOF",
+    # "Signed at ...", lines of underscores) is not part of that clause.
+    # It used to stay attached, and the "_____" noise rule below then
+    # threw the whole clause away - so every signed contract lost its
+    # last clause (usually jurisdiction).
+    heading_start = re.compile(r"^\d{1,2}[\.\)]\s+[A-Z]{2,}|^" + _KEYWORD_HEADING)
+    is_clause = [bool(heading_start.match(p)) for p in parts]
+    parts = [_cut_signature_block(p) if clause else p for p, clause in zip(parts, is_clause)]
+
     # Within each part, collapse remaining internal single newlines
     # (mid-sentence line wraps) into spaces, and tidy up whitespace.
     parts = [re.sub(r"(?<!\n)\n(?!\n)", " ", p) for p in parts]
     parts = [re.sub(r"\s{2,}", " ", p).strip() for p in parts]
 
     # Filter out very short fragments
-    refined = [p for p in parts if len(p) >= 40]
+    keep = [len(p) >= 40 for p in parts]
+    is_clause = [c for c, k in zip(is_clause, keep) if k]
+    refined = [p for p, k in zip(parts, keep) if k]
 
     # Remove boilerplate headers/footers/signature blocks/page numbers
     NOISE_PATTERNS = [
@@ -466,7 +524,9 @@ def split_document(text: str) -> Tuple[Optional[str], List[str]]:
             if re.search(pat, t, flags=re.IGNORECASE):
                 return True
         return False
-    refined = [c for c in refined if not is_noise(c)]
+    # A part that starts with a clause heading is a clause, even if it
+    # contains a fill-in blank ("Account no.: ________").
+    refined = [c for c, clause in zip(refined, is_clause) if clause or not is_noise(c)]
 
     # Deduplicate identical/near-identical clauses. Some PDF generators
     # reprint the same full clause list on every page (a source-document
