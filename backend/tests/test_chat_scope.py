@@ -496,3 +496,25 @@ def test_copied_header_label_with_parentheses_becomes_a_link():
 def test_round_brackets_do_not_swallow_the_rest_of_the_sentence():
     assert link_citations("It is 2% (Source 3) and applies (see below).", 5) == \
         "It is 2% ([Source 3](#source-3)) and applies (see below)."
+
+
+def test_clause_topic_misread_as_a_list_goes_to_the_clause_text(client, fake_llm):
+    # The router returned a "list" that selects nothing for "anything
+    # mentioned about ...": every contract was printed, each linked to its
+    # header, instead of the clause the question is about.
+    load_portfolio(client)
+    fake_llm.handlers["ChatQuerySpec"] = lambda p: spec()
+    fake_llm.handlers["text"] = lambda p: "All contracts: a 2% penalty on late installments [Source 1]."
+    r = chat(client, "anything mentioned about default")
+    assert r["route"] == "semantic"
+    assert r["sources"] and all(s["kind"] == "clause" for s in r["sources"])
+    assert "penalty of 2%" in r["sources"][0]["text"]
+    # Same wording in every contract: one source that lists the others.
+    assert len(r["sources"][0]["also_in"]) == 5
+
+
+def test_real_listing_request_still_lists_contracts(client, fake_llm):
+    load_portfolio(client)
+    fake_llm.handlers["ChatQuerySpec"] = lambda p: spec()
+    r = chat(client, "list all contracts")
+    assert r["route"] == "structured" and "6 matching contracts" in r["reply"]

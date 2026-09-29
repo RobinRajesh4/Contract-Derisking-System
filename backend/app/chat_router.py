@@ -105,7 +105,9 @@ kind = "semantic".
 
 kind = "semantic" when the answer needs the wording of clauses: what a clause
 says, obligations, interest rates, penalties, fees, termination terms, risks,
-comparing terms, drafting, or explanations.
+comparing terms, drafting, or explanations. A structured spec must rank,
+count, total, group, filter or pick fields; if it would do none of these,
+the question is semantic.
 
 Rules for structured specs:
 - "the highest / the lowest / the largest" (singular) -> limit 1.
@@ -155,6 +157,8 @@ Q: When does Contract_3 end?
 A: {{"kind":"structured","operation":"list","sort_by":null,"order":"desc","limit":null,"filters":[],"fields":["end_date"],"contracts":["Contract_3"],"across_contracts":false,"standalone_question":"When does Contract_3 end?"}}
 Q: Who is the lender for Julia Miller?
 A: {{"kind":"structured","operation":"list","sort_by":null,"order":"desc","limit":null,"filters":[],"fields":["lender_name"],"contracts":["Julia Miller"],"across_contracts":false,"standalone_question":"Who is the lender in Julia Miller's contract?"}}
+Q: anything mentioned about termination
+A: {{"kind":"semantic","operation":"list","sort_by":null,"order":"desc","limit":null,"filters":[],"fields":[],"contracts":[],"across_contracts":true,"standalone_question":"What do the contracts say about termination?"}}
 Q: What is the interest rate in Contract_5?
 A: {{"kind":"semantic","operation":"list","sort_by":null,"order":"desc","limit":null,"filters":[],"fields":[],"contracts":["Contract_5"],"across_contracts":false,"standalone_question":"What is the interest rate in Contract_5?"}}
 Q: Which contracts charge more than 1.4% monthly interest?
@@ -165,6 +169,49 @@ A: {{"kind":"semantic","operation":"list","sort_by":null,"order":"desc","limit":
 
 {convo}Question: {question}
 """
+
+
+# Topics that live in clause wording, not in the directory fields.
+# (Indemnification and governing law are directory fields, so they're
+# not here.)
+_CLAUSE_TOPIC = re.compile(
+    r"\b(terminat\w*|cancel\w*|default\w*|breach\w*|penalt\w*|fines?|fees?|charges?|late|interest|"
+    r"install?ments?|repay\w*|prepay\w*|insur\w*|guarant\w*|collateral|lien|"
+    r"jurisdiction|courts?|arbitrat\w*|disputes?|notices?|confidential\w*|warrant\w*|obligations?|"
+    r"covenants?|assign\w*|force majeure|grace period|mention\w*|say|says)\b",
+    re.I,
+)
+_LIST_ALL = re.compile(
+    r"^\s*(?:please\s+)?(?:list|show|display|give me|what are|which are)\b[^?]*\b(?:contracts|loans|agreements|documents)\b",
+    re.I,
+)
+
+
+def check_spec(spec: Optional[ChatQuerySpec], question: str) -> Optional[ChatQuerySpec]:
+    """
+    Catch structured specs that can't answer the question. The router
+    sometimes turns "anything mentioned about termination?" into a list
+    with no sort, filter or field, which printed every contract (linked to
+    its header) instead of the termination clauses. Clause topics without
+    a ranking or grouping, and "list" specs that select nothing, go to the
+    clause-text path instead, checked across all contracts.
+    """
+    if spec is None or spec.kind != "structured":
+        return spec
+    selects_nothing = (
+        spec.operation == "list" and not spec.sort_by and not spec.group_by
+        and not spec.filters and not spec.fields and not spec.contracts
+    )
+    topic = _CLAUSE_TOPIC.search(question or "")
+    about_clauses = bool(topic) and not spec.sort_by and not spec.group_by and spec.operation in ("list", "count")
+    if (selects_nothing and not (_LIST_ALL.search(question or "") and not topic)) or about_clauses:
+        return ChatQuerySpec(
+            kind="semantic",
+            contracts=spec.contracts,
+            across_contracts=not spec.contracts,
+            standalone_question=spec.standalone_question,
+        )
+    return spec
 
 
 def route_question(llm_client: Any, question: str, history: List[Dict[str, str]]) -> Optional[ChatQuerySpec]:

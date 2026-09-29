@@ -1461,7 +1461,7 @@ def chat_endpoint(request: ChatRequest):
        model told how much of the portfolio they cover.
     """
     from .chat_router import (
-        execute_spec, heuristic_spec, is_aggregate, looks_across_contracts, resolve_named_contracts,
+        check_spec, execute_spec, heuristic_spec, is_aggregate, looks_across_contracts, resolve_named_contracts,
         route_question, sources_for_rows, structured_scope,
     )
     from .mcp.llm_agent import remove_reasoning_traces
@@ -1493,6 +1493,10 @@ def chat_endpoint(request: ChatRequest):
     if spec is None:
         spec = heuristic_spec(query)
         routed_by = "heuristic" if spec is not None else "none"
+    checked = check_spec(spec, query)
+    if checked is not spec:
+        print(f"[chat] structured spec can't answer this question; using clause text instead")
+        spec = checked
 
     rewritten = spec.standalone_question.strip() if spec and spec.standalone_question else ""
     search_text = rewritten or (_follow_up_search_text(query, history) if history else query)
