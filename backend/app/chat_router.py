@@ -606,6 +606,133 @@ def _names(items: List[Dict[str, Any]]) -> str:
     return ", ".join(_name(a) for a in items)
 
 
+_ADDRESS = re.compile(
+    r"(?:residing at|resident at|domiciled at|with (?:its|their) (?:principal |registered |head )?office at|"
+    r"headquartered at|located at)\s+(.+?)(?=,\s*(?:holder|registered|represented|a |an |bearing|CPF|SSN|PAN|EIN)|\.\s|\.$|$)",
+    re.I,
+)
+
+
+_GENERIC_NAME_WORDS = {
+    "inc", "llc", "ltd", "limited", "the", "and", "bank", "credit", "union", "group", "holdings", "company",
+    "corporation", "corp", "capital", "finance", "financial", "trust", "national", "lending", "business",
+    "consumer", "housing", "america", "services", "partners", "of", "n.a", "p.c", "aca",
+}
+
+
+def _name_words(name: Optional[str]) -> List[str]:
+    return [w for w in _norm(name or "").split() if len(w) > 2 and w not in _GENERIC_NAME_WORDS]
+
+
+def _mentions(question: str, name: Optional[str]) -> bool:
+    """The question names this party: its full name, or a distinctive
+    word of it ("Rachel Park", "Park", "Bluewater")."""
+    words = _name_words(name)
+    q = set(_norm(question).split())
+    return bool(words) and any(w in q for w in words)
+
+
+def lender_names_as_filters(spec: ChatQuerySpec, analyses: List[Dict[str, Any]], named: List[Dict[str, Any]]) -> ChatQuerySpec:
+    """ "tell me about Harborline Credit Union": the router lists the lender
+    as a contract name, which matches no contract, so every contract was
+    listed. A name that is a lender becomes a lender filter instead."""
+    if spec.kind != "structured" or not spec.contracts or named:
+        return spec
+    lenders = {str(_field(a, "lender_name") or "") for a in analyses}
+    filters, left = list(spec.filters), []
+    for name in spec.contracts:
+        if any(_mentions(name, lender) for lender in lenders if lender):
+            filters.append(QueryFilter(field="lender_name", op="contains", value=name))
+        else:
+            left.append(name)
+    if len(left) == len(spec.contracts):
+        return spec
+    return spec.model_copy(update={"filters": filters, "contracts": left})
+
+
+def _party_address(record: Dict[str, Any], role: str) -> Optional[str]:
+    """The party's address as the contract header gives it, e.g.
+    "BORROWER: Rachel Park, residing at 6480 Tara Hill Drive, ..."."""
+    header = ((record.get("header") or {}).get("text") or "")
+    label = "BORROWER|CUSTOMER|CLIENT|DEBTOR" if role == "borrower" else "LENDER|BANK|CREDITOR"
+    m = re.search(r"\b(?:" + label + r")\s*:(.{0,400})", header, re.I | re.S)
+    if not m:
+        return None
+    segment = re.split(r"\b(?:BORROWER|LENDER|FINANCED AMOUNT|AMOUNT|CLAUSE)\s*:", m.group(1))[0]
+    a = _ADDRESS.search(" ".join(segment.split()))
+    return a.group(1).strip(" ,.") if a else None
+
+
+def describe_named(question: str, rows: List[Dict[str, Any]]) -> Optional[str]:
+    """
+    One or two plain sentences about the party or contract a lookup
+    question names ("who is Rachel Park?"), built from the stored fields
+    and the contract header - no model call, so no extra wait.
+    """
+    if not rows:
+        return None
+    sentences: List[str] = []
+
+    def contract_bits(a: Dict[str, Any]) -> str:
+        kind = _field(a, "contract_about")
+        start = _field(a, "start_date")
+        end = _field(a, "end_date")
+        value = _field(a, "contract_value")
+        text = f"**{_name(a)}**"
+        if kind:
+            text += f" (a {str(kind).strip().rstrip('.').lower()})"
+        if value is not None:
+            text += f" for **{format_money(value, _field(a, 'currency'))}**"
+        if start and end:
+            text += f", running {start} to {end}"
+        elif end:
+            text += f", ending {end}"
+        return text
+
+    def risk(a: Dict[str, Any]) -> str:
+        if not _is_analyzed(a):
+            return " It hasn't been risk-analyzed yet."
+        h, m, l = (_risk_value(a, f) for f in ("high_risk_clauses", "medium_risk_clauses", "low_risk_clauses"))
+        return f" Risk analysis: {int(h or 0)} high, {int(m or 0)} medium and {int(l or 0)} low-risk clauses."
+
+    borrower_of = [a for a in rows if _mentions(question, _field(a, "customer_name"))]
+    lender_of = [a for a in rows if _mentions(question, _field(a, "lender_name")) and a not in borrower_of]
+
+    if borrower_of:
+        a = borrower_of[0]
+        who = _field(a, "customer_name")
+        address = _party_address(a, "borrower")
+        lender = _field(a, "lender_name")
+        if len(borrower_of) == 1:
+            s = f"**{who}** is the borrower in {contract_bits(a)}"
+            s += f", with **{lender}** as lender." if lender else "."
+            if address:
+                s += f" The contract gives the borrower's address as {address}."
+            sentences.append(s + risk(a))
+        else:
+            sentences.append(f"**{who}** is the borrower in {len(borrower_of)} contracts: "
+                             + "; ".join(contract_bits(x) for x in borrower_of) + ".")
+    if lender_of:
+        lender = _field(lender_of[0], "lender_name")
+        if len(lender_of) == 1:
+            a = lender_of[0]
+            borrower = _field(a, "customer_name")
+            sentences.append(f"**{lender}** is the lender in {contract_bits(a)}"
+                             + (f", lending to **{borrower}**." if borrower else "."))
+        else:
+            names = [f"**{_field(a, 'customer_name') or _name(a)}**" for a in lender_of]
+            listed = ", ".join(names[:-1]) + f" and {names[-1]}" if len(names) > 1 else names[0]
+            sentences.append(f"**{lender}** is the lender in {len(lender_of)} contracts, lending to {listed}.")
+    if not sentences and len(rows) == 1:
+        a = rows[0]
+        who, lender = _field(a, "customer_name"), _field(a, "lender_name")
+        s = contract_bits(a)
+        if who or lender:
+            s += f": borrower **{who or 'not found'}**, lender **{lender or 'not found'}**."
+        sentences.append(s + risk(a))
+    return " ".join(sentences) or None
+
+
 def execute_spec(spec: ChatQuerySpec, analyses: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Run a structured spec over the contract records.

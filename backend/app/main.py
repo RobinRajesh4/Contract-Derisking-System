@@ -1499,7 +1499,7 @@ def chat_endpoint(request: ChatRequest):
        model told how much of the portfolio they cover.
     """
     from .chat_router import (
-        check_spec, execute_spec, follow_up_spec, heuristic_spec, is_aggregate, looks_across_contracts, resolve_named_contracts,
+        check_spec, describe_named, execute_spec, lender_names_as_filters, follow_up_spec, heuristic_spec, is_aggregate, looks_across_contracts, resolve_named_contracts,
         route_question, sources_for_rows, structured_scope,
     )
     from .mcp.llm_agent import remove_reasoning_traces
@@ -1556,6 +1556,9 @@ def chat_endpoint(request: ChatRequest):
 
     # 1) Structured questions: exact answer from the directory.
     if spec is not None and spec.kind == "structured":
+        by_lender = lender_names_as_filters(spec, all_analyses, named)
+        looked_up = bool(named) or by_lender is not spec
+        spec = by_lender
         scope, note = structured_scope(spec, all_analyses, named, selected)
         stored = len(scope)
         if already_shown:
@@ -1576,6 +1579,13 @@ def chat_endpoint(request: ChatRequest):
             run_spec = spec.model_copy(update={"filters": [f for f in spec.filters if f.field != "filename"]})
         result = execute_spec(run_spec, scope)
         answer = result["answer"]
+        if looked_up and run_spec.operation == "list" and not run_spec.sort_by and not run_spec.group_by:
+            # A lookup ("who is Rachel Park?"): say who it is in words, then
+            # the table - computed from stored fields, no model call.
+            about = describe_named(query, result["rows"])
+            if about:
+                answer = re.sub(r"^\d+ matching contracts?:\s*", "", answer)
+                answer = f"{about}\n\n{answer}"
         if note:
             answer = f"_{note}_\n\n{answer}"
         if stored > 1:

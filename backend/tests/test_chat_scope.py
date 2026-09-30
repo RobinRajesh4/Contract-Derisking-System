@@ -574,3 +574,26 @@ def test_the_other_ones_after_a_tie_shows_no_contract_twice(client, fake_llm):
     r = chat(client, "list the other ones", previous_spec=first["query_spec"],
              previous_ids=[src["analysis_id"] for src in first["sources"]])
     assert [src["filename"] for src in r["sources"]] == ["Small.txt"]
+
+
+# ------------------------------------------------ "who is ..." lookups
+
+def test_who_is_a_borrower_gets_a_sentence_not_just_a_table(client, fake_llm):
+    load_portfolio(client)
+    fake_llm.handlers["ChatQuerySpec"] = lambda p: spec(fields=["lender_name"], contracts=["Julia Miller"])
+    r = chat(client, "who is julia miller")
+    first = r["reply"].split("\n")[0]
+    assert first.startswith("**Julia Miller** is the borrower in **Contract_1.txt** for **$45,892.00**")
+    assert "FINANCIAL BANK OF AMERICA Inc** as lender" in first
+    assert "address as 1 Main Avenue - Boston, MA" in first
+    assert "| Lender |" in r["reply"]           # the table is still there
+    assert r["model"] is None                   # computed, no model call
+
+
+def test_lender_named_as_a_contract_lists_only_its_contracts(client, fake_llm):
+    upload(client, "a.txt", contract("Anna One", 1000, "1.0"))
+    upload(client, "b.txt", contract("Ben Two", 2000, "1.0").replace("FINANCIAL BANK OF AMERICA Inc", "Harborline Credit Union"))
+    fake_llm.handlers["ChatQuerySpec"] = lambda p: spec(contracts=["Harborline Credit Union"])
+    r = chat(client, "tell me about Harborline Credit Union")
+    assert [s["filename"] for s in r["sources"]] == ["b.txt"]
+    assert r["reply"].startswith("**Harborline Credit Union** is the lender in **b.txt**")
