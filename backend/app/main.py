@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Body
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from typing import List as TypingList
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +29,7 @@ from .store import Store
 from .mcp.llm_agent import LLMClient
 from .policy import save_policy, get_policy, list_policies, apply_policy
 from .llm_providers import (
+    LLMError,
     EDITABLE_SETTINGS,
     get_settings,
     save_settings,
@@ -1482,9 +1483,13 @@ def _follow_up_search_text(query: str, history: List[Dict[str, str]]) -> str:
     return f"{previous} {query}".strip() if previous else query
 
 
-@app.post("/chat")
-def chat_endpoint(request: ChatRequest):
+def _prepare_chat(request: "ChatRequest", status=None) -> Dict[str, Any]:
     """
+    Everything before the answer is written. Returns either the finished
+    response (exact answers, nothing to write) or, for questions answered
+    from clause text, {"_pending": True, "prompt": ..., ...} for
+    _finish_chat. `status(text)` is told what's happening, for streaming.
+
     Answer a question about the stored contracts.
 
     1. Questions answerable from contract fields (highest/lowest amount,
@@ -1525,6 +1530,8 @@ def chat_endpoint(request: ChatRequest):
     if not all_analyses:
         return {"reply": "No contracts have been uploaded yet.", "sources": [], "route": "none"}
 
+    if status:
+        status("Reading the question")
     spec = route_question(llm, query, history)
     routed_by = "llm"
     router_model = getattr(llm._get_provider("quality"), "model", None)
@@ -1604,6 +1611,8 @@ def chat_endpoint(request: ChatRequest):
         }
 
     # 2) Semantic questions: clause text + LLM.
+    if status:
+        status("Finding the relevant clauses")
     def need_rag():
         if ensure_rag() is None:
             reason = _rag_init["error"] or "see the server log"
@@ -1790,16 +1799,23 @@ def chat_endpoint(request: ChatRequest):
                     "the answer may not cover every contract.]")
         prompt = build_prompt([], context_parts)
 
-    reply, answer_model, tried = _answer_with_fallback(prompt)
-    if reply is None:
-        raise HTTPException(
-            status_code=503,
-            detail="The AI server didn't produce an answer (" + "; ".join(tried)
-            + "). Please try again in a minute.",
-        )
+    return {
+        "_pending": True,
+        "prompt": prompt,
+        "sources": sources,
+        "coverage": coverage,
+        "routed_by": routed_by,
+        "router_model": router_model,
+    }
 
+
+def _finish_chat(prepared: Dict[str, Any], reply: str, answer_model: Optional[str]) -> Dict[str, Any]:
+    """The written answer, with its citations linked and its sources."""
+    from .mcp.llm_agent import remove_reasoning_traces
+
+    sources = prepared["sources"]
     reply = link_citations(remove_reasoning_traces(str(reply)).strip(), len(sources))
-    print(f"[chat] answered by {answer_model} (routing: {routed_by}, {len(sources)} sources)")
+    print(f"[chat] answered by {answer_model} (routing: {prepared['routed_by']}, {len(sources)} sources)")
     # Show the sources the answer cites (numbers kept, so the inline links
     # still match). If it cites none, the passages it most likely drew on,
     # marked as such - an answer with no way to check it is worse.
@@ -1815,12 +1831,129 @@ def chat_endpoint(request: ChatRequest):
         "reply": reply,
         "sources": shown,
         "route": "semantic",
-        "routed_by": routed_by,
+        "routed_by": prepared["routed_by"],
         "citations": citations,
-        "coverage": coverage,
+        "coverage": prepared["coverage"],
         "model": answer_model,
-        "router_model": router_model,
+        "router_model": prepared["router_model"],
     }
+
+
+@app.post("/chat")
+def chat_endpoint(request: ChatRequest):
+    """Answer a question about the stored contracts (whole answer at once).
+    See _prepare_chat for how questions are answered."""
+    prepared = _prepare_chat(request)
+    if not prepared.get("_pending"):
+        return prepared
+    reply, answer_model, tried = _answer_with_fallback(prepared["prompt"])
+    if reply is None:
+        raise HTTPException(
+            status_code=503,
+            detail="The AI server didn't produce an answer (" + "; ".join(tried)
+            + "). Please try again in a minute.",
+        )
+    return _finish_chat(prepared, reply, answer_model)
+
+
+def _stream_with_fallback(prompt: str):
+    """
+    Yield ("model", name) once, then ("delta", text) pieces of the answer
+    as the model writes them. Models are tried in the same order as
+    _answer_with_fallback; a model that fails before writing anything
+    hands over to the next one. One that fails half-way raises, since
+    the user has already seen part of its answer.
+    """
+    from .llm_providers import chat_models
+
+    if get_settings().get("provider", "ollama") != "ollama":
+        candidates = [None]
+    else:
+        candidates = chat_models()
+    failures: List[str] = []
+    for model in candidates:
+        provider = llm._get_provider("quality") if model is None else llm._provider_for_model(model)
+        name = model or getattr(provider, "model", None)
+        stream = getattr(provider, "stream", None)
+        try:
+            if stream is None:
+                text = provider.invoke(prompt, system=CHAT_SYSTEM_PROMPT, temperature=0)
+                yield ("model", name)
+                yield ("delta", text)
+                return
+            pieces = stream(prompt, system=CHAT_SYSTEM_PROMPT, temperature=0)
+            first = next(pieces)
+        except StopIteration:
+            failures.append(f"{name}: empty answer")
+            continue
+        except Exception as error:
+            failures.append(f"{name}: {str(error)[:160]}")
+            continue
+        if failures:
+            print(f"[chat] fell back to {name} after: {' | '.join(failures)}")
+        yield ("model", name)
+        yield ("delta", first)
+        for piece in pieces:
+            yield ("delta", piece)
+        return
+    raise LLMError("The AI server didn't produce an answer (" + "; ".join(failures) + "). Please try again in a minute.")
+
+
+@app.post("/chat/stream")
+def chat_stream(request: ChatRequest):
+    """
+    The same answer as /chat, sent as it's written: newline-delimited JSON
+    events - {"type": "status", "text"} while the question is read and the
+    clauses found, {"type": "model"}, {"type": "delta", "text"} for each
+    piece of the answer, then {"type": "done", ...the /chat response} with
+    citations linked and sources attached, or {"type": "error", "detail"}.
+    """
+    import json as _json
+    import queue
+
+    events: "queue.Queue" = queue.Queue()
+
+    def send(event: Dict[str, Any]) -> None:
+        events.put(_json.dumps(event, ensure_ascii=False) + "\n")
+
+    def work() -> None:
+        try:
+            prepared = _prepare_chat(request, status=lambda text: send({"type": "status", "text": text}))
+            if not prepared.get("_pending"):
+                send({"type": "done", **prepared})
+                return
+            send({"type": "status", "text": "Writing the answer"})
+            parts: List[str] = []
+            model = None
+            for kind, value in _stream_with_fallback(prepared["prompt"]):
+                if kind == "model":
+                    model = value
+                    send({"type": "model", "model": value})
+                else:
+                    parts.append(value)
+                    send({"type": "delta", "text": value})
+            send({"type": "done", **_finish_chat(prepared, "".join(parts), model)})
+        except HTTPException as error:
+            send({"type": "error", "status": error.status_code, "detail": error.detail})
+        except Exception as error:
+            send({"type": "error", "status": 503, "detail": str(error)[:500]})
+        finally:
+            events.put(None)
+
+    threading.Thread(target=work, daemon=True).start()
+
+    def body():
+        while True:
+            item = events.get()
+            if item is None:
+                return
+            yield item
+
+    return StreamingResponse(
+        body(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 term_labels = {

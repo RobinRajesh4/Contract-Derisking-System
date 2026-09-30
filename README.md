@@ -342,6 +342,7 @@ src/
 | GET | `/clauses/{id}/file` | The original uploaded file |
 | GET | `/contracts` | Contracts with extracted facts |
 | POST | `/chat` | Ask a question (optionally about one contract via `analysis_id`) |
+| POST | `/chat/stream` | Same answer, sent as it's written (newline-delimited JSON: `status`, `model`, `delta` pieces, then `done` with the full `/chat` response, or `error`). The chat page uses this. If words arrive in bursts, the proxy in front of Ollama is buffering: LibreChat's nginx needs `proxy_buffering off;` for `/ollama/`. |
 | POST | `/compare` | Compare two contracts |
 | POST | `/summary/{id}` | Regenerate the executive summary |
 | POST | `/recommend` | Suggest alternative wording for a clause |

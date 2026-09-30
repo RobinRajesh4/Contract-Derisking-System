@@ -32,9 +32,11 @@ import DocumentViewer from "@/components/DocumentViewer";
 import {
   ask,
   clearConversation,
+  getLive,
   getMessages,
   isPending,
   subscribe,
+  type LiveAnswer,
   type ChatMessage as Message,
   type ChatSource as Source,
 } from "@/lib/chatSession";
@@ -58,13 +60,15 @@ export default function Chat() {
      arrives while this page is closed isn't lost) ─── */
   const [messages, setMessages] = useState<Message[]>(() => getMessages());
   const [isLoading, setIsLoading] = useState(() => isPending());
+  const [live, setLive] = useState<LiveAnswer | null>(() => getLive());
   const [input, setInput] = useState("");
 
   useEffect(
     () =>
-      subscribe((next, pending) => {
+      subscribe((next, pending, liveAnswer) => {
         setMessages(next);
         setIsLoading(pending);
+        setLive(liveAnswer ? { ...liveAnswer } : null);
       }),
     []
   );
@@ -191,6 +195,12 @@ export default function Chat() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+  // While an answer is being written, keep its newest line in view
+  // (instantly: a smooth scroll per word would lag behind).
+  const liveLength = live?.text.length ?? 0;
+  useEffect(() => {
+    if (liveLength) messagesEndRef.current?.scrollIntoView({ block: "end" });
+  }, [liveLength]);
 
   /* ── Jump-to-source handler ─── */
   const handleSourceClick = useCallback((source: Source) => {
@@ -483,7 +493,23 @@ export default function Chat() {
             })}
 
             {/* Typing indicator */}
-            {isLoading && (
+            {isLoading && live?.text ? (
+              /* The answer as it's being written. Citations become
+                 clickable once it's finished. */
+              <div className="flex gap-3 min-w-0" aria-live="polite">
+                <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-primary/10">
+                  <MessageSquare className="h-4 w-4 animate-pulse text-primary" />
+                </div>
+                <div className="max-w-[85%] min-w-0 rounded-xl bg-muted px-4 py-3 text-sm text-foreground">
+                  <div className="whitespace-pre-wrap break-words leading-relaxed prose prose-sm max-w-none dark:prose-invert">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{`${live.text}\u258D`}</ReactMarkdown>
+                  </div>
+                  <p className="mt-2 text-[10px] text-muted-foreground">
+                    Writing{live.model ? ` · ${live.model}` : ""}…
+                  </p>
+                </div>
+              </div>
+            ) : isLoading ? (
               <div className="flex gap-3">
                 <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-primary/10">
                   <MessageSquare  className="h-4 w-4 animate-pulse text-primary" />
@@ -492,9 +518,12 @@ export default function Chat() {
                   <div className="h-1.5 w-1.5 animate-bounce rounded-full bg-primary/50" />
                   <div className="h-1.5 w-1.5 animate-bounce rounded-full bg-primary/50 [animation-delay:-.3s]" />
                   <div className="h-1.5 w-1.5 animate-bounce rounded-full bg-primary/50 [animation-delay:-.5s]" />
+                  {live?.status && (
+                    <span className="ml-2 text-xs text-muted-foreground">{live.status}…</span>
+                  )}
                 </div>
               </div>
-            )}
+            ) : null}
 
             <div ref={messagesEndRef} />
           </div>

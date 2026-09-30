@@ -234,6 +234,49 @@ _MAX_TIMEOUT_RETRIES = 0
 _RETRY_BACKOFF_SEC = 2.0
 
 
+class _ThinkFilter:
+    """Drops <think>...</think> reasoning from a stream of text pieces,
+    even when a tag is split across two pieces."""
+
+    def __init__(self) -> None:
+        self.buffer = ""
+        self.thinking = False
+
+    def feed(self, piece: str) -> str:
+        self.buffer += piece
+        out = []
+        while self.buffer:
+            if self.thinking:
+                end = self.buffer.find("</think>")
+                if end < 0:
+                    # keep a possible partial "</think>" for the next piece
+                    self.buffer = self.buffer[-7:]
+                    return "".join(out)
+                self.buffer = self.buffer[end + len("</think>"):]
+                self.thinking = False
+                continue
+            start = self.buffer.find("<think>")
+            if start >= 0:
+                out.append(self.buffer[:start])
+                self.buffer = self.buffer[start + len("<think>"):]
+                self.thinking = True
+                continue
+            cut = self.buffer.rfind("<")
+            if cut >= 0 and "<think>".startswith(self.buffer[cut:]):
+                out.append(self.buffer[:cut])
+                self.buffer = self.buffer[cut:]
+            else:
+                out.append(self.buffer)
+                self.buffer = ""
+            break
+        return "".join(out)
+
+    def flush(self) -> str:
+        rest = "" if self.thinking else self.buffer
+        self.buffer = ""
+        return rest
+
+
 class OllamaProvider(BaseLLMProvider):
     """Ollama over its HTTP /api/chat endpoint."""
 
@@ -380,6 +423,85 @@ class OllamaProvider(BaseLLMProvider):
             raise LLMError(f"{self.model} returned an empty response")
 
         raise LLMError(f"Could not reach Ollama at {self.base_url} ({last_error})")
+
+    def stream(self, prompt: str, system: Optional[str] = None, temperature: float = 0):
+        """
+        The answer in pieces as the model writes them (chat). Same retries
+        as invoke() up to the first byte: 5xx and dropped connections are
+        retried, out-of-memory and 4xx fail at once so the next model can
+        be tried. Reasoning ("thinking") is never passed on.
+        """
+        timeout = float(_settings.get("llm_timeout_sec", 240))
+        use_think = _server_caps["think"]
+        transient_failures = 0
+        while True:
+            payload = self._payload(prompt, system, temperature, None, False, use_think)
+            payload["stream"] = True
+            try:
+                # (connect, read): the read timeout is per piece, so a
+                # long answer that keeps coming is never cut off.
+                r = requests.post(f"{self.base_url}/api/chat", json=payload, timeout=(15, timeout),
+                                  verify=self.verify, stream=True)
+            except requests.Timeout:
+                raise LLMError(f"Ollama model {self.model} did not start answering within {timeout:.0f}s; "
+                               "the server may be overloaded")
+            except requests.RequestException as e:
+                transient_failures += 1
+                if transient_failures > _MAX_TRANSIENT_RETRIES:
+                    raise LLMError(f"Could not reach Ollama at {self.base_url} ({e})")
+                time.sleep(_RETRY_BACKOFF_SEC * (2 ** (transient_failures - 1)))
+                continue
+            if r.status_code == 400 and use_think and "think" in (r.text or "").lower():
+                _server_caps["think"] = False
+                use_think = False
+                continue
+            if r.status_code >= 500 and _NOT_TRANSIENT.search(r.text or ""):
+                raise LLMError(f"Ollama returned HTTP {r.status_code} for model {self.model}: {r.text[:300]}")
+            if r.status_code >= 500:
+                transient_failures += 1
+                if transient_failures > _MAX_TRANSIENT_RETRIES:
+                    raise LLMError(f"Ollama returned HTTP {r.status_code} for model {self.model} "
+                                   f"after {transient_failures} attempts: {r.text[:300]}")
+                time.sleep(_RETRY_BACKOFF_SEC * (2 ** (transient_failures - 1)))
+                continue
+            if r.status_code >= 400:
+                raise LLMError(f"Ollama returned HTTP {r.status_code} for model {self.model}: {r.text[:300]}")
+            break
+
+        hide = _ThinkFilter()
+        wrote = False
+        num_ctx = int(_settings.get("ollama_num_ctx", 8192))
+        try:
+            for line in r.iter_lines():
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except ValueError:
+                    continue
+                if data.get("error"):
+                    raise LLMError(f"{self.model}: {data['error']}")
+                piece = hide.feed((data.get("message") or {}).get("content") or "")
+                if piece:
+                    wrote = True
+                    yield piece
+                if data.get("done"):
+                    if int(data.get("prompt_eval_count") or 0) >= num_ctx - 8:
+                        raise LLMError(
+                            f"The request to {self.model} filled the whole context window ({num_ctx} tokens), "
+                            "so part of it was cut off. Increase ollama_num_ctx in settings.json."
+                        )
+                    break
+            rest = hide.flush()
+            if rest:
+                wrote = True
+                yield rest
+        except requests.RequestException as e:
+            raise LLMError(f"The connection to {self.model} dropped while answering ({e})")
+        finally:
+            r.close()
+        if not wrote:
+            raise LLMError(f"{self.model} returned an empty response")
 
     def is_available(self) -> bool:
         """Checked before every call, so cache the result briefly

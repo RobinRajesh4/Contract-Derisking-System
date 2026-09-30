@@ -98,10 +98,23 @@ export function saveMessages(messages: ChatMessage[]): void {
   }
 }
 
-type Listener = (messages: ChatMessage[], pending: boolean) => void;
+/** The answer being written right now (not saved until it's finished). */
+export interface LiveAnswer {
+  text: string;
+  /** What the server is doing before the first words arrive. */
+  status?: string;
+  model?: string | null;
+}
+
+type Listener = (messages: ChatMessage[], pending: boolean, live: LiveAnswer | null) => void;
 let pending: Promise<void> | null = null;
 let current: ChatMessage[] | null = null;
+let live: LiveAnswer | null = null;
 const listeners = new Set<Listener>();
+
+export function getLive(): LiveAnswer | null {
+  return live;
+}
 
 /** The conversation (loaded from storage once, then kept in memory). */
 export function getMessages(): ChatMessage[] {
@@ -121,7 +134,73 @@ export function subscribe(listener: Listener): () => void {
 function publish(messages: ChatMessage[]) {
   current = messages;
   saveMessages(messages);
-  listeners.forEach((l) => l(messages, pending !== null));
+  listeners.forEach((l) => l(messages, pending !== null, live));
+}
+
+// Words can arrive dozens of times a second; redraw at most every 60 ms.
+let liveTimer: ReturnType<typeof setTimeout> | null = null;
+function publishLive() {
+  if (liveTimer) return;
+  liveTimer = setTimeout(() => {
+    liveTimer = null;
+    listeners.forEach((l) => l(getMessages(), pending !== null, live));
+  }, 60);
+}
+
+function toReply(data: any): ChatMessage {
+  return {
+    role: "assistant",
+    content: data.reply || "The AI returned an empty response.",
+    sources: data.sources || [],
+    coverage: data.coverage || undefined,
+    route: data.route,
+    model: data.model ?? null,
+    routerModel: data.router_model ?? null,
+    citations: data.citations,
+    querySpec: data.route === "structured" ? data.query_spec ?? null : null,
+  };
+}
+
+/**
+ * The answer from /chat/stream, shown word by word as it's written.
+ * Returns null if this backend has no streaming endpoint (older version),
+ * so the caller can use /chat instead.
+ */
+async function askStreaming(body: Record<string, unknown>): Promise<ChatMessage | null> {
+  const response = await fetch(`${getBaseUrl()}/chat/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (response.status === 404 || response.status === 405) return null;
+  if (!response.ok) throw new Error(await errorMessage(response));
+  if (!response.body) return null;
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  let finished: ChatMessage | null = null;
+  const handle = (line: string) => {
+    if (!line.trim()) return;
+    const event = JSON.parse(line);
+    if (event.type === "status") live = { ...(live || { text: "" }), status: event.text };
+    else if (event.type === "model") live = { ...(live || { text: "" }), model: event.model };
+    else if (event.type === "delta") live = { ...(live || { text: "" }), text: (live?.text || "") + event.text, status: undefined };
+    else if (event.type === "error") throw new Error(event.detail || "The answer failed.");
+    else if (event.type === "done") finished = toReply(event);
+    publishLive();
+  };
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffered += decoder.decode(value, { stream: true });
+    const lines = buffered.split("\n");
+    buffered = lines.pop() || "";
+    lines.forEach(handle);
+  }
+  handle(buffered);
+  if (!finished) throw new Error("The connection closed before the answer was finished.");
+  return finished;
 }
 
 /**
@@ -158,35 +237,35 @@ export function ask(question: string, analysisId: string | null): Promise<void> 
         body.previous_spec = previousSpec;
         body.previous_ids = previousIds;
       }
-      const response = await fetch(`${getBaseUrl()}/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      if (!response.ok) throw new Error(await errorMessage(response));
-      const data = await response.json();
-      reply = {
-        role: "assistant",
-        content: data.reply || "The AI returned an empty response.",
-        sources: data.sources || [],
-        coverage: data.coverage || undefined,
-        route: data.route,
-        model: data.model ?? null,
-        routerModel: data.router_model ?? null,
-        citations: data.citations,
-        querySpec: data.route === "structured" ? data.query_spec ?? null : null,
-      };
+      const streamed = await askStreaming(body);
+      if (streamed) {
+        reply = streamed;
+      } else {
+        const response = await fetch(`${getBaseUrl()}/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!response.ok) throw new Error(await errorMessage(response));
+        reply = toReply(await response.json());
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown connection error";
+      // Keep what was already written, so a half-finished answer isn't lost.
+      const partial = live?.text?.trim();
       reply = {
         role: "assistant",
-        content: `Sorry, I couldn't answer that. ${message}`,
+        content: partial
+          ? `${partial}\n\n_The answer was cut off: ${message}_`
+          : `Sorry, I couldn't answer that. ${message}`,
       };
     }
     pending = null;
+    live = null;
     publish([...getMessages(), reply]);
   })();
 
+  live = { text: "", status: "Sending the question" };
   publish(withQuestion);
   return pending;
 }
