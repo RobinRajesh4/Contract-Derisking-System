@@ -36,6 +36,9 @@ export interface ChatMessage {
   /** "inferred": the answer cited nothing inline; the references are the
    *  passages it most likely drew on. */
   citations?: "cited" | "inferred" | "none";
+  /** The exact query behind a computed answer; sent back with the next
+   *  question so "list the other ones too" can widen it. */
+  querySpec?: Record<string, unknown> | null;
 }
 
 const MESSAGES_KEY = "contract-chat-messages";
@@ -139,6 +142,11 @@ export function ask(question: string, analysisId: string | null): Promise<void> 
     )
     .slice(-8)
     .map((m) => ({ role: m.role, content: m.content.slice(0, 2000) }));
+  const lastAnswer = [...before].reverse().find((m) => m.role === "assistant" && m.content !== WELCOME.content);
+  const previousSpec = lastAnswer?.route === "structured" ? lastAnswer.querySpec : null;
+  const previousIds = previousSpec
+    ? Array.from(new Set((lastAnswer?.sources || []).map((s) => s.analysis_id).filter(Boolean)))
+    : [];
   const withQuestion: ChatMessage[] = [...before, { role: "user", content: question }];
 
   pending = (async () => {
@@ -146,6 +154,10 @@ export function ask(question: string, analysisId: string | null): Promise<void> 
     try {
       const body: Record<string, unknown> = { message: question, top_k: 5, history };
       if (analysisId) body.analysis_id = analysisId;
+      if (previousSpec) {
+        body.previous_spec = previousSpec;
+        body.previous_ids = previousIds;
+      }
       const response = await fetch(`${getBaseUrl()}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -162,6 +174,7 @@ export function ask(question: string, analysisId: string | null): Promise<void> 
         model: data.model ?? null,
         routerModel: data.router_model ?? null,
         citations: data.citations,
+        querySpec: data.route === "structured" ? data.query_spec ?? null : null,
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown connection error";

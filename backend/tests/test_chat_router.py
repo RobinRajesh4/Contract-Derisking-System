@@ -175,3 +175,17 @@ def test_ordinal_beyond_the_number_of_contracts():
     r = execute_spec(ChatQuerySpec(kind="structured", sort_by="contract_value", order="desc", limit=1, offset=4),
                      MIXED[:3])
     assert r["answer"] == "There are only 3 contracts with this information, so there is no fifth one."
+
+
+def test_the_rest_after_the_highest_in_each_currency():
+    data = MIXED + [record(11, "11_Car_Loan_INR.pdf", 950000, currency="INR")]
+    r = execute_spec(ChatQuerySpec(kind="structured", sort_by="contract_value", order="desc", offset=1), data)
+    assert r["answer"].startswith("The other contracts in each currency, after the first 1")
+    assert [a["filename"] for a in r["rows"]] == ["11_Car_Loan_INR.pdf", "02_Home_Mortgage_Rahman.pdf",
+                                                   "01_Auto_Loan_Okafor.pdf"]
+
+
+def test_the_rest_when_a_currency_has_no_more():
+    r = execute_spec(ChatQuerySpec(kind="structured", sort_by="contract_value", order="desc", offset=1), MIXED)
+    assert "No other INR contracts." in r["answer"]
+    assert "so no second one" not in r["answer"]

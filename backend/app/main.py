@@ -1014,6 +1014,11 @@ class ChatRequest(BaseModel):
     # Recent turns of this conversation, oldest first, so follow-ups
     # ("and the lowest?", "that's wrong, check again") make sense.
     history: List[ChatTurn] = []
+    # The query behind the previous answer when it was computed exactly,
+    # so "list the other ones too" can widen it.
+    previous_spec: Optional[Dict[str, Any]] = None
+    # The contracts that answer showed, so "the other ones" leaves them out.
+    previous_ids: List[str] = []
 
 
 def _directory_line(a: Dict[str, Any]) -> str:
@@ -1081,7 +1086,8 @@ Rules:
 4. For yes/no questions, start with Yes / No / Partially / It depends, then one
    or two sentences of reasoning.
 5. When listing contracts, use a Markdown table and a link column with
-   [View](#contract-<ID>) using the directory ID.
+   [View](#contract-<ID>) using the directory ID. Never show the ID itself
+   as text or as its own column; it is only for that link.
 6. When drafting clause wording, put the draft in a blockquote, separate from
    your explanation.
 7. Be concise. Don't repeat caveats.
@@ -1461,7 +1467,7 @@ def chat_endpoint(request: ChatRequest):
        model told how much of the portfolio they cover.
     """
     from .chat_router import (
-        check_spec, execute_spec, heuristic_spec, is_aggregate, looks_across_contracts, resolve_named_contracts,
+        check_spec, execute_spec, follow_up_spec, heuristic_spec, is_aggregate, looks_across_contracts, resolve_named_contracts,
         route_question, sources_for_rows, structured_scope,
     )
     from .mcp.llm_agent import remove_reasoning_traces
@@ -1493,6 +1499,9 @@ def chat_endpoint(request: ChatRequest):
     if spec is None:
         spec = heuristic_spec(query)
         routed_by = "heuristic" if spec is not None else "none"
+    widened, already_shown = follow_up_spec(query, spec, request.previous_spec, request.previous_ids)
+    if widened is not spec:
+        spec, routed_by = widened, "follow-up"
     checked = check_spec(spec, query)
     if checked is not spec:
         print(f"[chat] structured spec can't answer this question; using clause text instead")
@@ -1516,6 +1525,18 @@ def chat_endpoint(request: ChatRequest):
     # 1) Structured questions: exact answer from the directory.
     if spec is not None and spec.kind == "structured":
         scope, note = structured_scope(spec, all_analyses, named, selected)
+        stored = len(scope)
+        if already_shown:
+            scope = [a for a in scope if a.get("analysis_id") not in already_shown]
+            note = ((note + " ") if note else "") + (
+                f"The other contracts: the {stored - len(scope)} already shown are left out."
+            )
+            if not scope:
+                return {
+                    "reply": f"There are no other contracts: all {stored} were in the previous answer.",
+                    "sources": [], "route": "structured", "routed_by": routed_by,
+                    "query_spec": spec.model_dump(), "model": None, "router_model": router_model,
+                }
         run_spec = spec
         if named:
             # The named contracts are already the scope; a filename filter
@@ -1525,10 +1546,10 @@ def chat_endpoint(request: ChatRequest):
         answer = result["answer"]
         if note:
             answer = f"_{note}_\n\n{answer}"
-        if len(scope) > 1:
+        if stored > 1:
             # So a user checking the answer knows what it covered (e.g. a
             # folder upload still in progress).
-            answer += f"\n\n_Based on the {len(scope)} contracts currently stored._"
+            answer += f"\n\n_Based on the {stored} contracts currently stored._"
         return {
             "reply": answer,
             "sources": sources_for_rows(result["rows"]),
@@ -1665,11 +1686,16 @@ def chat_endpoint(request: ChatRequest):
     }
     discussed = [a for a in all_analyses if a.get("analysis_id") in in_sources or a is selected]
     if len(discussed) > 12:
-        directory = "\n".join(
-            f"- ID: {a.get('analysis_id')} | File: {a.get('filename')} | Borrower: "
-            f"{(a.get('contract_metadata') or {}).get('customer_name') or 'not found'}"
-            for a in discussed
-        )
+        from .chat_router import format_money
+
+        def short(a):
+            cm = a.get("contract_metadata") or {}
+            value = cm.get("contract_value")
+            amount = format_money(float(value), cm.get("currency")) if isinstance(value, (int, float)) else "not found"
+            return (f"- ID: {a.get('analysis_id')} | File: {a.get('filename')} | Borrower: "
+                    f"{cm.get('customer_name') or 'not found'} | Lender: {cm.get('lender_name') or 'not found'} "
+                    f"| Amount: {amount}")
+        directory = "\n".join(short(a) for a in discussed)
     else:
         directory = "\n".join(_directory_line(a) for a in discussed)
 

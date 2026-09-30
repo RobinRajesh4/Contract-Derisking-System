@@ -163,6 +163,9 @@ Q: What is the interest rate in Contract_5?
 A: {{"kind":"semantic","operation":"list","sort_by":null,"order":"desc","limit":null,"filters":[],"fields":[],"contracts":["Contract_5"],"across_contracts":false,"standalone_question":"What is the interest rate in Contract_5?"}}
 Q: Which contracts charge more than 1.4% monthly interest?
 A: {{"kind":"semantic","operation":"list","sort_by":null,"order":"desc","limit":null,"filters":[],"fields":[],"contracts":[],"across_contracts":true,"standalone_question":"Which contracts charge more than 1.4% monthly interest?"}}
+Conversation: user asked "Which contract has the highest amount?"
+Q: list the other ones too
+A: {{"kind":"structured","operation":"list","sort_by":"contract_value","order":"desc","limit":null,"offset":1,"filters":[],"fields":[],"contracts":[],"across_contracts":false,"standalone_question":"List the other contracts by financed amount, highest first."}}
 Conversation: user asked "What is the interest rate in Julia Miller's contract?"
 Q: and for Peter Chen?
 A: {{"kind":"semantic","operation":"list","sort_by":null,"order":"desc","limit":null,"filters":[],"fields":[],"contracts":["Peter Chen"],"across_contracts":false,"standalone_question":"What is the interest rate in Peter Chen's contract?"}}
@@ -187,6 +190,65 @@ _LIST_ALL = re.compile(
 )
 
 
+_FOLLOW_UP = re.compile(
+    r"\b(others?|other ones|the rest|rest of them|remaining|all of them|all the others|full list|whole list|"
+    r"everything|every one|the whole|more|too|also|as well)\b",
+    re.I,
+)
+_REST = re.compile(r"\b(others?|other ones|the rest|rest of them|remaining|all the others)\b", re.I)
+
+
+def _selects_nothing(spec: ChatQuerySpec) -> bool:
+    return (
+        spec.operation == "list" and not spec.sort_by and not spec.group_by
+        and not spec.filters and not spec.fields and not spec.contracts
+    )
+
+
+def follow_up_spec(
+    question: str,
+    spec: Optional[ChatQuerySpec],
+    previous: Optional[Dict[str, Any]],
+    previous_ids: Optional[List[str]] = None,
+) -> Tuple[Optional[ChatQuerySpec], set]:
+    """
+    "list the other ones too" right after an exact answer: the previous
+    answer's own query, widened to the whole list, and - for "other",
+    "rest", "remaining" - without the contracts that answer already showed
+    (ties included, so none is shown twice). Returns (spec, ids to leave
+    out). Done in code because the router, which only sees the
+    conversation as text, turned it into a query that selected nothing.
+    """
+    unchanged = (spec, set())
+    if not previous or not _FOLLOW_UP.search(question or "") or len((question or "").split()) > 14:
+        return unchanged
+    if _CLAUSE_TOPIC.search(question or ""):
+        return unchanged
+    if spec is not None and (
+        (spec.kind == "structured" and not _selects_nothing(spec))
+        or (spec.kind == "semantic" and spec.contracts)
+    ):
+        return unchanged  # the router understood it, or it's about a named contract
+    try:
+        prev = ChatQuerySpec.model_validate(previous)
+    except Exception:
+        return unchanged
+    if prev.kind != "structured":
+        return unchanged
+    rest = bool(_REST.search(question))
+    exclude = {str(i) for i in (previous_ids or []) if i} if rest else set()
+    offset = 0
+    if rest and not exclude and prev.limit:
+        offset = (prev.offset or 0) + prev.limit  # ids unknown: skip what was shown
+    widened = prev.model_copy(update={
+        "operation": prev.operation if prev.operation == "group" else "list",
+        "limit": None,
+        "offset": offset,
+        "standalone_question": (prev.standalone_question or "") + (" (the rest)" if rest else " (all of them)"),
+    })
+    return widened, exclude
+
+
 def check_spec(spec: Optional[ChatQuerySpec], question: str) -> Optional[ChatQuerySpec]:
     """
     Catch structured specs that can't answer the question. The router
@@ -198,10 +260,7 @@ def check_spec(spec: Optional[ChatQuerySpec], question: str) -> Optional[ChatQue
     """
     if spec is None or spec.kind != "structured":
         return spec
-    selects_nothing = (
-        spec.operation == "list" and not spec.sort_by and not spec.group_by
-        and not spec.filters and not spec.fields and not spec.contracts
-    )
+    selects_nothing = _selects_nothing(spec)
     topic = _CLAUSE_TOPIC.search(question or "")
     about_clauses = bool(topic) and not spec.sort_by and not spec.group_by and spec.operation in ("list", "count")
     if (selects_nothing and not (_LIST_ALL.search(question or "") and not topic)) or about_clauses:
@@ -681,14 +740,18 @@ def execute_spec(spec: ChatQuerySpec, analyses: List[Dict[str, Any]]) -> Dict[st
         groups = [(code, items) for code, items in groups if items]
         if not groups:
             total = sum(n for _, n in too_few)
+            if not spec.limit:
+                return {"answer": "There are no other contracts with this information.", "rows": [], "notes": notes}
             return {
                 "answer": f"There {'is' if total == 1 else 'are'} only {total} contract{'s' if total != 1 else ''} "
                           f"with this information, so there is no {place} one.",
                 "rows": [], "notes": notes,
             }
         for code, n in too_few:
-            if code:
+            if code and spec.limit:
                 notes.append(f"Only {n} {code} contract{'s' if n != 1 else ''}, so no {place} one in {code}.")
+            elif code:
+                notes.append(f"No other {code} contracts.")
 
     # Limit, keeping ties at the cut-off ------------------------------------
     if spec.limit:
@@ -766,7 +829,12 @@ def execute_spec(spec: ChatQuerySpec, analyses: List[Dict[str, Any]]) -> Dict[st
         direction = "highest first" if spec.order == "desc" else "lowest first"
         if spec.sort_by in ("start_date", "end_date"):
             direction = "latest first" if spec.order == "desc" else "earliest first"
-        lead = f"Sorted by {FIELD_LABELS[spec.sort_by].lower()}, {direction}:"
+        if spec.offset and not spec.limit:
+            per = " in each currency" if spec.sort_by == "contract_value" and len(groups) > 1 else ""
+            lead = (f"The other contracts{per}, after the first {spec.offset}, by "
+                    f"{FIELD_LABELS[spec.sort_by].lower()}, {direction}:")
+        else:
+            lead = f"Sorted by {FIELD_LABELS[spec.sort_by].lower()}, {direction}:"
     else:
         lead = f"{len(rows)} matching contract{'s' if len(rows) != 1 else ''}:"
 

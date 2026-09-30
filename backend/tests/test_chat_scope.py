@@ -518,3 +518,59 @@ def test_real_listing_request_still_lists_contracts(client, fake_llm):
     fake_llm.handlers["ChatQuerySpec"] = lambda p: spec()
     r = chat(client, "list all contracts")
     assert r["route"] == "structured" and "6 matching contracts" in r["reply"]
+
+
+# ------------------------------------------ follow-ups to an exact answer
+
+def _highest_then(client, fake_llm, follow_up, router_reply):
+    load_portfolio(client)
+    fake_llm.handlers["ChatQuerySpec"] = lambda p: spec(sort_by="contract_value", order="desc", limit=1)
+    first = chat(client, "which contract has the highest number of financial amounts")
+    assert first["route"] == "structured"
+    fake_llm.handlers["ChatQuerySpec"] = lambda p: router_reply
+    return chat(client, follow_up, previous_spec=first["query_spec"],
+                previous_ids=[src["analysis_id"] for src in first["sources"]],
+                history=[{"role": "user", "content": "which contract has the highest amount"},
+                         {"role": "assistant", "content": first["reply"]}])
+
+
+def test_list_the_other_ones_after_the_highest(client, fake_llm):
+    # The router made this a query that selected nothing; it used to go to
+    # the language model, which printed internal IDs and no amounts.
+    r = _highest_then(client, fake_llm, "list the other ones too", spec())
+    assert r["route"] == "structured" and r["routed_by"] == "follow-up"
+    amounts = [parse_money(line.split("|")[3]) for line in r["reply"].splitlines() if line.startswith("| ") and "$" in line]
+    assert amounts == sorted(amounts, reverse=True) and len(amounts) == 5
+    assert 1203432 not in amounts  # the highest one was already shown
+    assert "the 1 already shown are left out" in r["reply"]
+    assert "Based on the 6 contracts currently stored" in r["reply"]
+
+
+def test_all_of_them_lists_every_contract(client, fake_llm):
+    r = _highest_then(client, fake_llm, "show all of them", json.dumps({"kind": "semantic"}))
+    assert r["route"] == "structured" and len(r["sources"]) == 6
+
+
+def test_follow_up_the_router_understood_is_left_alone(client, fake_llm):
+    r = _highest_then(client, fake_llm, "and the lowest one too", spec(sort_by="contract_value", order="asc", limit=1))
+    assert "$9,999.00" in r["reply"] and r["routed_by"] == "llm"
+
+
+def test_clause_follow_up_is_not_widened(client, fake_llm):
+    r = _highest_then(client, fake_llm, "what about its default terms too", json.dumps({"kind": "semantic"}))
+    assert r["route"] == "semantic"
+
+
+def test_the_other_ones_after_a_tie_shows_no_contract_twice(client, fake_llm):
+    # "Highest" showed every tied contract; "the other ones" must not
+    # repeat any of them.
+    for i in range(3):
+        upload(client, f"Tie_{i}.txt", contract(f"Tie Person{i}", 50000, "1.0"))
+    upload(client, "Small.txt", contract("Small Person", 1000, "1.0"))
+    fake_llm.handlers["ChatQuerySpec"] = lambda p: spec(sort_by="contract_value", order="desc", limit=1)
+    first = chat(client, "which contract has the highest amount")
+    assert len(first["sources"]) == 3
+    fake_llm.handlers["ChatQuerySpec"] = lambda p: spec()
+    r = chat(client, "list the other ones", previous_spec=first["query_spec"],
+             previous_ids=[src["analysis_id"] for src in first["sources"]])
+    assert [src["filename"] for src in r["sources"]] == ["Small.txt"]

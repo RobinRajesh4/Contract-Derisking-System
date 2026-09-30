@@ -25,8 +25,8 @@ _settings: Dict[str, Any] = {
     "ollama_url": "http://localhost:11434",
     # Model for the many small per-clause calls.
     "ollama_model": "qwen3:8b",
-    # Model for per-contract extraction, summaries and chat.
-    "ollama_quality_model": "qwen3:32b",
+    # Model for per-contract extraction, summaries and question routing.
+    "ollama_quality_model": "qwen3:8b",
     "groq_model": "llama-3.1-70b-versatile",
     # Set to false only for a trusted internal server whose certificate
     # your OS/Python doesn't trust (e.g. a corporate self-signed CA).

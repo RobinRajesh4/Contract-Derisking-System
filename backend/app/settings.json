@@ -9,6 +9,6 @@
   "llm_timeout_sec": 240,
   "embedding_url": "",
   "embedding_model": "qwen3-embedding:8b",
-  "ollama_chat_model": "qwen3:32b",
-  "ollama_chat_fallback_models": ["gpt-oss:20b", "qwen3:8b"]
+  "ollama_chat_model": "gpt-oss:20b",
+  "ollama_chat_fallback_models": ["qwen3:8b"]
 }
