@@ -4,7 +4,7 @@
   "ollama_model": "qwen3:8b",
   "ollama_quality_model": "qwen3:8b",
   "ollama_verify_ssl": false,
-  "llm_concurrency": 4,
+  "llm_concurrency": 3,
   "ollama_num_ctx": 16384,
   "llm_timeout_sec": 240,
   "embedding_url": "",

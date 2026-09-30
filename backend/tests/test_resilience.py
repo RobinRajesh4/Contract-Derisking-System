@@ -206,3 +206,48 @@ def test_out_of_memory_is_not_retried(monkeypatch, no_sleep):
     with pytest.raises(LLMError, match="memory"):
         OllamaProvider(model="qwen3:32b").invoke("hi")
     assert len(calls) == 1
+
+
+# ------------------------------------------ search that failed to start
+
+def test_search_starts_later_if_the_embedding_server_was_down_at_start(client, fake_llm, monkeypatch):
+    # A dropped connection at start-up used to leave chat search off until
+    # a restart, and contracts uploaded meanwhile were never indexed.
+    working = main.rag
+    working.client.close()          # free the local search folder
+    main.rag = None
+    real_embed = rag_module.RAGStore.embed
+
+    def down(self, texts, kind="document"):
+        raise RuntimeError("Could not get embeddings: SSLEOFError")
+    monkeypatch.setattr(rag_module.RAGStore, "embed", down)
+    main._rag_init["last_attempt"] = 0.0
+    assert main.ensure_rag() is None and "SSLEOFError" in main._rag_init["error"]
+
+    r = client.post("/chat", json={"message": "what does the default clause say?"})
+    assert r.status_code in (200, 503)
+    if r.status_code == 503:
+        assert "retried automatically" in r.json()["detail"]
+
+    # The server is back; the next attempt (after the wait) succeeds and
+    # the next upload is indexed.
+    monkeypatch.setattr(rag_module.RAGStore, "embed", real_embed)
+    main._rag_init["last_attempt"] = time.time() - main._RAG_RETRY_SEC - 1
+    info = upload(client, "julia_miller.txt", fixture_text("julia_miller.txt"))
+    assert main.rag is not None and info["search_index"]["ok"] is True
+
+
+def test_failed_start_does_not_retry_on_every_request(monkeypatch):
+    calls = {"n": 0}
+    saved = main.rag
+    main.rag = None
+    try:
+        def failing():
+            calls["n"] += 1
+            raise RuntimeError("down")
+        monkeypatch.setattr(main, "RAGStore", failing)
+        main._rag_init["last_attempt"] = 0.0
+        main.ensure_rag(); main.ensure_rag(); main.ensure_rag()
+        assert calls["n"] == 1
+    finally:
+        main.rag = saved

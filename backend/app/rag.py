@@ -123,14 +123,17 @@ class RAGStore:
         slug = re.sub(r"[^a-z0-9]+", "_", self.embedding_model.lower()).strip("_")
         self.collection = f"contracts__{slug}"
 
-        os.makedirs(QDRANT_DATA_PATH, exist_ok=True)
-        with _QDRANT_LOCK:
-            self.client = QdrantClient(path=QDRANT_DATA_PATH)
-
+        # Ask the embedding server first: if it can't be reached, no local
+        # search database is opened, so a later retry in this process
+        # doesn't find the database folder still locked by this attempt.
         test_vectors = self.embed(["dimension test"], kind="document")
         if not test_vectors or not test_vectors[0]:
             raise RuntimeError("Ollama returned no embedding vector")
         self.dim = len(test_vectors[0])
+
+        os.makedirs(QDRANT_DATA_PATH, exist_ok=True)
+        with _QDRANT_LOCK:
+            self.client = QdrantClient(path=QDRANT_DATA_PATH)
         self._ensure_collection()
 
     # ------------------------------------------------------------ setup

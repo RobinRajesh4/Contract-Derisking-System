@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 import re
 import hashlib
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 # Load env from .env (GROQ_API_KEY, QDRANT_URL, etc.)
@@ -120,18 +121,39 @@ UPLOADS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploaded
 llm = LLMClient()
 rag = None
 
+# Chat search needs the embedding server at start-up. If it can't be
+# reached then (a dropped connection, the shared server busy), search is
+# tried again on the next upload, question or status check - at most
+# every _RAG_RETRY_SEC - instead of staying off until the backend is
+# restarted, with every contract uploaded meanwhile left unsearchable.
+_RAG_RETRY_SEC = 30
+_rag_init = {"last_attempt": 0.0, "error": None}
+_rag_init_lock = threading.Lock()
+
+
+def ensure_rag():
+    """The search store, starting it if an earlier attempt failed."""
+    global rag
+    if rag is not None or RAGStore is None:
+        return rag
+    with _rag_init_lock:
+        if rag is not None:
+            return rag
+        if time.time() - _rag_init["last_attempt"] < _RAG_RETRY_SEC:
+            return None
+        _rag_init["last_attempt"] = time.time()
+        try:
+            rag = RAGStore()
+            _rag_init["error"] = None
+            print("RAG system enabled")
+        except Exception as error:
+            _rag_init["error"] = str(error)
+            print(f"RAG system failed to initialize (retrying in {_RAG_RETRY_SEC}s when needed): {error}")
+    return rag
+
+
 if RAGStore is not None:
-    try:
-        rag = RAGStore()
-        print("RAG system enabled")
-
-    except Exception as error:
-        print(
-            "RAG system failed to initialize: "
-            f"{error}"
-        )
-        rag = None
-
+    ensure_rag()
 else:
     print(
         "RAGStore could not be imported. "
@@ -274,6 +296,11 @@ def ingest_document(
     # contract, so it's recorded on the contract and reported, not just
     # printed to the server log.
     search_index: Dict[str, Any] = {"ok": False, "passages": 0, "error": "Search is not available on this server."}
+    if ensure_rag() is None and _rag_init["error"]:
+        search_index["error"] = (
+            "Could not add this contract to chat search: the embedding server couldn't be reached. "
+            "Run a re-index once it's back."
+        )
     if rag is not None:
         try:
             indexed = rag.index_analysis(analysis_id, doc["clauses"], doc["header"])
@@ -582,8 +609,8 @@ def _analysis_quality(results: List[Dict[str, Any]], policy_summary: Optional[Di
 
 @app.get("/rag/status")
 def rag_status():
-    if rag is None:
-        return {"enabled": False}
+    if ensure_rag() is None:
+        return {"enabled": False, "error": _rag_init["error"]}
     try:
         info = rag.client.get_collection(rag.collection)
         return {
@@ -877,6 +904,11 @@ def _run_reindex(reanalyze: str, remove_duplicates: bool, reset_index: bool) -> 
         analyses = [a for a in analyses if a["analysis_id"] not in set(removed)]
         state["total"] = len(analyses)
 
+        if ensure_rag() is None:
+            state["search_warning"] = (
+                "Chat search is not available (" + str(_rag_init["error"] or "embedding server unreachable")[:200]
+                + "); contracts are re-parsed but not added to search."
+            )
         if reset_index and rag is not None:
             state["phase"] = "resetting search index"
             rag.reset()
@@ -1563,8 +1595,13 @@ def chat_endpoint(request: ChatRequest):
 
     # 2) Semantic questions: clause text + LLM.
     def need_rag():
-        if rag is None:
-            raise HTTPException(status_code=503, detail="Contract search is not available (RAG failed to start; see the server log).")
+        if ensure_rag() is None:
+            reason = _rag_init["error"] or "see the server log"
+            raise HTTPException(
+                status_code=503,
+                detail=f"Contract search is not available right now ({reason[:200]}). "
+                       f"It is retried automatically; try again in {_RAG_RETRY_SEC} seconds.",
+            )
         return rag
 
     top_k = max(1, min(request.top_k, 10))
