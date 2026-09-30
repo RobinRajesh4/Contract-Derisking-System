@@ -353,3 +353,60 @@ def test_sentence_starting_with_signed_is_not_a_signature_block():
     _, clauses = split_document(text)
     assert "Signed copies of every notice must be kept" in clauses[-1]
     assert "Signed in two counterparts" not in clauses[-1]
+
+
+def test_heading_split_by_the_pdf_text_layer_is_still_a_heading():
+    # pypdf gave "5. L IABILITY": the clause was merged into clause 4.
+    text = ("SERVICE AGREEMENT between AlphaTech Solutions and Beta Retail, dated 1 November 2025.\n"
+            "4. CONFIDENTIALITY Both parties agree to keep shared information confidential. "
+            "5. L IABILITY The Service Provider's liability shall not exceed the fees paid in 6 months. "
+            "6. GOVERNING LAW This Agreement is governed by the laws of India.")
+    _, clauses = split_document(text)
+    assert [c.split(" ")[0] for c in clauses] == ["4.", "5.", "6."]
+    assert clauses[1].startswith("5. L IABILITY")
+
+
+def test_in_witness_whereof_mid_line_ends_the_last_clause():
+    text = ("SERVICE AGREEMENT between AlphaTech Solutions and Beta Retail, dated 1 November 2025.\n"
+            "1. SERVICES The provider maintains the website for the client as agreed. "
+            "2. GOVERNING LAW This Agreement is governed by the laws of India, courts in Bengaluru. "
+            "IN WITNESS WHEREOF, the parties have executed this Agreement.\n_________ ______ Authorized Signatory")
+    _, clauses = split_document(text)
+    assert len(clauses) == 2
+    assert clauses[-1].endswith("courts in Bengaluru.")
+
+
+def test_numbered_list_word_starting_with_a_single_capital_is_not_a_heading():
+    _, clauses = split_document(
+        "LOAN AGREEMENT between the parties below, for a car purchase.\n"
+        "CLAUSE ONE – PAYMENT: The borrower pays in 12 installments. A Borrower who pays late owes a fee of 2%."
+    )
+    assert len(clauses) == 1
+
+
+FLAWED = (
+    "SERVICE AGREEMENT (FLAWED VERSION)\n"
+    'This Agreement is made between XYZ Corp ("Provider") and ABC Ltd ("Client").\n'
+    "1. Services: Provider agrees to offer consulting services but the exact scope will be determined later.\n"
+    "2. Payment: Client shall pay Provider $10,000. Payment schedule will be discussed after completion of\nservices.\n"
+    "6. Governing Law: This agreement shall be governed by whichever jurisdiction the Provider deems fit.\n"
+    "7. Signatures: Digital or verbal consent is acceptable; signatures are optional.\n"
+    "Signed by:\nXYZ Corp Representative: ____________________\n"
+)
+
+
+def test_numbered_headings_in_ordinary_capitals_with_a_colon():
+    # "1. Services: ..." used to give no clauses at all.
+    header, clauses = split_document(FLAWED)
+    assert [c.split(":")[0] for c in clauses] == ["1. Services", "2. Payment", "6. Governing Law", "7. Signatures"]
+    assert "made between XYZ Corp" in header
+    assert clauses[-1].endswith("signatures are optional.")
+
+
+def test_numbered_sentences_and_cross_references_are_not_headings():
+    _, clauses = split_document(
+        "LOAN AGREEMENT between the parties below, for the purchase of a vehicle.\n"
+        "CLAUSE ONE – PAYMENT: The borrower pays monthly as per clause 2. Payment: see the schedule. "
+        "The steps are:\n2. The borrower shall notify the bank of any change of address within 10 days."
+    )
+    assert len(clauses) == 1

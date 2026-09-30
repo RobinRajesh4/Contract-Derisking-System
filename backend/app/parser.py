@@ -411,15 +411,33 @@ _SIGNATURE_START = re.compile(
 )
 
 
+# An ALL-CAPS heading word. PDF text layers sometimes split one ("5. L
+# IABILITY"), which used to stop the heading being seen, so the clause
+# was merged into the one before it.
+_CAPS_WORD = r"[A-Z](?: ?[A-Z])+"
+
+# "1. Services: Provider agrees ..." - a numbered heading in ordinary
+# capitals, ending in a colon, at the start of a line or sentence. The
+# colon is what tells it from a numbered sentence ("2. The borrower
+# shall ..."). Without this, such contracts came out with no clauses.
+_TITLE_HEADING = r"\d{1,2}[.)][ \t]+[A-Z][a-z]+(?:[ \t]+[A-Za-z&/\-]+){0,4}[ \t]*:(?!//)"
+_TITLE_HEADING_START = r"(?:^|(?<=\n)|(?<=[.;!?] ))"
+
+# "IN WITNESS WHEREOF" starts the signature block even in the middle of
+# a line, as some PDFs extract it.
+_WITNESS_INLINE = re.compile(r"\bIN WITNESS WHEREOF\b|(?<=[.!?] )In witness whereof\b")
+
+
 def _cut_signature_block(clause: str) -> str:
     """The clause without a signature block that follows it. Only a line
     that starts like a signature block ("Signed at ...", "IN WITNESS
     WHEREOF", a line of underscores) ends the clause - not underscores
     inside a sentence, which are fill-in blanks."""
-    m = _SIGNATURE_START.search(clause, 1)
-    if not m or m.start() < 40:
+    starts = [m.start() for m in (_SIGNATURE_START.search(clause, 1), _WITNESS_INLINE.search(clause, 1)) if m]
+    starts = [i for i in starts if i >= 40]
+    if not starts:
         return clause
-    return clause[: m.start()].rstrip()
+    return clause[: min(starts)].rstrip()
 
 
 def split_document(text: str) -> Tuple[Optional[str], List[str]]:
@@ -457,8 +475,9 @@ def split_document(text: str) -> Tuple[Optional[str], List[str]]:
     HEADER_RE = re.compile(
         # (?<![\d.,]) stops "$45,892.00. CLAUSE ONE" being read as a
         # numbered heading "00. CLAUSE", which cut the cents off amounts.
-        r"(?<![\d.,])(?=\b\d{1,2}[\.\)]\s+[A-Z]{2,}(?:[\s&/\-]+[A-Z]{2,}){0,6}\b)"
+        r"(?<![\d.,])(?=\b\d{1,2}[\.\)]\s+" + _CAPS_WORD + r"(?:[\s&/\-]+[A-Z]{2,}){0,6}\b)"
         r"|(?=" + _KEYWORD_HEADING + r")"
+        r"|" + _TITLE_HEADING_START + r"(?=" + _TITLE_HEADING + r")"
     )
     parts = HEADER_RE.split(t)
     parts = [p.strip() for p in parts if p and p.strip()]
@@ -468,8 +487,8 @@ def split_document(text: str) -> Tuple[Optional[str], List[str]]:
     # - unless the document has no preamble and a heading is the first
     # thing in the text. Drop it in the former case; it isn't a clause.
     FIRST_HEADING_RE = re.compile(
-        r"^\d{1,2}[\.\)]\s+[A-Z]{2,}"
-        r"|^" + _KEYWORD_HEADING
+        r"^\d{1,2}[\.\)]\s+" + _CAPS_WORD + r"\b"
+        r"|^" + _KEYWORD_HEADING + r"|^" + _TITLE_HEADING
     )
     header: Optional[str] = None
     if len(parts) > 1 and not FIRST_HEADING_RE.match(parts[0]):
@@ -491,7 +510,7 @@ def split_document(text: str) -> Tuple[Optional[str], List[str]]:
     # It used to stay attached, and the "_____" noise rule below then
     # threw the whole clause away - so every signed contract lost its
     # last clause (usually jurisdiction).
-    heading_start = re.compile(r"^\d{1,2}[\.\)]\s+[A-Z]{2,}|^" + _KEYWORD_HEADING)
+    heading_start = re.compile(r"^\d{1,2}[\.\)]\s+" + _CAPS_WORD + r"\b|^" + _KEYWORD_HEADING + r"|^" + _TITLE_HEADING)
     is_clause = [bool(heading_start.match(p)) for p in parts]
     parts = [_cut_signature_block(p) if clause else p for p, clause in zip(parts, is_clause)]
 
