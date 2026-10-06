@@ -4,7 +4,7 @@ from fastapi.concurrency import run_in_threadpool
 from typing import List as TypingList
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 import orjson
 import os
@@ -1142,6 +1142,9 @@ Rules:
    them against. Do not approve or reject them on your own.
 13. If the user says an earlier answer was wrong, re-check against the
    sources only; don't defend or repeat the earlier answer.
+14. Use only the sources that bear on the question. Don't list a clause
+   just to say it isn't about the topic. For contracts with nothing on
+   the topic, say so in one line that names them.
 """.strip()
 
 
@@ -1439,6 +1442,135 @@ def link_citations(reply: str, source_count: int) -> str:
         piece = "".join(p if p.startswith("[Source ") else _CITE_BARE.sub(fix_bare, p) for p in parts)
         pieces[i] = piece
     return "".join(pieces)
+
+
+def _file_pattern(filename: str) -> Optional["re.Pattern"]:
+    """Matches a contract's file name in an answer, with or without its
+    extension ("Contract_1" must not match inside "Contract_10")."""
+    stem = os.path.splitext(str(filename or ""))[0].strip()
+    if len(stem) < 3:
+        return None
+    return re.compile(r"(?<![A-Za-z0-9_])" + re.escape(stem) + r"(?:\.[A-Za-z0-9]{2,5})?(?![A-Za-z0-9_])", re.I)
+
+
+def attach_citations(reply: str, sources: List[Dict[str, Any]]) -> str:
+    """
+    Link the contracts and clauses an answer names to their sources, in
+    code. Models often write "05_Loan.pdf - Clause 7" in a table instead
+    of a [Source N] marker; such an answer had no links at all, and its
+    references were a guess. Here every line that names a contract (and a
+    clause) gets the link to exactly that source, so the references are
+    the passages the answer points at - all of them.
+
+    A line that already cites a source is left as the model wrote it.
+    """
+    if not reply or not sources:
+        return reply
+
+    # (file, clause) -> source number; a merged source ("identical wording
+    # also in ...") stands for every contract it lists.
+    patterns: List[Tuple["re.Pattern", str]] = []
+    by_file_clause: Dict[Tuple[str, str], int] = {}
+    by_file: Dict[str, List[int]] = {}
+    for src in sources:
+        names = [src.get("filename")] + [o.get("filename") for o in (src.get("also_in") or [])]
+        for name in names:
+            if not name:
+                continue
+            key = str(name).lower()
+            if key not in by_file:
+                pattern = _file_pattern(name)
+                if pattern is None:
+                    continue
+                patterns.append((pattern, key))
+                by_file[key] = []
+            by_file[key].append(src["source_number"])
+            by_file_clause.setdefault((key, str(src.get("clause_id")).lower()), src["source_number"])
+    if not patterns:
+        return reply
+    # Longest names first, so "Contract_12" is tried before "Contract_1".
+    patterns.sort(key=lambda item: -len(item[1]))
+
+    def files_in(line: str) -> List[Tuple[str, int]]:
+        found, taken = [], []
+        for pattern, key in patterns:
+            for m in pattern.finditer(line):
+                if any(a < m.end() and m.start() < b for a, b in taken):
+                    continue
+                taken.append((m.start(), m.end()))
+                found.append((key, m.end()))
+        return sorted(found, key=lambda item: item[1])
+
+    def link(numbers: List[int]) -> str:
+        return " " + " ".join(f"[Source {n}](#source-{n})" for n in dict.fromkeys(numbers))
+
+    lines = reply.split("\n")
+    by_number = {src["source_number"]: src for src in sources}
+
+    def closest(line: str, numbers: List[int]) -> List[int]:
+        """Of several sources for one contract, the one(s) sharing the
+        most figures and distinctive words with this line."""
+        if len(numbers) <= 1:
+            return numbers
+        wanted = _evidence_terms(line)
+        scores = {n: len(wanted & _evidence_terms(by_number[n].get("text", ""))) for n in numbers}
+        top = max(scores.values())
+        return [n for n in numbers if scores[n] == top] if top else numbers[:1]
+
+    # First pass: lines naming a contract and a clause. Remember which
+    # sources each contract's lines used, for lines that name it without a
+    # clause (the summary under a table).
+    used: Dict[str, List[int]] = {}
+    plan: Dict[int, List[Tuple[int, List[int]]]] = {}   # line -> [(insert position, sources)]
+    pending: List[Tuple[int, List[Tuple[str, int]]]] = []
+    in_code = False
+    for i, line in enumerate(lines):
+        if line.strip().startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code or "#source-" in line or re.match(r"^\s*\|?\s*:?-{3,}", line):
+            continue
+        files = files_in(line)
+        if not files:
+            continue
+        clause_matches = list(_CLAUSE_REF.finditer(line))
+        clause_ids = [str(n) for n in _clause_numbers(line)]
+        if re.search(r"\b(?:contract )?header\b|\bpreamble\b", line, re.I):
+            clause_ids.append("header")
+        numbers = [by_file_clause[(key, c)] for key, _ in files for c in clause_ids if (key, c) in by_file_clause]
+        if numbers:
+            for key, _ in files:
+                used.setdefault(key, []).extend(n for n in numbers if n in by_file[key])
+            at = clause_matches[-1].end() if clause_matches else files[-1][1]
+            plan[i] = [(at, list(dict.fromkeys(numbers)))]
+        else:
+            pending.append((i, files))
+
+    # Second pass: a contract named without a clause -> the source its
+    # other lines used (the closest one, if several); failing that, its
+    # passage closest to what the line says. Each link goes right after
+    # the contract it belongs to; a source is linked once per line.
+    for i, files in pending:
+        seen: set = set()
+        for key, end in files:
+            candidates = list(dict.fromkeys(used.get(key) or by_file[key]))
+            numbers = [n for n in closest(lines[i], candidates) if n not in seen]
+            if numbers:
+                seen.update(numbers)
+                plan.setdefault(i, []).append((end, numbers))
+
+    for i, inserts in plan.items():
+        line = lines[i]
+        for at, numbers in sorted(inserts, reverse=True):
+            if line.lstrip().startswith("|") and len(inserts) == 1:
+                # In a table, put the link at the end of that cell.
+                cell_end = line.find("|", at)
+                at = cell_end if cell_end >= 0 else len(line)
+                line = line[:at].rstrip() + link(numbers) + " " + line[at:]
+            else:
+                line = line[:at] + link(numbers) + line[at:]
+        lines[i] = line
+    return "\n".join(lines)
 
 
 _EVIDENCE_STOP = {
@@ -1815,6 +1947,7 @@ def _finish_chat(prepared: Dict[str, Any], reply: str, answer_model: Optional[st
 
     sources = prepared["sources"]
     reply = link_citations(remove_reasoning_traces(str(reply)).strip(), len(sources))
+    reply = attach_citations(reply, sources)
     print(f"[chat] answered by {answer_model} (routing: {prepared['routed_by']}, {len(sources)} sources)")
     # Show the sources the answer cites (numbers kept, so the inline links
     # still match). If it cites none, the passages it most likely drew on,

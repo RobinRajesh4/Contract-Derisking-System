@@ -597,3 +597,76 @@ def test_lender_named_as_a_contract_lists_only_its_contracts(client, fake_llm):
     r = chat(client, "tell me about Harborline Credit Union")
     assert [s["filename"] for s in r["sources"]] == ["b.txt"]
     assert r["reply"].startswith("**Harborline Credit Union** is the lender in **b.txt**")
+
+
+# ------------------------- contracts and clauses named without a marker
+
+from app.main import attach_citations, _cited_source_numbers  # noqa: E402
+
+
+def _src(n, filename, clause, text, also=()):
+    return {"source_number": n, "filename": filename, "clause_id": clause, "text": text, "kind": "clause",
+            "also_in": [{"analysis_id": x, "filename": x} for x in also]}
+
+
+NAMED_SOURCES = [
+    _src(4, "05_Personal_Loan_Delgado.pdf", 7, "CLAUSE SEVEN – TERMINATION: The LENDER may terminate this agreement"),
+    _src(9, "06_Farm_Equipment_Whitaker.pdf", 7, "CLAUSE SEVEN – DEFAULT: An installment not paid by December 1"),
+    _src(20, "Contract_1.pdf", 7, "CLAUSE SEVEN – TERMINATION: Breach of obligations results in termination",
+         also=["Contract_10.pdf", "Contract_3.pdf"]),
+    _src(21, "Contract_1.pdf", 2, "CLAUSE TWO – TERM: The financing period shall be up to 60 months",
+         also=["Contract_10.pdf", "Contract_3.pdf"]),
+]
+NAMED_REPLY = (
+    "| Contract | Clause | Key points |\n|---|---|---|\n"
+    "| 05_Personal_Loan_Delgado.pdf | Clause 7 – Termination | Lender may terminate at any time. |\n"
+    "| 06_Farm_Equipment_Whitaker.pdf | Clause 7 – Default | Late interest accrues. |\n"
+    "| Contract_1.pdf, Contract_10.pdf (the generic contracts) | Clause 7 – Termination (identical wording) | Breach ends it. |\n"
+    "| Contract_3.pdf (and the same set) | Clause 2 – Term | Up to 60 months. |\n\n"
+    "- Unconditional termination – 05_Personal_Loan_Delgado.pdf allows the lender to terminate.\n"
+    "- Breach – the generic contracts (Contract_1, 10) end on a breach, which results in termination.\n"
+)
+
+
+def test_contract_and_clause_named_in_a_table_get_their_links():
+    out = attach_citations(NAMED_REPLY, NAMED_SOURCES)
+    rows = out.split("\n")
+    assert rows[2] == ("| 05_Personal_Loan_Delgado.pdf | Clause 7 – Termination [Source 4](#source-4) "
+                       "| Lender may terminate at any time. |")
+    assert "Clause 7 – Default [Source 9](#source-9) |" in rows[3]
+    # A row for the contracts sharing one wording links that shared source,
+    # also when it names a contract the source only lists under "also in".
+    assert "(identical wording) [Source 20](#source-20) |" in rows[4]
+    assert "Clause 2 – Term [Source 21](#source-21) |" in rows[5]
+    # Every source the answer points at is cited - no cap of five.
+    assert _cited_source_numbers(out) == [4, 9, 20, 21]
+
+
+def test_contract_named_without_a_clause_links_what_its_other_lines_used():
+    out = attach_citations(NAMED_REPLY, NAMED_SOURCES)
+    summary = out.split("\n")[-3:]
+    assert "05_Personal_Loan_Delgado.pdf [Source 4](#source-4) allows" in summary[0]
+    # Contract_1 has two sources; the line is about termination, not the term.
+    assert "Contract_1 [Source 20](#source-20), 10)" in summary[1] and "#source-21" not in summary[1]
+
+
+def test_file_name_is_not_matched_inside_a_longer_one():
+    sources = [_src(1, "Contract_1.pdf", 3, "CLAUSE THREE – PAYMENT: interest of 1.2% per month"),
+               _src(2, "Contract_12.pdf", 3, "CLAUSE THREE – PAYMENT: interest of 0.9% per month")]
+    out = attach_citations("Contract_12.pdf charges 0.9% (clause 3).", sources)
+    assert "[Source 2](#source-2)" in out and "#source-1)" not in out
+
+
+def test_lines_the_model_already_cited_are_left_alone():
+    line = "05_Personal_Loan_Delgado.pdf, clause 7 [Source 4](#source-4)."
+    assert attach_citations(line, NAMED_SOURCES) == line
+
+
+def test_named_clause_gives_real_references_through_the_api(client, fake_llm):
+    load_portfolio(client)
+    fake_llm.handlers["ChatQuerySpec"] = lambda p: json.dumps({"kind": "semantic"})
+    fake_llm.handlers["text"] = lambda p: "| Contract | Clause |\n|---|---|\n| Contract_1.txt | Clause 4 – Default |"
+    r = chat(client, "what are the default terms in Julia Miller's contract?")
+    assert r["citations"] == "cited"
+    assert len(r["sources"]) == 1 and "penalty of 2%" in r["sources"][0]["text"]
+    assert "#source-" in r["reply"]
