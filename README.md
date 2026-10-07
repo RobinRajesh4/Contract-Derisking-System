@@ -342,6 +342,7 @@ src/
 | GET | `/clauses/{id}/file` | The original uploaded file |
 | GET | `/contracts` | Contracts with extracted facts |
 | POST | `/chat` | Ask a question (optionally about one contract via `analysis_id`) |
+| GET / PUT / DELETE | `/conversations`, `/conversations/{id}` | Saved chat conversations (the chat page saves after every answer; "History" lists and reopens them). Stored in `backend/data/conversations.json`, which holds questions, answers and quoted clause text - not committed. There are no user accounts, so everyone using the backend sees the same list. |
 | POST | `/chat/stream` | Same answer, sent as it's written (newline-delimited JSON: `status`, `model`, `delta` pieces, then `done` with the full `/chat` response, or `error`). The chat page uses this. If words arrive in bursts, the proxy in front of Ollama is buffering: LibreChat's nginx needs `proxy_buffering off;` for `/ollama/`. |
 | POST | `/compare` | Compare two contracts |
 | POST | `/summary/{id}` | Regenerate the executive summary |

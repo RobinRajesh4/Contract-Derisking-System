@@ -29,6 +29,7 @@ import {
 } from "@/components/ui/select";
 import { listAnalyses } from "@/services/analysis";
 import DocumentViewer from "@/components/DocumentViewer";
+import ChatHistory from "@/components/ChatHistory";
 import {
   ask,
   clearConversation,
@@ -273,6 +274,17 @@ export default function Chat() {
             )}
           </div>
 
+          <div className="flex items-center gap-1">
+          <ChatHistory
+            disabled={isLoading}
+            onOpened={(analysisId) => {
+              // Back to the contract the conversation was about, if it
+              // still exists; otherwise all contracts.
+              const exists = analysisId && analyses.some((a: any) => a.analysis_id === analysisId);
+              changeScope(exists ? (analysisId as string) : "all");
+              setRefsOpen({});
+            }}
+          />
           <Button
             variant="ghost"
             size="sm"
@@ -287,6 +299,7 @@ export default function Chat() {
           >
             <RotateCcw className="mr-1 h-3.5 w-3.5" /> New chat
           </Button>
+          </div>
         </div>
       </div>
 

@@ -43,6 +43,8 @@ Thumbs.db
 
 # Runtime-generated application data
 backend/data/analyses.json
+backend/data/conversations.json
+backend/data/*.tmp
 backend/uploaded_files/
 .ipynb_checkpoints/
 

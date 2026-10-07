@@ -42,6 +42,46 @@ export interface ChatMessage {
 }
 
 const MESSAGES_KEY = "contract-chat-messages";
+const CONVERSATION_KEY = "contract-chat-conversation-id";
+
+/** A saved conversation, as listed in the history. */
+export interface ConversationInfo {
+  id: string;
+  title: string;
+  updated_at?: string;
+  messages: number;
+  analysis_id?: string | null;
+}
+
+function newConversationId(): string {
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  return "conv_" + Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+let conversationId: string | null = null;
+
+/** The id this conversation is saved under (kept across a page reload). */
+export function getConversationId(): string {
+  if (!conversationId) {
+    try {
+      conversationId = sessionStorage.getItem(CONVERSATION_KEY);
+    } catch {
+      /* storage unavailable */
+    }
+    if (!conversationId) setConversationId(newConversationId());
+  }
+  return conversationId as string;
+}
+
+function setConversationId(id: string) {
+  conversationId = id;
+  try {
+    sessionStorage.setItem(CONVERSATION_KEY, id);
+  } catch {
+    /* storage unavailable */
+  }
+}
 const MAX_SAVED_MESSAGES = 60;
 const MAX_SAVED_SOURCE_TEXT = 600;
 
@@ -263,13 +303,67 @@ export function ask(question: string, analysisId: string | null): Promise<void> 
     pending = null;
     live = null;
     publish([...getMessages(), reply]);
+    void saveConversation();
   })();
 
+  lastScope = analysisId;
   live = { text: "", status: "Sending the question" };
   publish(withQuestion);
   return pending;
 }
 
 export function clearConversation(): void {
+  setConversationId(newConversationId());
   publish([WELCOME]);
+}
+
+/* ── Saved conversations (history) ─────────────────────────────── */
+
+let lastScope: string | null = null;
+
+/**
+ * Save this conversation on the server, so it can be reopened after the
+ * tab is closed. Called after every answer; a failure only means the
+ * history misses this conversation, so it is never shown as an error.
+ */
+async function saveConversation(): Promise<void> {
+  const messages = getMessages().filter((m) => m.content !== WELCOME.content);
+  if (!messages.some((m) => m.role === "user")) return;
+  try {
+    await fetch(`${getBaseUrl()}/conversations/${getConversationId()}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages, analysis_id: lastScope }),
+    });
+  } catch {
+    /* backend unreachable: nothing to do */
+  }
+}
+
+export async function listConversations(): Promise<ConversationInfo[]> {
+  const response = await fetch(`${getBaseUrl()}/conversations`);
+  if (!response.ok) throw new Error(await errorMessage(response));
+  return response.json();
+}
+
+/**
+ * Reopen a saved conversation: its messages become the current
+ * conversation, and new questions continue it. Returns the contract it
+ * was about (null = all contracts).
+ */
+export async function openConversation(id: string): Promise<string | null> {
+  if (pending) throw new Error("Wait for the current answer to finish.");
+  const response = await fetch(`${getBaseUrl()}/conversations/${id}`);
+  if (!response.ok) throw new Error(await errorMessage(response));
+  const data = await response.json();
+  setConversationId(id);
+  lastScope = data.analysis_id ?? null;
+  publish([WELCOME, ...((data.messages || []) as ChatMessage[])]);
+  return lastScope;
+}
+
+export async function deleteConversation(id: string): Promise<void> {
+  const response = await fetch(`${getBaseUrl()}/conversations/${id}`, { method: "DELETE" });
+  if (!response.ok && response.status !== 404) throw new Error(await errorMessage(response));
+  if (id === conversationId && !pending) clearConversation();
 }

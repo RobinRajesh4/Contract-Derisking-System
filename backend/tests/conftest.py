@@ -118,6 +118,8 @@ def client(fake_llm):
     if os.path.exists(store_module.DATA_FILE):
         os.remove(store_module.DATA_FILE)
     main.store = store_module.Store()
+    if os.path.exists(main.conversations.path):
+        os.remove(main.conversations.path)
     if main.rag is not None:
         main.rag.reset()
     return TestClient(main.app)

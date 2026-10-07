@@ -36,6 +36,7 @@ from .llm_providers import (
     get_provider_status,
     load_settings,
 )
+from .conversations import ConversationStore, valid_id as _valid_conversation_id
 try:
     from .rag import RAGStore
 except Exception as error:
@@ -121,6 +122,7 @@ UPLOADS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploaded
 
 llm = LLMClient()
 rag = None
+conversations = ConversationStore()
 
 # Chat search needs the embedding server at start-up. If it can't be
 # reached then (a dropped connection, the shared server busy), search is
@@ -2087,6 +2089,51 @@ def chat_stream(request: ChatRequest):
         media_type="application/x-ndjson",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ------------------------------------------------------- saved conversations
+
+class ConversationSave(BaseModel):
+    messages: List[Dict[str, Any]]
+    # Which contract the questions covered (None = all contracts).
+    analysis_id: Optional[str] = None
+
+
+def _conversation_id(conversation_id: str) -> str:
+    if not _valid_conversation_id(conversation_id):
+        raise HTTPException(status_code=400, detail="Invalid conversation id.")
+    return conversation_id
+
+
+@app.get("/conversations")
+def list_conversations():
+    """Saved chat conversations, newest first (titles only)."""
+    return conversations.list()
+
+
+@app.get("/conversations/{conversation_id}")
+def get_conversation(conversation_id: str):
+    found = conversations.get(_conversation_id(conversation_id))
+    if not found:
+        raise HTTPException(status_code=404, detail="This conversation no longer exists.")
+    return found
+
+
+@app.put("/conversations/{conversation_id}")
+def save_conversation(conversation_id: str, body: ConversationSave):
+    """Create or replace a saved conversation (the chat page saves after
+    every answer)."""
+    cid = _conversation_id(conversation_id)
+    if len(body.messages) > 1000:
+        raise HTTPException(status_code=413, detail="Too many messages in one conversation.")
+    return conversations.save(cid, body.messages, body.analysis_id)
+
+
+@app.delete("/conversations/{conversation_id}")
+def delete_conversation(conversation_id: str):
+    if not conversations.delete(_conversation_id(conversation_id)):
+        raise HTTPException(status_code=404, detail="This conversation no longer exists.")
+    return {"deleted": True}
 
 
 term_labels = {
