@@ -4,6 +4,7 @@ import { FileText, BookOpen } from "lucide-react";
 import { getAnalysis } from "@/services/analysis";
 import { getBaseUrl } from "@/services/api";
 import PdfDocumentViewer from "./PdfDocumentViewer";
+import { scrollWithin } from "@/lib/scrollWithin";
 
 export interface DocumentViewerProps {
   analysisId: string | null;
@@ -23,6 +24,7 @@ export default function DocumentViewer({
   });
 
   const clauseRefs = useRef<Record<string | number, HTMLDivElement | null>>({});
+  const listRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (highlightedClauseId == null) return;
@@ -34,7 +36,7 @@ export default function DocumentViewer({
     void el.offsetWidth;
     el.classList.add("clause-highlighted");
 
-    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    if (listRef.current) scrollWithin(listRef.current, el, "center");
 
     const timer = setTimeout(() => {
       el.classList.remove("clause-highlighted");
@@ -130,7 +132,7 @@ export default function DocumentViewer({
         </p>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-5 space-y-4">
+      <div ref={listRef} className="flex-1 overflow-y-auto p-5 space-y-4">
         {clauses.map((clause) => (
           <div
             key={clause.id}

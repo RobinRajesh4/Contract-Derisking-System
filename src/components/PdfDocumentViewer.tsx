@@ -4,6 +4,7 @@ import type { PDFDocumentProxy } from "pdfjs-dist";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
 import { escapeHtml, planHighlight, type HighlightPlan } from "@/lib/pdfHighlight";
+import { scrollWithin } from "@/lib/scrollWithin";
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
@@ -56,8 +57,9 @@ export default function PdfDocumentViewer({
         pendingScroll.current = highlightKey;
         // Text not found (e.g. a scanned PDF without a text layer): at
         // least bring the reported page into view.
-        if (next.firstPage == null && targetPage) {
-          pageRefs.current[targetPage]?.scrollIntoView({ behavior: "smooth", block: "start" });
+        const pageEl = targetPage ? pageRefs.current[targetPage] : null;
+        if (next.firstPage == null && pageEl && containerRef.current) {
+          scrollWithin(containerRef.current, pageEl, "start");
           pendingScroll.current = null;
         }
       })
@@ -90,8 +92,13 @@ export default function PdfDocumentViewer({
   firstPageRef.current = plan.firstPage;
   const scrollToHighlight = useCallback((pageNum: number) => {
     if (pendingScroll.current == null || pageNum !== firstPageRef.current) return;
-    const mark = pageRefs.current[pageNum]?.querySelector(".pdf-clause-highlight");
-    (mark ?? pageRefs.current[pageNum])?.scrollIntoView({ behavior: "smooth", block: "center" });
+    const pageEl = pageRefs.current[pageNum];
+    const container = containerRef.current;
+    if (!pageEl || !container) return;
+    // Scroll only the viewer itself (see scrollWithin for why not
+    // scrollIntoView).
+    const mark = pageEl.querySelector(".pdf-clause-highlight");
+    scrollWithin(container, mark ?? pageEl, mark ? "center" : "start");
     pendingScroll.current = null;
   }, []);
   const onTextRendered = useMemo(

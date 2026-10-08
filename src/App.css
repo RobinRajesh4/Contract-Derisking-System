@@ -21,6 +21,13 @@
   transition: background 0.15s;
 }
 
+/* pdf.js's text layer uses overflow: hidden, which leaves it scrollable from
+   script. If it ever scrolls, every highlight drifts off its words. clip
+   hides the overflow the same way but can't be scrolled at all. */
+.react-pdf__Page .textLayer {
+  overflow: clip;
+}
+
 .pdf-clause-highlight {
   background: hsl(48 96% 65% / 0.55);
   border-radius: 2px;
