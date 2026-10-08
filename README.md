@@ -205,8 +205,8 @@ contract has the highest amount?", "how many contracts are there?",
   "llm_timeout_sec": 240,
   "embedding_url": "",
   "embedding_model": "qwen3-embedding:8b",
-  "ollama_chat_model": "gpt-oss:20b",
-  "ollama_chat_fallback_models": ["qwen3:8b"]
+  "ollama_chat_model": "qwen3:8b",
+  "ollama_chat_fallback_models": []
 }
 ```
 
@@ -214,8 +214,8 @@ contract has the highest amount?", "how many contracts are there?",
 |---|---|
 | `ollama_model` | Model for per-clause work (classification, compliance checks) |
 | `ollama_quality_model` | Model for per-contract work: fact extraction, summaries, question routing. Also the last fallback for chat answers. |
-| `ollama_chat_model` | Model that writes chat answers from the clause text: `gpt-oss:20b` (better reasoning than qwen3:8b and fast once loaded; about 14 GB on the server). Exact answers (rankings, counts, totals) are computed in code and don't use it. |
-| `ollama_chat_fallback_models` | Models tried next, in order, if the chat model can't answer (out of memory, timeout, error): `["qwen3:8b"]`. The chat shows which model answered. `qwen3:32b` was dropped: it needs more memory than the shared server has free. |
+| `ollama_chat_model` | Model that writes chat answers from the clause text. Currently `qwen3:8b`: the same model as the rest of the app, so the shared server keeps one model loaded and nothing is swapped between questions. `gpt-oss:20b` gives better-reasoned answers but is slower and doesn't fit on the server's GPU together with `qwen3:8b`. Exact answers (rankings, counts, totals) are computed in code and don't use it. |
+| `ollama_chat_fallback_models` | Models tried next, in order, if the chat model can't answer (out of memory, timeout, error), e.g. `["qwen3:8b"]` when the chat model is a bigger one. Empty when the chat model is already the small one. The chat shows which model answered. |
 | `ollama_num_ctx` | Context window. Must be large enough for whole-contract chat prompts; answers are refused rather than silently truncated if a prompt doesn't fit. |
 | `llm_concurrency` | How many LLM calls run in parallel during one analysis |
 | `llm_timeout_sec` | How long to wait for one model answer |

@@ -26,6 +26,9 @@ def events(client, message, **kw):
 
 def test_written_answer_arrives_in_pieces_then_done(client, fake_llm, monkeypatch):
     load_template_portfolio(client)
+    # Independent of the chat model in the live settings.json.
+    monkeypatch.setitem(providers._settings, "ollama_chat_model", "gpt-oss:20b")
+    monkeypatch.setitem(providers._settings, "ollama_chat_fallback_models", [])
 
     class Streaming:
         model = "gpt-oss:20b"
